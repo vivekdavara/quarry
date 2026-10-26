@@ -1,0 +1,22 @@
+[package]
+name = "quarry"
+description = "A SQL query engine over Parquet and CSV, on Apache Arrow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+arrow.workspace = true
+parquet.workspace = true
+sqlparser.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

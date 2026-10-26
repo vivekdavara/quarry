@@ -1,0 +1,6 @@
+/target/
+.scratch/
+data/
+*.profraw
+.env
+.DS_Store

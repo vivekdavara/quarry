@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["crates/quarry", "crates/quarry-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+repository = "https://github.com/vivekdavara/quarry"
+authors = ["Vivek Davara"]
+
+[workspace.dependencies]
+arrow = { version = "60.0.0", default-features = false, features = ["csv", "prettyprint"] }
+parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap", "zstd", "lz4", "flate2-zlib-rs", "simdutf8"] }
+sqlparser = "0.63.0"
+thiserror = "2.0.21"
+clap = { version = "4.6.7", features = ["derive"] }
+tempfile = "3.27.0"
+proptest = "1.12.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
