@@ -39,6 +39,17 @@ impl<'a> Scope<'a> {
     }
 }
 
+/// Whether two identifiers name the same thing: equal without regard to case, by Unicode's lowercase mapping (the
+/// catalog's rule for table names too).
+pub(crate) fn same_name(a: &str, b: &str) -> bool {
+    a == b || a.to_lowercase() == b.to_lowercase()
+}
+
+/// Whether some column in the schema has this name (any qualifier).
+pub(crate) fn has_column(schema: &PlanSchema, name: &str) -> bool {
+    schema.fields().iter().any(|f| same_name(&f.name, name))
+}
+
 /// The column a name refers to: case-insensitive, with an optional table qualifier.
 pub(crate) fn resolve_column(
     schema: &PlanSchema,
@@ -46,11 +57,10 @@ pub(crate) fn resolve_column(
     name: &str,
 ) -> Result<usize> {
     if let Some(q) = qualifier {
-        let known = schema.fields().iter().any(|f| {
-            f.qualifier
-                .as_deref()
-                .is_some_and(|fq| fq.eq_ignore_ascii_case(q))
-        });
+        let known = schema
+            .fields()
+            .iter()
+            .any(|f| f.qualifier.as_deref().is_some_and(|fq| same_name(fq, q)));
         if !known {
             return Err(plan_err!(
                 "table {q} is not in FROM (or is known by an alias there)"
@@ -62,12 +72,9 @@ pub(crate) fn resolve_column(
         .iter()
         .enumerate()
         .filter(|(_, f)| {
-            f.name.eq_ignore_ascii_case(name)
-                && qualifier.is_none_or(|q| {
-                    f.qualifier
-                        .as_deref()
-                        .is_some_and(|fq| fq.eq_ignore_ascii_case(q))
-                })
+            same_name(&f.name, name)
+                && qualifier
+                    .is_none_or(|q| f.qualifier.as_deref().is_some_and(|fq| same_name(fq, q)))
         })
         .map(|(i, _)| i)
         .collect();

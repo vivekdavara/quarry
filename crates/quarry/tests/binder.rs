@@ -817,3 +817,52 @@ fn explain_binds_the_query_without_running_it() {
     assert!(sql::plan(&catalog, "EXPLAIN SELECT a FROM t").is_err());
     unsupported("EXPLAIN ANALYZE SELECT a FROM t", "EXPLAIN ANALYZE");
 }
+
+// --- Found by the day-1 review (each failed before its fix) ---
+
+#[test]
+fn group_by_an_ambiguous_from_column_is_not_an_alias() {
+    // `a` is a FROM column twice (t.a, u.a); the alias fallback is only for names that aren't FROM columns at all.
+    plan_error(
+        "SELECT u.x AS a FROM t, u GROUP BY a",
+        "column a is ambiguous: t.a, u.a",
+    );
+    // Two select items of that name with different expressions are ambiguous too, as in ORDER BY.
+    plan_error(
+        "SELECT a AS k, b AS k FROM t GROUP BY k",
+        "GROUP BY k is ambiguous",
+    );
+    plan_error(
+        "SELECT count(*) AS k FROM t GROUP BY k",
+        "GROUP BY k refers to an aggregate",
+    );
+}
+
+#[test]
+fn an_empty_select_list_is_an_error() {
+    // sqlparser accepts these. Bound, `SELECT DISTINCT FROM t` and `SELECT FROM t HAVING TRUE` were the same
+    // zero-column Aggregate, though over an empty table the first has no rows and the second one.
+    plan_error("SELECT FROM t", "the select list is empty");
+    plan_error("SELECT DISTINCT FROM t", "the select list is empty");
+    plan_error("SELECT FROM t HAVING TRUE", "the select list is empty");
+}
+
+#[test]
+fn names_match_by_unicode_lowercase_everywhere() {
+    // Table names already matched this way; columns and qualifiers compared ASCII case only.
+    let mut catalog = Catalog::new();
+    let schema = Schema::new(vec![Field::new("Été", DataType::Int64, true)]);
+    catalog
+        .register(
+            "Ville",
+            Arc::new(MemTable::from_batch(RecordBatch::new_empty(Arc::new(
+                schema,
+            )))),
+        )
+        .unwrap();
+    let plan = sql::plan(&catalog, "SELECT été, VILLE.ÉTÉ FROM ville").unwrap();
+    assert_eq!(
+        plan.to_string(),
+        "Projection: ville.Été, ville.Été\n  Scan: ville\n"
+    );
+}

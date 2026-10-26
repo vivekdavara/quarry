@@ -130,7 +130,7 @@ NULL` is `FALSE`, `TRUE OR NULL` is `TRUE`) and `IS NULL`. Aggregates skip NULLs
 
 ## Names
 
-Identifiers match without regard to case, quoted or not (`"L_ORDERKEY"` and `l_orderkey` are the same column), as
+Identifiers match without regard to case (by Unicode's lowercase mapping), quoted or not (`"L_ORDERKEY"` and `l_orderkey` are the same column), as
 in DuckDB, which day 4 uses as the oracle. A table in `FROM` is known by its alias if it has one (`FROM lineitem AS
 l` makes `l.l_quantity` valid and `lineitem.l_quantity` an error), otherwise by its name as the query spells it. A
 bare column in the select list is named as the table spells it (`SELECT L_ORDERKEY` outputs `l_orderkey` if the file
@@ -183,7 +183,8 @@ The binder builds the plan from the bottom up, in SQL's logical order of evaluat
 3. **Aggregation.** The query aggregates if it has a `GROUP BY`, a `HAVING`, or an aggregate in its select list or
    `ORDER BY`. Then:
    - each `GROUP BY` item is an ordinal (`GROUP BY 1`, the first select item), an expression over the `FROM` scope,
-     or, when a bare name isn't a `FROM` column, a select-list alias; aggregates aren't allowed in it;
+     or, when a bare name isn't a `FROM` column at all (an ambiguous one still is), a select-list alias (two
+     different items with that name are ambiguous); aggregates aren't allowed in it;
    - the aggregates are collected from the select list, `HAVING` and `ORDER BY`, each distinct one once; an aggregate
      inside an aggregate's argument is an error;
    - an `Aggregate` node is built, and every select, `HAVING` and `ORDER BY` expression is rewritten over its output:
@@ -194,7 +195,7 @@ The binder builds the plan from the bottom up, in SQL's logical order of evaluat
    `FROM` scope, so it can't name a select-list alias (PostgreSQL's rule; DuckDB allows it).
 5. **SELECT.** `*` expands to every column in scope and `t.*` to table `t`'s; each other item is bound and named by
    its alias, or by its column name when it is a bare column, or otherwise by its SQL text (`sum(l_quantity)`).
-   Output names may repeat.
+   Output names may repeat. An empty select list (`SELECT FROM t`, which sqlparser accepts) is an error.
 6. **DISTINCT** becomes an `Aggregate` grouping by every output column, with no aggregates. `DISTINCT ON` is
    unsupported.
 7. **ORDER BY.** Each key is, in this order of preference: an ordinal (`ORDER BY 2`; out of range is an error); a

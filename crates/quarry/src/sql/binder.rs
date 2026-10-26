@@ -8,7 +8,7 @@ use sqlparser::ast::{
 };
 
 use super::BoundStatement;
-use super::expr::{Scope, bind_expr, resolve_column};
+use super::expr::{Scope, bind_expr, has_column, same_name};
 use crate::Catalog;
 use crate::error::{Result, plan_err, unsupported};
 use crate::plan::{Expr, JoinKind, LogicalPlan, PlanSchema, SortKey};
@@ -123,6 +123,10 @@ impl<'a> Binder<'a> {
         let mut items = Vec::new();
         for item in &select.projection {
             bind_select_item(item, scope, &mut items)?;
+        }
+        // sqlparser accepts `SELECT FROM t` and `SELECT DISTINCT FROM t`; a result needs at least one column.
+        if items.is_empty() {
+            return Err(plan_err!("the select list is empty"));
         }
         let distinct = match &select.distinct {
             None | Some(Distinct::All) => false,
@@ -343,10 +347,7 @@ impl<'a> Binder<'a> {
             Some(alias) if alias.columns.is_empty() => alias.name.value.clone(),
             Some(_) => return Err(unsupported!("column aliases in FROM")),
         };
-        if qualifiers
-            .iter()
-            .any(|q| q.eq_ignore_ascii_case(&qualifier))
-        {
+        if qualifiers.iter().any(|q| same_name(q, &qualifier)) {
             return Err(plan_err!(
                 "the table name {qualifier} appears more than once in FROM; give each an alias"
             ));
@@ -454,7 +455,7 @@ fn bind_select_item(item: &SelectItem, scope: Scope<'_>, items: &mut Vec<Item>) 
                         .field(i)
                         .qualifier
                         .as_deref()
-                        .is_some_and(|q| q.eq_ignore_ascii_case(&table))
+                        .is_some_and(|q| same_name(q, &table))
                 })
                 .collect();
             if columns.is_empty() {
@@ -500,7 +501,7 @@ fn bind_order_target(ast: &ast::Expr, items: &[Item], scope: Scope<'_>) -> Resul
     }
     if let ast::Expr::Identifier(ident) = ast {
         let matches: Vec<usize> = (0..items.len())
-            .filter(|&i| items[i].name.eq_ignore_ascii_case(&ident.value))
+            .filter(|&i| same_name(&items[i].name, &ident.value))
             .collect();
         if let Some(&first) = matches.first() {
             // Two outputs with this name are fine if they are the same expression (SELECT a, a ... ORDER BY a).
@@ -533,17 +534,27 @@ fn bind_group_by(ast: &ast::Expr, items: &[Item], from: &PlanSchema) -> Result<E
         }
         return Ok(item.expr.clone());
     }
-    // A bare name that isn't a FROM column may be a select-list alias.
+    // A bare name that isn't a FROM column at all may be a select-list alias. (A FROM column that is ambiguous is
+    // still a FROM column: binding it below reports the ambiguity.)
     if let ast::Expr::Identifier(ident) = ast
-        && resolve_column(from, None, &ident.value).is_err()
-        && let Some(item) = items
-            .iter()
-            .find(|i| i.name.eq_ignore_ascii_case(&ident.value))
+        && !has_column(from, &ident.value)
     {
-        if item.expr.contains_aggregate() {
-            return Err(plan_err!("GROUP BY {} refers to an aggregate", ident.value));
+        let matches: Vec<&Item> = items
+            .iter()
+            .filter(|i| same_name(&i.name, &ident.value))
+            .collect();
+        if let Some(item) = matches.first() {
+            if matches.iter().any(|m| m.expr != item.expr) {
+                return Err(plan_err!(
+                    "GROUP BY {} is ambiguous: the select list has more than one",
+                    ident.value
+                ));
+            }
+            if item.expr.contains_aggregate() {
+                return Err(plan_err!("GROUP BY {} refers to an aggregate", ident.value));
+            }
+            return Ok(item.expr.clone());
         }
-        return Ok(item.expr.clone());
     }
     bind_expr(ast, Scope::without_aggregates(from, "GROUP BY"))
 }
