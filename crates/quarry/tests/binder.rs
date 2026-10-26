@@ -686,6 +686,11 @@ fn order_by_an_aggregate_not_in_the_select_list() {
 
 #[test]
 fn limit_and_offset() {
+    // MySQL's LIMIT offset, count.
+    assert_eq!(
+        plan("SELECT a FROM t LIMIT 2, 3").lines().next().unwrap(),
+        "Limit: skip=2 fetch=3"
+    );
     assert_eq!(
         plan("SELECT a FROM t OFFSET 5").lines().next().unwrap(),
         "Limit: skip=5 fetch=all"

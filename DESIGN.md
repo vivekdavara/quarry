@@ -83,7 +83,8 @@ the type. `UInt64` is left out because no signed type holds all of it.
 
 **Literals.** An integer literal is `Int64` (one that doesn't fit is an error); a number with a point or exponent is
 `Float64`; a quoted string is `Utf8`; `TRUE`/`FALSE` are `Boolean`; `NULL` is `Null`; `DATE 'YYYY-MM-DD'` is
-`Date32` (a malformed date is an error).
+`Date32` (a malformed date is an error). A minus sign before a number is part of the literal, so
+`-9223372036854775808` is an `Int64`. A double-quoted `"x"` is a name, not a string. `x::t` is `CAST(x AS t)`.
 
 **The common type** of two types, used to make an operator's two sides the same:
 
@@ -131,11 +132,14 @@ NULL` is `FALSE`, `TRUE OR NULL` is `TRUE`) and `IS NULL`. Aggregates skip NULLs
 
 Identifiers match without regard to case, quoted or not (`"L_ORDERKEY"` and `l_orderkey` are the same column), as
 in DuckDB, which day 4 uses as the oracle. A table in `FROM` is known by its alias if it has one (`FROM lineitem AS
-l` makes `l.l_quantity` valid and `lineitem.l_quantity` an error), otherwise by its name.
+l` makes `l.l_quantity` valid and `lineitem.l_quantity` an error), otherwise by its name as the query spells it. A
+bare column in the select list is named as the table spells it (`SELECT L_ORDERKEY` outputs `l_orderkey` if the file
+says `l_orderkey`).
 
 A column reference `c` resolves against the columns of every table in scope: no match is an error ("column c not
 found; columns are ..."), more than one is an error ("column c is ambiguous: a.c, b.c"). `t.c` looks only in table
-`t`. Two tables in one `FROM` with the same name or alias are an error.
+`t`. Two tables in one `FROM` with the same name or alias are an error. A type error names the whole expression as
+written ("cannot compare Float64 with Utf8 ('big') in total > 'big'").
 
 ## The logical plan
 
@@ -186,7 +190,8 @@ The binder builds the plan from the bottom up, in SQL's logical order of evaluat
      a subexpression equal to a group expression becomes that group column, an aggregate becomes its column, and a
      column left over that is neither grouped nor inside an aggregate is an error ("column l_tax must appear in GROUP
      BY or be used in an aggregate").
-4. **HAVING** becomes a `Filter` over the `Aggregate`; `Boolean` again.
+4. **HAVING** becomes a `Filter` over the `Aggregate`; `Boolean` again. It is bound like the select list, over the
+   `FROM` scope, so it can't name a select-list alias (PostgreSQL's rule; DuckDB allows it).
 5. **SELECT.** `*` expands to every column in scope and `t.*` to table `t`'s; each other item is bound and named by
    its alias, or by its column name when it is a bare column, or otherwise by its SQL text (`sum(l_quantity)`).
    Output names may repeat.
@@ -195,10 +200,12 @@ The binder builds the plan from the bottom up, in SQL's logical order of evaluat
 7. **ORDER BY.** Each key is, in this order of preference: an ordinal (`ORDER BY 2`; out of range is an error); a
    bare name equal to exactly one output column's name (more than one is an error); or an expression over the input
    of the projection. An expression equal to a select expression sorts by that column; any other is added to the
-   projection as a hidden column, sorted by, and dropped by a final projection. With `DISTINCT`, a key must be in
-   the select list. `ASC` is the default; NULLs sort last in both directions unless `NULLS FIRST` says otherwise
-   (DuckDB's default).
+   projection as a hidden column (named `__order_0`, `__order_1`, ...), sorted by, and dropped by a final
+   projection. A bare name inside an expression (`ORDER BY x + 1`) is never an output name. With `DISTINCT`, a key
+   must be in the select list. `ASC` is the default; NULLs sort last in both directions unless `NULLS FIRST` says
+   otherwise (DuckDB's default).
 8. **LIMIT n OFFSET m** becomes `Limit { skip: m, fetch: n }`; both must be non-negative integer literals.
+   `LIMIT NULL` is no limit, and `LIMIT m, n` (MySQL's order) is `OFFSET m LIMIT n`.
 
 Unsupported, each an error naming it: subqueries anywhere, `WITH`, `UNION`/`INTERSECT`/`EXCEPT`, window functions,
 `GROUPING SETS`/`ROLLUP`/`CUBE`, `USING`/`NATURAL` joins, `RIGHT`/`FULL` joins, intervals, and statements other than
