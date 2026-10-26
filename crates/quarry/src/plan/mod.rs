@@ -517,3 +517,120 @@ fn quote_name(name: &str) -> String {
         format!("\"{}\"", name.replace('"', "\"\""))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::datasource::MemTable;
+    use arrow::array::RecordBatch;
+
+    fn table() -> Arc<dyn TableProvider> {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("c", DataType::Float64, true),
+        ]);
+        Arc::new(MemTable::from_batch(RecordBatch::new_empty(Arc::new(
+            schema,
+        ))))
+    }
+
+    fn count(arg: Option<Expr>) -> Expr {
+        Expr::Aggregate {
+            func: AggregateFunction::Count,
+            arg: arg.map(Box::new),
+            distinct: false,
+        }
+    }
+
+    #[test]
+    fn constructors_refuse_what_the_binder_never_builds() {
+        let scan = || LogicalPlan::scan("t", "t", table());
+        let err = LogicalPlan::filter(scan(), Expr::Column(0)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("a filter must be a boolean, not Int64: t.a"),
+            "{err}"
+        );
+        let err = LogicalPlan::aggregate(scan(), vec![], vec![Expr::Column(0)]).unwrap_err();
+        assert!(err.to_string().contains("not an aggregate: t.a"), "{err}");
+        let nested = Expr::Aggregate {
+            func: AggregateFunction::Sum,
+            arg: Some(Box::new(count(None))),
+            distinct: false,
+        };
+        let err = LogicalPlan::aggregate(scan(), vec![], vec![nested]).unwrap_err();
+        assert!(
+            err.to_string().contains("aggregate calls cannot be nested"),
+            "{err}"
+        );
+        let err = LogicalPlan::aggregate(scan(), vec![count(None)], vec![]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("aggregates are not allowed in GROUP BY"),
+            "{err}"
+        );
+        let on = count(Some(Expr::Column(0)));
+        let err = LogicalPlan::join(scan(), scan(), JoinKind::Inner, Some(on)).unwrap_err();
+        assert!(err.to_string().contains("must be a boolean"), "{err}");
+    }
+
+    #[test]
+    fn output_schemas() {
+        let scan = LogicalPlan::scan("t", "x", table());
+        assert_eq!(scan.schema().field(1).qualified_name(), "x.b");
+        // Group columns keep a bare column's field; other group expressions and aggregates are named by their text.
+        let plus = Expr::binary(
+            BinaryOp::Plus,
+            Expr::Column(0),
+            Expr::Literal(ScalarValue::Int64(1)),
+        );
+        let agg =
+            LogicalPlan::aggregate(scan.clone(), vec![Expr::Column(1), plus], vec![count(None)])
+                .unwrap();
+        let names: Vec<String> = agg
+            .schema()
+            .fields()
+            .iter()
+            .map(PlanField::qualified_name)
+            .collect();
+        assert_eq!(names, vec!["x.b", "x.a + 1", "count(*)"]);
+        assert!(!agg.schema().field(2).nullable);
+        // A LEFT join's right side is nullable; the left keeps its own.
+        let left = LogicalPlan::join(
+            scan.clone(),
+            LogicalPlan::scan("t", "y", table()),
+            JoinKind::Left,
+            None,
+        )
+        .unwrap();
+        let nullable: Vec<bool> = left.schema().fields().iter().map(|f| f.nullable).collect();
+        assert_eq!(nullable, vec![false, true, true, true, true, true]);
+        assert_eq!(left.schema().to_arrow().field(3).name(), "a"); // a result's names are unqualified
+    }
+
+    #[test]
+    fn printing_nodes_the_binder_does_not_make_yet() {
+        let LogicalPlan::Scan(mut scan) = LogicalPlan::scan("lineitem", "l", table()) else {
+            unreachable!()
+        };
+        scan.projection = Some(vec![2, 0]); // day 3's projection pushdown sets this
+        let plan = LogicalPlan::limit(LogicalPlan::Scan(scan), 0, None);
+        assert_eq!(
+            plan.to_string(),
+            "Limit: skip=0 fetch=all\n  Scan: lineitem AS l projection=[c, a]\n"
+        );
+        assert_eq!(LogicalPlan::empty(false).to_string(), "Empty: no rows\n");
+        let projection = LogicalPlan::projection(
+            LogicalPlan::scan("t", "t", table()),
+            vec![
+                (Expr::Column(1), "weird \"name\"".to_string()),
+                (Expr::Column(0), "a".to_string()),
+            ],
+        );
+        assert_eq!(
+            projection.to_string().lines().next().unwrap(),
+            "Projection: t.b AS \"weird \"\"name\"\"\", t.a"
+        );
+    }
+}
