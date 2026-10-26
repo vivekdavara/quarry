@@ -410,3 +410,69 @@ fn catalog_registers_files_by_extension() {
         .unwrap_err();
     assert!(err.to_string().contains("unknown file type"), "{err}");
 }
+
+// --- Found by the day-1 review (each failed before its fix) ---
+
+#[test]
+fn csv_timestamps_are_read_as_strings() {
+    // arrow-csv infers Timestamp(...), a type no expression takes; the text is kept instead.
+    let dir = TempDir::new().unwrap();
+    let path = write_csv(
+        dir.path(),
+        "t.csv",
+        "ts\n2024-01-01 10:00:00\n2024-01-02T11:30:00.5\n",
+    );
+    let table = CsvTable::try_new(&path).unwrap();
+    assert_eq!(table.schema().field(0).data_type(), &DataType::Utf8);
+    let batch = concat(&table.schema(), &read_all(&table, None, 1024));
+    let s = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(s.value(1), "2024-01-02T11:30:00.5");
+}
+
+#[test]
+fn csv_dates_that_do_not_exist_make_the_column_strings() {
+    // Inference matched the pattern alone, so 2024-02-30 made the column Date32 and every scan failed on it.
+    let dir = TempDir::new().unwrap();
+    let path = write_csv(
+        dir.path(),
+        "t.csv",
+        "d,ok\n2024-01-31,2024-01-31\n2024-02-30,2024-02-29\n,\n",
+    );
+    let table = CsvTable::try_new(&path).unwrap();
+    let schema = table.schema();
+    let types: Vec<&DataType> = schema.fields().iter().map(|f| f.data_type()).collect();
+    assert_eq!(types, vec![&DataType::Utf8, &DataType::Date32]); // the real dates (and an empty field) stay dates
+    let batch = concat(&table.schema(), &read_all(&table, None, 1024));
+    let s = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(s.value(1), "2024-02-30");
+}
+
+#[test]
+fn csv_a_fake_date_after_the_sample_still_fails_the_scan() {
+    // The check reads the same rows inference did; past them, the documented rule holds.
+    let dir = TempDir::new().unwrap();
+    let path = write_csv(
+        dir.path(),
+        "t.csv",
+        "d\n2024-01-01\n2024-01-02\n2024-02-30\n",
+    );
+    let table = CsvTable::try_new_with(
+        &path,
+        CsvOptions {
+            infer_rows: Some(2),
+            ..CsvOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(table.schema().field(0).data_type(), &DataType::Date32);
+    let result: Result<Vec<_>, _> = table.scan(None, 1024).unwrap().collect();
+    assert!(result.unwrap_err().to_string().contains("2024-02-30"));
+}

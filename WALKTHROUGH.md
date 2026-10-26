@@ -100,9 +100,12 @@ row count; the tests check every reader yields those (`parquet_empty_projection_
 
 **How does CSV schema inference work, and how can it go wrong?**
 `arrow-csv` reads the first 1,000 rows and picks, per column, the narrowest of boolean, integer, float, date or
-timestamp that every value fits, else string. Two traps, both tested: a column with no values at all comes back as
-`Null`, which Quarry turns into strings (`nulls_as_strings`); and a value after the sample that doesn't fit the
-inferred type fails the scan that reaches it, so `CsvOptions { infer_rows: None, .. }` reads the whole file.
+timestamp that every value fits, else string. Quarry then corrects three things, each tested: a column with no
+values comes back as `Null`, and one of date-times as `Timestamp`, and both become strings (`only_design_types`);
+and a "date" column is only checked against the pattern, so one `2024-02-30` would make every scan fail: the
+sampled rows are re-read as text and the column becomes strings unless each value is a real date
+(`real_dates_only`, found by the review). A value after the sample that doesn't fit still fails the scan that
+reaches it, so `CsvOptions { infer_rows: None, .. }` reads the whole file to infer.
 
 ## Testing
 

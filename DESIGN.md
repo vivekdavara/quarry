@@ -57,8 +57,8 @@ providers exist:
   recorded them) are kept in `statistics()`; day 3's predicate pushdown skips row groups with them.
 - **`CsvTable`** reads a CSV file with `arrow-csv`. The file must have a header row. The schema is inferred from the
   first 1,000 rows by default: a column is `Int64` if every non-empty value parses as an integer, `Float64` if every
-  value parses as a number, `Boolean` for `true`/`false`, `Date32` for `YYYY-MM-DD`, and `Utf8` otherwise; an
-  empty field is NULL. A schema can be given instead of inferred.
+  value parses as a number, `Boolean` for `true`/`false`, `Date32` for `YYYY-MM-DD` when every one is a real
+  date, and `Utf8` otherwise (date-times included: no expression takes a timestamp); an empty field is NULL. A schema can be given instead of inferred.
 - **`MemTable`** holds record batches in memory, for tests.
 
 The **catalog** maps table names to providers. Table names are matched without regard to case (`LineItem` and

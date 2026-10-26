@@ -5,12 +5,14 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arrow::array::{Array, StringArray};
 use arrow::csv::ReaderBuilder;
 use arrow::csv::reader::Format;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use super::{BatchIter, TableProvider, TableStatistics, resolve_projection};
 use crate::error::{QuarryError, Result};
+use crate::types::parse_date32;
 
 /// How a CSV file is read.
 #[derive(Debug, Clone)]
@@ -68,7 +70,13 @@ impl CsvTable {
                             path.display()
                         ))
                     })?;
-                Arc::new(nulls_as_strings(inferred))
+                let inferred = only_design_types(inferred);
+                Arc::new(real_dates_only(
+                    &path,
+                    inferred,
+                    options.delimiter,
+                    options.infer_rows,
+                )?)
             }
         };
         if schema.fields().is_empty() {
@@ -117,16 +125,79 @@ fn open(path: &Path) -> Result<File> {
     File::open(path).map_err(|e| QuarryError::Table(format!("cannot open {}: {e}", path.display())))
 }
 
-/// Inference gives a column with no values in the rows it read the type `Null`; such a column is read as strings
-/// instead, as DuckDB does, so that values further down still have somewhere to go.
-fn nulls_as_strings(schema: Schema) -> Schema {
+/// Inference can give types DESIGN.md's inference doesn't list. A column with no values in the rows it read is `Null`,
+/// and one of date-times is a `Timestamp`, which no expression takes; both are read as strings instead (as DuckDB
+/// does for the first), so the values are kept as written and stay usable.
+fn only_design_types(schema: Schema) -> Schema {
     let fields: Vec<Field> = schema
         .fields()
         .iter()
         .map(|f| match f.data_type() {
-            DataType::Null => Field::new(f.name(), DataType::Utf8, true),
+            DataType::Null | DataType::Timestamp(..) | DataType::Date64 => {
+                Field::new(f.name(), DataType::Utf8, true)
+            }
             _ => f.as_ref().clone(),
         })
         .collect();
     Schema::new_with_metadata(fields, schema.metadata().clone())
+}
+
+/// Inference calls a column `Date32` when every value it read looks like `YYYY-MM-DD`, without checking the dates
+/// exist; one `2024-02-30` among them would then fail every scan, so the file couldn't be read at all. This re-reads
+/// those rows as text and makes any such column strings unless every value is a real date.
+fn real_dates_only(
+    path: &Path,
+    schema: Schema,
+    delimiter: u8,
+    infer_rows: Option<usize>,
+) -> Result<Schema> {
+    let dates: Vec<usize> = (0..schema.fields().len())
+        .filter(|&i| schema.field(i).data_type() == &DataType::Date32)
+        .collect();
+    if dates.is_empty() {
+        return Ok(schema);
+    }
+    let text = Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|f| Field::new(f.name(), DataType::Utf8, true))
+            .collect::<Vec<_>>(),
+    );
+    let reader = ReaderBuilder::new(Arc::new(text))
+        .with_header(true)
+        .with_delimiter(delimiter)
+        .with_projection(dates.clone())
+        .build(BufReader::new(open(path)?))?;
+    let mut fake = vec![false; dates.len()];
+    let mut seen = 0usize;
+    for batch in reader {
+        let batch = batch?;
+        let take = infer_rows.map_or(batch.num_rows(), |limit| batch.num_rows().min(limit - seen));
+        for (k, column) in batch.columns().iter().enumerate() {
+            let values = column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("read as Utf8");
+            fake[k] |= values
+                .iter()
+                .take(take)
+                .flatten()
+                .any(|v| !v.is_empty() && parse_date32(v).is_none());
+        }
+        seen += take;
+        if infer_rows.is_some_and(|limit| seen >= limit) {
+            break;
+        }
+    }
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| match dates.iter().position(|&d| d == i) {
+            Some(k) if fake[k] => Field::new(f.name(), DataType::Utf8, true),
+            _ => f.as_ref().clone(),
+        })
+        .collect();
+    Ok(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
