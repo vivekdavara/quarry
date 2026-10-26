@@ -657,5 +657,26 @@ mod tests {
             projection.to_string().lines().next().unwrap(),
             "Projection: t.b AS \"weird \"\"name\"\"\", t.a"
         );
+        // A table column whose name isn't an identifier is quoted where it is used: a digit first, a space, a keyword.
+        let schema = Schema::new(vec![
+            Field::new("9lives", DataType::Int64, true),
+            Field::new("two words", DataType::Int64, true),
+            Field::new("select", DataType::Int64, true),
+        ]);
+        let odd: Arc<dyn TableProvider> = Arc::new(MemTable::from_batch(RecordBatch::new_empty(
+            Arc::new(schema),
+        )));
+        let projection = LogicalPlan::projection(
+            LogicalPlan::scan("t", "t", odd),
+            vec![
+                (Expr::Column(0), "9lives".to_string()),
+                (Expr::Column(1), "two words".to_string()),
+                (Expr::Column(2), "select".to_string()),
+            ],
+        );
+        assert_eq!(
+            projection.to_string().lines().next().unwrap(),
+            "Projection: t.\"9lives\", t.\"two words\", t.\"select\""
+        );
     }
 }

@@ -476,3 +476,34 @@ fn csv_a_fake_date_after_the_sample_still_fails_the_scan() {
     let result: Result<Vec<_>, _> = table.scan(None, 1024).unwrap().collect();
     assert!(result.unwrap_err().to_string().contains("2024-02-30"));
 }
+
+#[test]
+fn a_batch_size_of_zero_means_one_row_a_batch() {
+    let dir = TempDir::new().unwrap();
+    let batch = sample();
+    let parquet = ParquetTable::try_new(write_parquet(dir.path(), &batch, 4)).unwrap();
+    let csv = CsvTable::try_new(write_csv(dir.path(), "t.csv", "a\n1\n2\n3\n")).unwrap();
+    let mem = MemTable::from_batch(batch.slice(0, 3));
+    for (name, table) in [
+        ("parquet", &parquet as &dyn TableProvider),
+        ("csv", &csv),
+        ("mem", &mem),
+    ] {
+        let batches = read_all(table, Some(&[0]), 0);
+        assert!(batches.iter().all(|b| b.num_rows() == 1), "{name}");
+        assert!(batches.len() >= 3, "{name}");
+    }
+}
+
+#[test]
+fn parquet_projection_with_a_repeat_in_order_still_repeats() {
+    // [0, 0] is sorted, but the mask yields column 0 once: the reorder is still needed.
+    let dir = TempDir::new().unwrap();
+    let batch = sample();
+    let table = ParquetTable::try_new(write_parquet(dir.path(), &batch, 4)).unwrap();
+    let expected = batch.project(&[0, 0]).unwrap();
+    assert_eq!(
+        concat(&expected.schema(), &read_all(&table, Some(&[0, 0]), 1024)),
+        expected
+    );
+}

@@ -30,6 +30,7 @@ fn catalog() -> Catalog {
         Field::new("x + 1", DataType::Int64, false),
         Field::new("x", DataType::Int64, false),
         Field::new("f32", DataType::Float32, false),
+        Field::new("large", DataType::LargeUtf8, true),
     ]);
     let mut catalog = Catalog::new();
     for (name, schema) in [("t", t), ("u", u), ("w", w)] {
@@ -992,4 +993,72 @@ fn printed_plans_parse_back_as_the_same_expressions() {
         plan("SELECT a AS \"null\" FROM t").lines().next().unwrap(),
         "Projection: t.a AS \"null\""
     );
+}
+
+// --- Mechanisms the review's mutations showed no test covered ---
+
+#[test]
+fn small_rules_each_pinned() {
+    plan_error(
+        "SELECT * FROM t, T",
+        "the table name T appears more than once in FROM",
+    );
+    unsupported(
+        "SELECT count(a ORDER BY a) FROM t",
+        "ORDER BY or LIMIT inside count",
+    );
+    unsupported(
+        "EXPLAIN VERBOSE SELECT a FROM t",
+        "EXPLAIN ANALYZE and EXPLAIN VERBOSE",
+    );
+    plan_error("SELECT count(DISTINCT *) FROM t", "only COUNT(*) takes *");
+    assert_eq!(
+        plan("SELECT a FROM t WHERE s IS NOT NULL")
+            .lines()
+            .nth(1)
+            .unwrap(),
+        "  Filter: t.s IS NOT NULL"
+    );
+}
+
+#[test]
+fn other_string_types_are_cast_for_like_and_concat() {
+    assert_eq!(
+        plan("SELECT large LIKE 'a%', large || 'x' FROM w")
+            .lines()
+            .next()
+            .unwrap(),
+        "Projection: CAST(w.large AS Utf8) LIKE 'a%' AS \"large LIKE 'a%'\", CAST(w.large AS Utf8) || 'x' AS \"large || 'x'\""
+    );
+}
+
+#[test]
+fn the_aggregate_rewrite_reaches_every_operand() {
+    // The IN operand and the LIKE pattern: transform and visit must walk both.
+    assert_eq!(
+        plan("SELECT b IN (1) FROM t GROUP BY b"),
+        lines(&[
+            "Projection: CAST(t.b AS Int64) IN (1) AS \"b IN (1)\"",
+            "  Aggregate: group_by=[t.b] aggregates=[]",
+            "    Scan: t",
+        ])
+    );
+    assert_eq!(
+        plan("SELECT 'x' LIKE max(s) FROM t")
+            .lines()
+            .nth(1)
+            .unwrap(),
+        "  Aggregate: group_by=[] aggregates=[max(t.s)]"
+    );
+}
+
+#[test]
+fn case_nullability_counts_every_branch() {
+    let nullable = |q: &str| bind(q).schema().field(0).nullable;
+    assert!(nullable("SELECT CASE WHEN flag THEN a ELSE b END FROM t")); // b may be NULL
+    assert!(nullable("SELECT CASE WHEN flag THEN b ELSE a END FROM t"));
+    assert!(nullable("SELECT CASE WHEN flag THEN a END FROM t")); // no ELSE is ELSE NULL
+    assert!(!nullable(
+        "SELECT CASE WHEN flag THEN a ELSE a + 1 END FROM t"
+    ));
 }
