@@ -118,7 +118,7 @@ it on Linux (ubuntu-24.04) and macOS (macos-15) on every push.
 | `tests/binder.rs` (29) | each binding rule in DESIGN.md: the printed plan, or the error and its message |
 | `tests/binder_properties.rs` (3) | random expressions against a model of the type rules (below) |
 | unit tests (11) | the common-type rules, date parsing over every day from 1600 to 2400 and against Arrow's own cast, expression printing |
-| `quarry-cli/tests/cli.rs` (6) | the built binary: output, exit codes, errors on stderr, and that this README's examples print what it says |
+| `quarry-cli/tests/cli.rs` (7) | the built binary: output, exit codes, errors on stderr, and that this README's examples print what it says |
 
 The property tests bind `SELECT <expr> FROM t` for expressions from two generators (a random grammar of every
 supported operator, mostly ill-typed, and a type-directed one that builds well-typed trees three operators deep)

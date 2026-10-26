@@ -3,7 +3,13 @@
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::Arc;
 
+use quarry::arrow::array::{ArrayRef, Int32Array, StringArray};
+use quarry::arrow::datatypes::{DataType, Field, Schema};
+use quarry::arrow::record_batch::RecordBatch;
+use quarry::parquet::arrow::ArrowWriter;
+use quarry::parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 fn quarry(args: &[&str]) -> Output {
@@ -171,5 +177,57 @@ fn the_readme_examples_print_what_the_readme_says() {
         readme.contains(stderr(&out).trim_end()),
         "README's error is stale: {}",
         stderr(&out)
+    );
+}
+
+/// Five rows in row groups of two: ids 1-5 (not null) and names with one NULL.
+fn sample_parquet(dir: &Path) -> String {
+    let ids: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]));
+    let names: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("a"),
+        None,
+        Some("c"),
+        Some("d"),
+        Some("e"),
+    ]));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![ids, names]).unwrap();
+    let path = dir.join("people.parquet");
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(2))
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(fs::File::create(&path).unwrap(), schema, Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+#[test]
+fn parquet_schema_head_and_plan() {
+    let dir = TempDir::new().unwrap();
+    let path = sample_parquet(dir.path());
+    let out = quarry(&["schema", &path]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "id: Int32 not null\nname: Utf8\nrows: 5\nrow groups: 3 (2, 2, 1 rows)\n"
+    );
+    // head reads across row groups and stops at n.
+    let text = stdout(&quarry(&["head", "-n", "3", &path]));
+    assert!(text.contains("| 3  | c    |"), "{text}");
+    assert!(!text.contains("| 4  |"), "{text}");
+    let plan = stdout(&quarry(&[
+        "plan",
+        "-t",
+        &path,
+        "SELECT name FROM people WHERE id % 2 = 1",
+    ]));
+    assert_eq!(
+        plan,
+        "Projection: people.name\n  Filter: CAST(people.id AS Int64) % 2 = 1\n    Scan: people\n"
     );
 }
