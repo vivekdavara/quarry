@@ -22,13 +22,21 @@ pub(crate) struct Scope<'a> {
     pub schema: &'a PlanSchema,
     /// `None` when aggregates are allowed; otherwise the clause, for "aggregates are not allowed in WHERE".
     pub no_aggregates: Option<&'static str>,
+    /// How many expressions enclose the one being bound.
+    depth: usize,
 }
+
+/// The deepest an expression may nest (`a = 0 OR a = 1 OR ...` is one level per OR). Binding, printing and dropping an
+/// expression all recurse once per level; 128 levels fit a 2 MiB thread stack in a debug build (a test checks it),
+/// and no query of the TPC-H kind comes near.
+pub const MAX_EXPR_DEPTH: usize = 128;
 
 impl<'a> Scope<'a> {
     pub fn new(schema: &'a PlanSchema) -> Self {
         Scope {
             schema,
             no_aggregates: None,
+            depth: 0,
         }
     }
 
@@ -36,7 +44,22 @@ impl<'a> Scope<'a> {
         Scope {
             schema,
             no_aggregates: Some(clause),
+            depth: 0,
         }
+    }
+
+    /// The scope for an expression's operands, or an error past the depth limit.
+    fn nested(self) -> Result<Self> {
+        if self.depth >= MAX_EXPR_DEPTH {
+            return Err(unsupported!(
+                "expressions nested more than {MAX_EXPR_DEPTH} deep (a long chain of AND/OR is one level per operator; \
+                 an IN list is one level)"
+            ));
+        }
+        Ok(Scope {
+            depth: self.depth + 1,
+            ..self
+        })
     }
 }
 
@@ -108,6 +131,7 @@ pub(crate) fn resolve_column(
 /// Binds one AST expression in a scope.
 pub(crate) fn bind_expr(ast: &ast::Expr, scope: Scope<'_>) -> Result<Expr> {
     use ast::Expr as A;
+    let scope = scope.nested()?;
     let schema = scope.schema;
     match ast {
         A::Identifier(ident) => Ok(Expr::Column(resolve_column(schema, None, &ident.value)?)),
@@ -622,8 +646,8 @@ fn bind_function(function: &ast::Function, scope: Scope<'_>) -> Result<Expr> {
     let distinct = matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct));
     // Inside an aggregate's argument another aggregate is an error, with this message.
     let inner = Scope {
-        schema,
         no_aggregates: Some("the argument of another aggregate"),
+        ..scope
     };
     let arg = match list.args.as_slice() {
         [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]

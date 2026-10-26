@@ -12,6 +12,7 @@ use crate::error::{QuarryError, Result, unsupported};
 use crate::plan::LogicalPlan;
 
 pub use binder::Binder;
+pub use expr::MAX_EXPR_DEPTH;
 
 /// A bound statement.
 #[derive(Debug, Clone)]

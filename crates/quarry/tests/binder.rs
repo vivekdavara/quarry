@@ -902,3 +902,61 @@ fn avg_sums_in_the_arguments_own_type() {
             .all(|(_, t)| *t == DataType::Float64)
     );
 }
+
+/// Runs `f` on a thread with a 2 MiB stack, Rust's default for spawned threads and for test threads.
+fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+fn or_chain(terms: usize) -> String {
+    let ors: String = (1..terms).map(|i| format!(" OR b = {i}")).collect();
+    format!("SELECT a FROM t WHERE b = 0{ors}")
+}
+
+#[test]
+fn deep_expressions_are_refused_not_a_stack_overflow() {
+    // A 5,000-term OR chain aborted the process (the binder recursed once per OR). It is now an error.
+    let e = error(&or_chain(5000));
+    assert!(matches!(e, QuarryError::Unsupported(_)), "{e}");
+    assert!(
+        e.to_string()
+            .contains(&format!("nested more than {} deep", sql::MAX_EXPR_DEPTH)),
+        "{e}"
+    );
+    // Deep parentheses never get here: sqlparser's own recursion limit refuses them as a syntax error.
+    let parens = error(&format!(
+        "SELECT {}a{} FROM t",
+        "(".repeat(300),
+        ")".repeat(300)
+    ));
+    assert!(matches!(parens, QuarryError::Sql(_)), "{parens}");
+    // Inside an aggregate's argument the depth keeps counting.
+    let ors: String = (1..300).map(|i| format!(" OR b = {i}")).collect();
+    let e = error(&format!("SELECT count(b = 0{ors}) FROM t"));
+    assert!(e.to_string().contains("nested more than"), "{e}");
+}
+
+#[test]
+fn the_deepest_expression_allowed_binds_and_prints_on_a_small_stack() {
+    // Find the longest chain that binds, and check it is close to the limit: each OR term is one level, plus the
+    // comparison and its cast operand. Every Int32 `b` is cast, so the bound tree is deeper than the SQL.
+    let longest = on_small_stack(|| {
+        let mut n = 1;
+        while sql::plan(&catalog(), &or_chain(n + 1)).is_ok() {
+            n += 1;
+        }
+        let plan = sql::plan(&catalog(), &or_chain(n)).unwrap();
+        // Printing and dropping recurse too.
+        assert!(plan.to_string().len() > 1000);
+        n
+    });
+    assert!(
+        (sql::MAX_EXPR_DEPTH - 5..=sql::MAX_EXPR_DEPTH).contains(&longest),
+        "{longest}"
+    );
+}

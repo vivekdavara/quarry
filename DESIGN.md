@@ -122,8 +122,8 @@ on one operator.
 
 **Aggregates:** `COUNT(*)` and `COUNT(x)` → `Int64`; `SUM` of integers → `Int64`, of floats → `Float64`; `AVG` →
 `Float64` (its argument widens as `SUM`'s does, and the division is the last step, so integers above 2^53 aren't
-rounded before they are added or deduplicated); `MIN`, `MAX` → the argument's type (numbers, strings, dates, booleans). `COUNT(DISTINCT x)`,
-`SUM(DISTINCT x)` and the rest take `DISTINCT`. `SUM`, `AVG` need a number.
+rounded before they are added or deduplicated); `MIN`, `MAX` → the argument's type (numbers, strings, dates,
+booleans). `COUNT(DISTINCT x)`, `SUM(DISTINCT x)` and the rest take `DISTINCT`. `SUM`, `AVG` need a number.
 
 **NULL** follows SQL: an operator with a NULL operand is NULL, except `AND`/`OR` (three-valued logic: `FALSE AND
 NULL` is `FALSE`, `TRUE OR NULL` is `TRUE`) and `IS NULL`. Aggregates skip NULLs; `COUNT(*)` counts rows. `WHERE` and
@@ -210,7 +210,9 @@ The binder builds the plan from the bottom up, in SQL's logical order of evaluat
    `LIMIT NULL` is no limit, and `LIMIT m, n` (MySQL's order) is `OFFSET m LIMIT n`.
 
 Unsupported, each an error naming it: subqueries anywhere, `WITH`, `UNION`/`INTERSECT`/`EXCEPT`, window functions,
-`GROUPING SETS`/`ROLLUP`/`CUBE`, `USING`/`NATURAL` joins, `RIGHT`/`FULL` joins, intervals, and statements other than
+`GROUPING SETS`/`ROLLUP`/`CUBE`, `USING`/`NATURAL` joins, `RIGHT`/`FULL` joins, intervals, expressions nested more
+than 128 deep (`MAX_EXPR_DEPTH`: a chain of `OR`s is one level per operator, and binding, printing and dropping
+recurse once per level), and statements other than
 `SELECT` (and `EXPLAIN SELECT`, which prints the plan).
 
 ## The days
