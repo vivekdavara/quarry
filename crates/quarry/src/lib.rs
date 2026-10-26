@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod datasource;
 pub mod error;
 pub mod plan;
+pub mod sql;
 pub mod types;
 
 pub use catalog::Catalog;

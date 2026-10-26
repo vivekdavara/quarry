@@ -43,4 +43,10 @@ macro_rules! plan_err {
     ($($arg:tt)*) => { $crate::error::QuarryError::Plan(format!($($arg)*)) };
 }
 
+/// `unsupported!("JOIN ... USING")` builds a `QuarryError::Unsupported` from a format string.
+macro_rules! unsupported {
+    ($($arg:tt)*) => { $crate::error::QuarryError::Unsupported(format!($($arg)*)) };
+}
+
 pub(crate) use plan_err;
+pub(crate) use unsupported;
