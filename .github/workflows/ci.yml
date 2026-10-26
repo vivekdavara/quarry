@@ -36,7 +36,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          # "debug+release": the Linux job builds both, and a cache whose key already exists is never saved again.
+          key: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-debug+release-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-
       - name: Format, Clippy with warnings as errors, tests, docs without broken links
         run: make check
