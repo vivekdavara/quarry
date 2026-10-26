@@ -10,6 +10,9 @@ pub mod plan;
 pub mod sql;
 pub mod types;
 
+/// The Arrow and Parquet crates Quarry is built on, at the versions it uses.
+pub use {arrow, parquet};
+
 pub use catalog::Catalog;
 pub use error::{QuarryError, Result};
 
