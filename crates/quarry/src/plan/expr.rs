@@ -503,12 +503,16 @@ impl fmt::Display for ExprDisplay<'_> {
                 self.operand(f, e, prec, false)
             }
             Expr::Negative(e) => {
-                // `-` before a negative number or another minus would print `--`, which starts a SQL comment.
+                // A number right after the minus would read back as one negative literal (`-5` is the literal -5,
+                // not the negation of 5), and a minus after it would print `--`, which starts a SQL comment; both
+                // get parentheses: `-(5)`, `-(-5)`, `-(-t.a)`.
                 write!(f, "-")?;
-                let starts_with_minus = matches!(**e, Expr::Negative(_))
-                    || matches!(&**e, Expr::Literal(ScalarValue::Int64(v)) if *v < 0)
-                    || matches!(&**e, Expr::Literal(ScalarValue::Float64(v)) if v.is_sign_negative());
-                if starts_with_minus {
+                let needs_parentheses = matches!(**e, Expr::Negative(_))
+                    || matches!(
+                        &**e,
+                        Expr::Literal(ScalarValue::Int64(_) | ScalarValue::Float64(_))
+                    );
+                if needs_parentheses {
                     write!(f, "({})", self.child(e))
                 } else {
                     self.operand(f, e, prec, false)
@@ -662,6 +666,14 @@ mod tests {
     #[test]
     fn minus_signs_never_print_as_a_comment() {
         assert_eq!(show(&Expr::Negative(Box::new(lit(-5)))), "-(-5)");
+        // Found by the round-trip property: `-0` reads back as the literal 0, not the negation of 0.
+        assert_eq!(show(&Expr::Negative(Box::new(lit(0)))), "-(0)");
+        assert_eq!(
+            show(&Expr::Negative(Box::new(Expr::Literal(
+                ScalarValue::Float64(0.5)
+            )))),
+            "-(0.5)"
+        );
         assert_eq!(
             show(&Expr::Negative(Box::new(Expr::Negative(Box::new(col(0)))))),
             "-(-t.a)"
