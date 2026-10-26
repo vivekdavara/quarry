@@ -121,7 +121,8 @@ on one operator.
 | `CAST(x AS t)` | when Arrow can cast the type to `t` | `t` |
 
 **Aggregates:** `COUNT(*)` and `COUNT(x)` → `Int64`; `SUM` of integers → `Int64`, of floats → `Float64`; `AVG` →
-`Float64`; `MIN`, `MAX` → the argument's type (numbers, strings, dates, booleans). `COUNT(DISTINCT x)`,
+`Float64` (its argument widens as `SUM`'s does, and the division is the last step, so integers above 2^53 aren't
+rounded before they are added or deduplicated); `MIN`, `MAX` → the argument's type (numbers, strings, dates, booleans). `COUNT(DISTINCT x)`,
 `SUM(DISTINCT x)` and the rest take `DISTINCT`. `SUM`, `AVG` need a number.
 
 **NULL** follows SQL: an operator with a NULL operand is NULL, except `AND`/`OR` (three-valued logic: `FALSE AND

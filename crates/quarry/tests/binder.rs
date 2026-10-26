@@ -25,8 +25,14 @@ fn catalog() -> Catalog {
         Field::new("a", DataType::Int64, true),
         Field::new("x", DataType::Utf8, true),
     ]);
+    // From the day-1 review: a Float32 column, and a column whose name is an expression's text.
+    let w = Schema::new(vec![
+        Field::new("x + 1", DataType::Int64, false),
+        Field::new("x", DataType::Int64, false),
+        Field::new("f32", DataType::Float32, false),
+    ]);
     let mut catalog = Catalog::new();
-    for (name, schema) in [("t", t), ("u", u)] {
+    for (name, schema) in [("t", t), ("u", u), ("w", w)] {
         let batch = RecordBatch::new_empty(Arc::new(schema));
         catalog
             .register(name, Arc::new(MemTable::from_batch(batch)))
@@ -165,7 +171,7 @@ fn unknown_and_ambiguous_names_are_errors() {
     plan_error("SELECT a FROM t JOIN u ON a = a", "column a is ambiguous");
     plan_error(
         "SELECT * FROM nope",
-        "table nope not found; the tables are: t, u",
+        "table nope not found; the tables are: t, u, w",
     );
     // Qualifying resolves it.
     assert_eq!(
@@ -864,5 +870,35 @@ fn names_match_by_unicode_lowercase_everywhere() {
     assert_eq!(
         plan.to_string(),
         "Projection: ville.Été, ville.Été\n  Scan: ville\n"
+    );
+}
+
+#[test]
+fn unary_minus_keeps_a_float_type() {
+    assert_eq!(
+        columns("SELECT -f32, +f32 FROM w")
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect::<Vec<_>>(),
+        vec![DataType::Float32, DataType::Float32]
+    );
+    assert_eq!(columns("SELECT -b FROM t")[0].1, DataType::Int64);
+}
+
+#[test]
+fn avg_sums_in_the_arguments_own_type() {
+    // avg(DISTINCT a) bound as avg(DISTINCT CAST(a AS Float64)) deduplicated the rounded floats: over {0, 2^53,
+    // 2^53 + 1} it would count two values, not three. The argument now widens as SUM's does.
+    assert_eq!(
+        plan("SELECT avg(DISTINCT a), avg(b), avg(f) FROM t")
+            .lines()
+            .nth(1)
+            .unwrap(),
+        "  Aggregate: group_by=[] aggregates=[avg(DISTINCT t.a), avg(CAST(t.b AS Int64)), avg(t.f)]"
+    );
+    assert!(
+        columns("SELECT avg(a) FROM t")
+            .iter()
+            .all(|(_, t)| *t == DataType::Float64)
     );
 }

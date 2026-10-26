@@ -11,7 +11,8 @@ use sqlparser::ast::{
 use crate::error::{Result, plan_err, unsupported};
 use crate::plan::{AggregateFunction, BinaryOp, Expr, PlanSchema, ScalarValue};
 use crate::types::{
-    common_type, is_integer, is_numeric, is_string, is_supported, parse_date32, widen_numeric,
+    common_type, is_float, is_integer, is_numeric, is_string, is_supported, parse_date32,
+    widen_numeric,
 };
 
 /// Where an expression is being bound: the columns it can name, and whether it may hold an aggregate (and if not,
@@ -143,8 +144,13 @@ pub(crate) fn bind_expr(ast: &ast::Expr, scope: Scope<'_>) -> Result<Expr> {
                 UnaryOperator::Minus | UnaryOperator::Plus
                     if is_numeric(&t) || t == DataType::Null =>
                 {
-                    let widened = widen_numeric(&t);
-                    let operand = cast_to(operand, &t, &widened);
+                    // Integers widen to Int64 (so -(-128) fits); a float keeps its type.
+                    let target = if is_float(&t) {
+                        t.clone()
+                    } else {
+                        DataType::Int64
+                    };
+                    let operand = cast_to(operand, &t, &target);
                     Ok(if *op == UnaryOperator::Minus {
                         Expr::Negative(Box::new(operand))
                     } else {
@@ -649,13 +655,10 @@ fn bind_function(function: &ast::Function, scope: Scope<'_>) -> Result<Expr> {
                             arg.display(schema)
                         ));
                     }
-                    // The argument is cast to the result's type, so the executor adds values of one type.
-                    let target = if func == AggregateFunction::Avg {
-                        DataType::Float64
-                    } else {
-                        widen_numeric(&t)
-                    };
-                    cast_to(arg, &t, &target)
+                    // Integers widen to Int64 and floats to Float64, so the executor adds values of one type. AVG
+                    // sums the same way and divides as a float at the end: casting each value to Float64 first would
+                    // lose integers above 2^53, and AVG(DISTINCT) would deduplicate the rounded floats.
+                    cast_to(arg, &t, &widen_numeric(&t))
                 }
                 AggregateFunction::Min | AggregateFunction::Max => {
                     if !is_supported(&t) {
