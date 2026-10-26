@@ -6,6 +6,8 @@
 pub mod catalog;
 pub mod datasource;
 pub mod error;
+pub mod plan;
+pub mod types;
 
 pub use catalog::Catalog;
 pub use error::{QuarryError, Result};

@@ -37,3 +37,10 @@ pub enum QuarryError {
 }
 
 pub type Result<T, E = QuarryError> = std::result::Result<T, E>;
+
+/// `plan_err!("unknown column {name}")` builds a `QuarryError::Plan` from a format string.
+macro_rules! plan_err {
+    ($($arg:tt)*) => { $crate::error::QuarryError::Plan(format!($($arg)*)) };
+}
+
+pub(crate) use plan_err;
