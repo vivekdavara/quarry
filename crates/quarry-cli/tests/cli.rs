@@ -138,3 +138,38 @@ fn a_bad_command_line_is_status_2() {
         format!("quarry {}\n", env!("CARGO_PKG_VERSION"))
     );
 }
+
+#[test]
+fn the_readme_examples_print_what_the_readme_says() {
+    let orders = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/orders.csv");
+    let readme =
+        fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md")).unwrap();
+
+    let schema = stdout(&quarry(&["schema", orders]));
+    assert!(
+        readme.contains(&schema),
+        "README's schema output is stale:\n{schema}"
+    );
+
+    let sql = "SELECT customer, count(*) AS orders, sum(total) AS spent FROM orders WHERE status <> 'cancelled' \
+               AND placed >= '2024-01-01' GROUP BY customer HAVING count(*) > 1 ORDER BY spent DESC LIMIT 3";
+    let plan = stdout(&quarry(&["plan", "-t", orders, sql]));
+    assert!(
+        readme.contains(sql),
+        "README's query differs from the test's"
+    );
+    assert!(readme.contains(&plan), "README's plan is stale:\n{plan}");
+
+    let out = quarry(&[
+        "plan",
+        "-t",
+        orders,
+        "SELECT customer FROM orders WHERE total > 'big'",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        readme.contains(stderr(&out).trim_end()),
+        "README's error is stale: {}",
+        stderr(&out)
+    );
+}
