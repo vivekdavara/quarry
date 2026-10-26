@@ -33,9 +33,13 @@ impl PlanField {
     }
 
     /// `qualifier.name`, or `name` without a qualifier.
+    ///
+    /// A table's column (one with a qualifier) prints each part as SQL would need it, quoted when it isn't a plain
+    /// identifier: `w."x + 1"` is a column, `w.x + 1` an expression. A computed column (an aggregate's output, a
+    /// select-list name) has no qualifier and prints its name as it is, which for an aggregate is its own text.
     pub fn qualified_name(&self) -> String {
         match &self.qualifier {
-            Some(q) => format!("{q}.{}", self.name),
+            Some(q) => format!("{}.{}", quote_name(q), quote_name(&self.name)),
             None => self.name.clone(),
         }
     }
@@ -502,15 +506,36 @@ impl fmt::Display for LogicalPlan {
     }
 }
 
-/// A name as it would be written in SQL: bare when it is a plain lowercase identifier, quoted otherwise.
-fn quote_name(name: &str) -> String {
+/// Words that can't be a bare identifier without changing what SQL means: sqlparser's reserved lists, and the keywords
+/// that start or join an expression.
+fn is_reserved(name: &str) -> bool {
+    use sqlparser::keywords::{
+        RESERVED_FOR_COLUMN_ALIAS, RESERVED_FOR_IDENTIFIER, RESERVED_FOR_TABLE_ALIAS,
+    };
+    const EXPRESSION_WORDS: &[&str] = &[
+        "NULL", "TRUE", "FALSE", "NOT", "AND", "OR", "IS", "IN", "LIKE", "ILIKE", "BETWEEN",
+        "CASE", "WHEN", "THEN", "ELSE", "END", "CAST", "AS", "DISTINCT", "ALL", "ANY", "SOME",
+        "DATE",
+    ];
+    let upper = name.to_uppercase();
+    EXPRESSION_WORDS.contains(&upper.as_str())
+        || RESERVED_FOR_COLUMN_ALIAS
+            .iter()
+            .chain(RESERVED_FOR_TABLE_ALIAS)
+            .chain(RESERVED_FOR_IDENTIFIER)
+            .any(|k| format!("{k:?}") == upper)
+}
+
+/// A name as it would be written in SQL: bare when it is an identifier (a letter or `_`, then letters, digits or `_`,
+/// in any case and any script, since names match without regard to case) that isn't reserved; quoted otherwise, with
+/// any `"` doubled.
+pub(crate) fn quote_name(name: &str) -> String {
     let plain = name
         .chars()
         .next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        .is_some_and(|c| c.is_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && !is_reserved(name);
     if plain {
         name.to_string()
     } else {

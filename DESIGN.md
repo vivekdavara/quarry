@@ -161,7 +161,11 @@ qualifier (the table it came from), a name, an Arrow type and nullability.
 Expressions in a node are **bound**: a column is an index into the node's input schema, not a name, and every
 operator's operands already have the types it takes (one type on both sides, except date arithmetic). Names are resolved once, in the binder; after that, nothing looks
 a name up, and two fields with the same name (`SELECT a.id, b.id`) are never confused. The plan prints as an
-indented tree, the root first, expressions shown with their columns' names:
+indented tree, the root first, expressions shown with their columns' names. An expression prints as SQL that binds
+back to the same tree: parentheses follow sqlparser's precedence (OR < AND < NOT < IS < LIKE < comparisons, IN <
+`+ -` < `* / % ||` < unary minus), a table's column is quoted when its name isn't a plain identifier or is reserved
+(`w."x + 1"` is a column, `w.x + 1` an expression), and casts use Arrow's type names, which `CAST` accepts. A
+computed column (an aggregate's output) prints as its own text, unquoted:
 
 ```
 Limit: skip=0 fetch=10

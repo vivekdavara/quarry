@@ -379,7 +379,14 @@ fn sql_type(t: &ast::DataType) -> Result<DataType> {
         | T::Float8
         | T::Float64 => DataType::Float64,
         T::Varchar(None) | T::Text | T::String(None) => DataType::Utf8,
-        T::Date => DataType::Date32,
+        T::Date | T::Date32 => DataType::Date32,
+        // The plan prints casts with Arrow's names; Int64, Float64 and the rest parse as SQL types already, and
+        // Utf8 parses as a custom type. Accepting it makes a printed plan's expressions bind again.
+        T::Custom(name, args)
+            if args.is_empty() && name.to_string().eq_ignore_ascii_case("utf8") =>
+        {
+            DataType::Utf8
+        }
         other => return Err(unsupported!("the type {other}")),
     })
 }

@@ -3,7 +3,8 @@
 //! The binder must never panic. Each expression's type and nullability are worked out a second time, here, by a
 //! direct reading of DESIGN.md's rules (the `model` below, which shares no code with the binder): an expression the
 //! model types must bind, to exactly that type and nullability, and one it rejects must fail with an error. Every
-//! bound expression must also have the explicit casts DESIGN.md promises: both sides of an operator the same type.
+//! bound expression must also have the explicit casts DESIGN.md promises (both sides of an operator the same type),
+//! and must print as SQL that binds back to the same expression.
 
 use std::sync::Arc;
 
@@ -456,6 +457,12 @@ fn typed(class: Class, depth: u32) -> BoxedStrategy<G> {
             prop_oneof![
                 (compare.clone(), number.clone(), number.clone())
                     .prop_map(move |(op, l, r)| bin(op, l, r)),
+                (
+                    prop::sample::select(vec!["=", "<>"]),
+                    sub(Class::Bool),
+                    sub(Class::Bool)
+                )
+                    .prop_map(move |(op, l, r)| bin(op, l, r)),
                 (compare.clone(), sub(Class::Str), sub(Class::Str))
                     .prop_map(move |(op, l, r)| bin(op, l, r)),
                 (
@@ -534,6 +541,19 @@ fn check(g: &G) -> Result<(), TestCaseError> {
             );
             if let Err(problem) = check_operands(&p.exprs[0], input) {
                 prop_assert!(false, "{}: {}", text, problem);
+            }
+            // The printed expression is SQL that binds to the same tree: printing loses nothing, and its
+            // parentheses agree with sqlparser's precedence.
+            let printed = p.exprs[0].display(input).to_string();
+            let again = format!("SELECT {printed} FROM t");
+            match sql::plan(&catalog(), &again) {
+                Ok(LogicalPlan::Projection(q)) => {
+                    prop_assert_eq!(&q.exprs[0], &p.exprs[0], "{} printed as {}", text, printed)
+                }
+                Ok(other) => prop_assert!(false, "{}: not a projection:\n{}", again, other),
+                Err(e) => {
+                    prop_assert!(false, "{} printed as {}, which fails: {}", text, printed, e)
+                }
             }
         }
         (Some(expected), Err(e)) => prop_assert!(

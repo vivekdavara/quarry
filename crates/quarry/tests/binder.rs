@@ -960,3 +960,36 @@ fn the_deepest_expression_allowed_binds_and_prints_on_a_small_stack() {
         "{longest}"
     );
 }
+
+#[test]
+fn printed_plans_parse_back_as_the_same_expressions() {
+    // LIKE binds more loosely than = in sqlparser, so `t.s LIKE 'a' = t.flag` read back as s LIKE ('a' = flag).
+    assert_eq!(
+        plan("SELECT a FROM t WHERE (s LIKE 'a') = flag")
+            .lines()
+            .nth(1)
+            .unwrap(),
+        "  Filter: (t.s LIKE 'a') = t.flag"
+    );
+    // A column named "x + 1" and the expression x + 1 printed alike.
+    assert_eq!(
+        plan("SELECT \"x + 1\" AS k FROM w").lines().next().unwrap(),
+        "Projection: w.\"x + 1\" AS k"
+    );
+    assert_eq!(
+        plan("SELECT x + 1 AS k FROM w").lines().next().unwrap(),
+        "Projection: w.x + 1 AS k"
+    );
+    // A keyword as a name needs quotes (`AS from` doesn't parse); a mixed-case name doesn't (names ignore case).
+    assert_eq!(
+        plan("SELECT a AS \"from\", a AS Total FROM t")
+            .lines()
+            .next()
+            .unwrap(),
+        "Projection: t.a AS \"from\", t.a AS Total"
+    );
+    assert_eq!(
+        plan("SELECT a AS \"null\" FROM t").lines().next().unwrap(),
+        "Projection: t.a AS \"null\""
+    );
+}

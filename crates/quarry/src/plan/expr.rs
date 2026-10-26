@@ -142,14 +142,15 @@ impl BinaryOp {
         }
     }
 
+    /// Binding strength, in sqlparser's order (its `prec_value`), so a printed expression parses back to the same
+    /// tree: OR < AND < NOT < IS < LIKE < comparisons, IN, BETWEEN < + - < * / % || < unary minus.
     fn precedence(self) -> u8 {
         match self {
             BinaryOp::Or => 1,
             BinaryOp::And => 2,
-            op if op.is_comparison() => 4,
-            BinaryOp::Concat => 5,
-            BinaryOp::Plus | BinaryOp::Minus => 6,
-            _ => 7, // * / %
+            op if op.is_comparison() => 6,
+            BinaryOp::Plus | BinaryOp::Minus => 8,
+            _ => 9, // * / % and || (sqlparser gives || the precedence of *)
         }
     }
 }
@@ -441,12 +442,17 @@ impl Expr {
         match self {
             Expr::Binary { op, .. } => op.precedence(),
             Expr::Not(_) => 3,
-            Expr::IsNull(_) | Expr::IsNotNull(_) | Expr::Like { .. } | Expr::InList { .. } => 4,
-            Expr::Negative(_) => 8,
-            _ => 9, // atoms: columns, literals, CASE, CAST, function calls
+            Expr::IsNull(_) | Expr::IsNotNull(_) => 4,
+            Expr::Like { .. } => 5,
+            Expr::InList { .. } => 6,
+            Expr::Negative(_) => 10,
+            _ => 11, // atoms: columns, literals, CASE, CAST, function calls
         }
     }
 }
+
+/// The precedence of the comparison operators (and IN).
+const COMPARISON: u8 = 6;
 
 /// An expression with the schema that names its columns, for printing.
 #[derive(Debug, Clone, Copy)]
@@ -508,12 +514,13 @@ impl fmt::Display for ExprDisplay<'_> {
                     self.operand(f, e, prec, false)
                 }
             }
+            // `(a = 1) IS NULL`, not `a = 1 IS NULL`: sqlparser reads both alike, people don't.
             Expr::IsNull(e) => {
-                self.operand(f, e, prec, true)?;
+                self.operand(f, e, COMPARISON + 1, false)?;
                 write!(f, " IS NULL")
             }
             Expr::IsNotNull(e) => {
-                self.operand(f, e, prec, true)?;
+                self.operand(f, e, COMPARISON + 1, false)?;
                 write!(f, " IS NOT NULL")
             }
             Expr::Like {
