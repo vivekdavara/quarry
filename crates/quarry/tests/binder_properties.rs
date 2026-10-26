@@ -555,8 +555,16 @@ fn check(g: &G) -> Result<(), TestCaseError> {
     Ok(())
 }
 
+/// 3,000 cases a property by default; `PROPTEST_CASES=100000 cargo test --release` searches longer.
+fn cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3000)
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 3000, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig::with_cases(cases()))]
 
     #[test]
     fn the_binder_agrees_with_the_model(g in expr()) {
