@@ -38,9 +38,5 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-
-      - name: Format, Clippy with warnings as errors, tests
+      - name: Format, Clippy with warnings as errors, tests, docs without broken links
         run: make check
-      - name: Docs build without warnings
-        run: cargo doc --workspace --no-deps --locked
-        env:
-          RUSTDOCFLAGS: -D warnings

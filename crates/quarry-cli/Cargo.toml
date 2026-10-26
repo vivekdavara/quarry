@@ -11,6 +11,8 @@ authors.workspace = true
 [[bin]]
 name = "quarry"
 path = "src/main.rs"
+# The library is also called quarry; documenting both would write to the same target/doc/quarry/.
+doc = false
 
 [dependencies]
 quarry = { path = "../quarry" }
