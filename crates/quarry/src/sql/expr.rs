@@ -154,7 +154,7 @@ pub(crate) fn bind_expr(ast: &ast::Expr, scope: Scope<'_>) -> Result<Expr> {
         A::BinaryOp { left, op, right } => {
             let l = bind_expr(left, scope)?;
             let r = bind_expr(right, scope)?;
-            bind_binary(op, l, r, schema)
+            bind_binary(op, l, r, schema, ast)
         }
         A::IsNull(e) => Ok(Expr::IsNull(Box::new(bind_expr(e, scope)?))),
         A::IsNotNull(e) => Ok(Expr::IsNotNull(Box::new(bind_expr(e, scope)?))),
@@ -172,6 +172,7 @@ pub(crate) fn bind_expr(ast: &ast::Expr, scope: Scope<'_>) -> Result<Expr> {
                 ],
                 schema,
                 "BETWEEN",
+                ast,
             )?;
             let (high, low, value) = (all.pop().unwrap(), all.pop().unwrap(), all.pop().unwrap());
             Ok(if *negated {
@@ -197,7 +198,7 @@ pub(crate) fn bind_expr(ast: &ast::Expr, scope: Scope<'_>) -> Result<Expr> {
             for item in list {
                 all.push(bind_expr(item, scope)?);
             }
-            let mut all = coerce_all(all, schema, "IN")?;
+            let mut all = coerce_all(all, schema, "IN", ast)?;
             let value = all.remove(0);
             Ok(Expr::InList {
                 expr: Box::new(value),
@@ -246,6 +247,7 @@ pub(crate) fn bind_expr(ast: &ast::Expr, scope: Scope<'_>) -> Result<Expr> {
             conditions,
             else_result.as_deref(),
             scope,
+            ast,
         ),
         A::Cast {
             kind,
@@ -351,7 +353,17 @@ fn cast_to(e: Expr, from: &DataType, to: &DataType) -> Expr {
 
 /// Makes every expression the same type: the common type of all (DESIGN.md's rules 1–4), after rule 5 turns string
 /// literals into dates when any of the expressions is a date. Returns them cast to it.
-fn coerce_all(exprs: Vec<Expr>, schema: &PlanSchema, what: &str) -> Result<Vec<Expr>> {
+fn coerce_all(
+    exprs: Vec<Expr>,
+    schema: &PlanSchema,
+    what: &str,
+    context: &ast::Expr,
+) -> Result<Vec<Expr>> {
+    let prefix = if what.is_empty() {
+        String::new()
+    } else {
+        format!("{what}: ")
+    };
     let has_date = exprs
         .iter()
         .any(|e| e.data_type(schema) == DataType::Date32);
@@ -362,7 +374,7 @@ fn coerce_all(exprs: Vec<Expr>, schema: &PlanSchema, what: &str) -> Result<Vec<E
                 Expr::Literal(ScalarValue::Utf8(s)) => match parse_date32(&s) {
                     Some(days) => Ok(Expr::Literal(ScalarValue::Date32(days))),
                     None => Err(plan_err!(
-                        "'{s}' is compared with a date but isn't one (expected YYYY-MM-DD)"
+                        "{prefix}'{s}' is compared with a date but isn't one (expected YYYY-MM-DD) in {context}"
                     )),
                 },
                 e => Ok(e),
@@ -373,13 +385,13 @@ fn coerce_all(exprs: Vec<Expr>, schema: &PlanSchema, what: &str) -> Result<Vec<E
     };
     let types: Vec<DataType> = exprs.iter().map(|e| e.data_type(schema)).collect();
     if let Some(bad) = types.iter().find(|t| !is_supported(t)) {
-        return Err(unsupported!("{what} over the type {bad}"));
+        return Err(unsupported!("{prefix}{bad} values in {context}"));
     }
     let mut target = DataType::Null;
     for (e, t) in exprs.iter().zip(&types) {
         target = common_type(&target, t).ok_or_else(|| {
             plan_err!(
-                "{what}: cannot compare {target} with {t} ({})",
+                "{prefix}cannot compare {target} with {t} ({}) in {context}",
                 e.display(schema)
             )
         })?;
@@ -414,7 +426,14 @@ fn string_operand(what: &str, e: Expr, schema: &PlanSchema) -> Result<Expr> {
     }
 }
 
-fn bind_binary(op: &BinaryOperator, l: Expr, r: Expr, schema: &PlanSchema) -> Result<Expr> {
+/// Binds `l op r`; `context` is the whole expression as written, for error messages.
+fn bind_binary(
+    op: &BinaryOperator,
+    l: Expr,
+    r: Expr,
+    schema: &PlanSchema,
+    context: &ast::Expr,
+) -> Result<Expr> {
     let op = match op {
         BinaryOperator::Plus => BinaryOp::Plus,
         BinaryOperator::Minus => BinaryOp::Minus,
@@ -447,7 +466,7 @@ fn bind_binary(op: &BinaryOperator, l: Expr, r: Expr, schema: &PlanSchema) -> Re
             string_operand("||", r, schema)?,
         )),
         op if op.is_comparison() => {
-            let mut both = coerce_all(vec![l, r], schema, "a comparison")?;
+            let mut both = coerce_all(vec![l, r], schema, "", context)?;
             let r = both.pop().unwrap();
             let l = both.pop().unwrap();
             Ok(Expr::binary(op, l, r))
@@ -508,6 +527,7 @@ fn bind_case(
     conditions: &[ast::CaseWhen],
     else_result: Option<&ast::Expr>,
     scope: Scope<'_>,
+    context: &ast::Expr,
 ) -> Result<Expr> {
     let schema = scope.schema;
     let mut whens = Vec::with_capacity(conditions.len());
@@ -518,7 +538,7 @@ fn bind_case(
             for c in conditions {
                 all.push(bind_expr(&c.condition, scope)?);
             }
-            let mut all = coerce_all(all, schema, "CASE")?;
+            let mut all = coerce_all(all, schema, "CASE", context)?;
             let value = all.remove(0);
             whens.extend(
                 all.into_iter()
@@ -543,7 +563,7 @@ fn bind_case(
         Some(e) => bind_expr(e, scope)?,
         None => Expr::Literal(ScalarValue::Null),
     });
-    let mut results = coerce_all(results, schema, "CASE results")?;
+    let mut results = coerce_all(results, schema, "CASE results", context)?;
     let else_expr = results.pop().unwrap();
     Ok(Expr::Case {
         when_then: whens.into_iter().zip(results).collect(),

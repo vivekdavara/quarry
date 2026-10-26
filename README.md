@@ -102,7 +102,7 @@ before anything is read, with status 1:
 ```
 
 ```
-error: plan error: a comparison: cannot compare Float64 with Utf8 ('big')
+error: plan error: cannot compare Float64 with Utf8 ('big') in total > 'big'
 ```
 
 `quarry head -n 3 examples/orders.csv` prints rows; `quarry --help` lists the rest.

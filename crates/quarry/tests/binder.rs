@@ -214,7 +214,7 @@ fn comparisons_cast_to_the_common_type() {
     );
     plan_error(
         "SELECT a FROM t WHERE s = 1",
-        "cannot compare Utf8 with Int64",
+        "cannot compare Utf8 with Int64 (1) in s = 1",
     );
     plan_error(
         "SELECT a FROM t WHERE flag = 1",
@@ -345,7 +345,7 @@ fn between_and_in_desugar_or_coerce() {
     );
     plan_error(
         "SELECT a FROM t WHERE a IN (1, 'x')",
-        "IN: cannot compare Int64 with Utf8",
+        "IN: cannot compare Int64 with Utf8 ('x') in a IN (1, 'x')",
     );
 }
 
@@ -429,10 +429,7 @@ fn unsupported_types_are_named() {
     // A column of an unsupported type passes through, but no operator takes it.
     assert_eq!(columns("SELECT big FROM t")[0].1, DataType::UInt64);
     unsupported("SELECT big + 1 FROM t", "arithmetic on UInt64 and Int64");
-    unsupported(
-        "SELECT a FROM t WHERE big = 1",
-        "a comparison over the type UInt64",
-    );
+    unsupported("SELECT a FROM t WHERE big = 1", "UInt64 values in big = 1");
     unsupported("SELECT min(big) FROM t", "min over the type UInt64");
     assert_eq!(columns("SELECT count(big) FROM t")[0].1, DataType::Int64);
 }
