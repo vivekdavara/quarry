@@ -127,6 +127,34 @@ A random grammar over every operator mostly makes ill-typed trees (322 typable o
 tests the refusals well and the deep casts badly. The type-directed generator builds well-typed trees three
 operators deep, where casts nest inside `CASE`s inside arithmetic.
 
+## What went wrong on day 1
+
+**What did the review find?**
+Ten bugs, each reproduced as a failing test before it was fixed (README, "Review of day 1"). The instructive ones:
+`GROUP BY a` silently fell back to a select alias when `a` was an *ambiguous* FROM column (the fallback ran on any
+resolution error, not just "not found"); `avg(DISTINCT a)` deduplicated the values after casting them to Float64,
+so two integers above 2^53 counted once; and a long `OR` chain overflowed the stack.
+
+**Why did a long OR chain crash, and how is it handled?**
+sqlparser parses `a = 0 OR a = 1 OR ...` in a loop, but the result is a left-deep tree, and the binder, the printer
+and even `Drop` recurse once per level. A debug build ran out of an 8 MiB stack at about 800 terms. The binder now
+counts depth in its `Scope` and refuses past `MAX_EXPR_DEPTH` (128) with an error; a test binds, prints and drops the
+deepest allowed chain on a 2 MiB stack, the size of a test thread. Deep parentheses never get that far: sqlparser
+has its own recursion limit.
+
+**How do you know a printed plan means what the plan means?**
+The property tests now print every bound expression, bind the printed text again, and require the identical tree.
+That caught the printer giving LIKE the comparisons' precedence (sqlparser binds LIKE more loosely than `=`), and
+then, on its own in a 100,000-case search, `-(-0)` printing as `-0`, which binds back as the literal 0 rather than a
+negation: a minus before a number is part of the literal when parsed. A number under unary minus is now printed
+in parentheses.
+
+**How did you test the tests?**
+By mutation: change one line of the engine, run the suite, restore the file from a copy. The review's 31 mutations
+left 25 undetected at its commit; after the property tests 12 still were, and each got a test until all 22 that
+still apply fail the suite. One run's results were noise at first: a proptest failure file saved under one mutant
+was replayed under the next, so the runner now deletes it before each.
+
 ## Limits and next steps
 
 **What doesn't it support, and what happens if you try?**

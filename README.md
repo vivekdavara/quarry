@@ -114,18 +114,43 @@ it on Linux (ubuntu-24.04) and macOS (macos-15) on every push.
 
 | Suite | What it checks |
 |---|---|
-| `tests/datasource.rs` (17) | Parquet and CSV files written in the test read back equal; projections in any order and with repeats; empty projections still count rows; batch sizes; inferred CSV types and NULLs; the catalog's names |
-| `tests/binder.rs` (29) | each binding rule in DESIGN.md: the printed plan, or the error and its message |
+| `tests/datasource.rs` (22) | Parquet and CSV files written in the test read back equal; projections in any order and with repeats; empty projections still count rows; batch sizes (0 included); inferred CSV types, NULLs, timestamps and impossible dates; the catalog's names |
+| `tests/binder.rs` (41) | each binding rule in DESIGN.md: the printed plan, or the error and its message; the review's findings; the depth limit on a 2 MiB stack |
 | `tests/binder_properties.rs` (3) | random expressions against a model of the type rules (below) |
-| unit tests (11) | the common-type rules, date parsing over every day from 1600 to 2400 and against Arrow's own cast, expression printing |
+| unit tests (14) | the common-type rules, date parsing over every day from 1600 to 2400 and against Arrow's own cast, expression printing, the plan nodes' guards and schemas |
 | `quarry-cli/tests/cli.rs` (7) | the built binary: output, exit codes, errors on stderr, and that this README's examples print what it says |
 
 The property tests bind `SELECT <expr> FROM t` for expressions from two generators (a random grammar of every
 supported operator, mostly ill-typed, and a type-directed one that builds well-typed trees three operators deep)
 and compare each with a model in the test that re-reads DESIGN.md's rules without sharing code with the binder. An
 expression the model types must bind to exactly that type and nullability; one it refuses must fail with an error;
-nothing may panic; and every bound operator must see one type on both sides. Mutating the binder (dropping its
-casts, integer division, a wrong nullability) fails them; see the commit that added them for the run.
+nothing may panic; every bound operator must see one type on both sides; and the printed expression must bind back
+to the same tree. Mutating the binder (dropping its casts, integer division, a wrong nullability, LIKE's printing
+precedence) fails them. `PROPTEST_CASES=100000 cargo test --release -p quarry --test binder_properties` searches
+longer (about 5 s here); CI's Linux job runs that on every push.
+
+## Review of day 1
+
+One review agent read the day's code at `6a48287` against DESIGN.md (19 minutes, in its own worktree) and saved
+each bug it reproduced as a failing test. It found 10; each is fixed, and its test, adapted, is in the suites above:
+
+| Finding | Fix |
+|---|---|
+| `GROUP BY a` with `a` an ambiguous FROM column fell back to a select alias | the alias is only for names no FROM column has |
+| `SELECT DISTINCT FROM t` and `SELECT FROM t HAVING TRUE` bound to the same plan, which need 0 and 1 rows | an empty select list is an error |
+| `avg(DISTINCT a)` deduplicated `CAST(a AS Float64)`: 2^53 and 2^53 + 1 counted once | AVG's argument widens as SUM's does; the division is last |
+| a 5,000-term `OR` chain overflowed the stack and aborted the process | expressions nest at most 128 deep (`MAX_EXPR_DEPTH`) |
+| `-x` on a Float32 came out Float64 | floats keep their type |
+| `(s LIKE 'a') = flag` printed as `s LIKE 'a' = flag`, which parses differently | printing follows sqlparser's precedence |
+| a column named `x + 1` printed like the expression `x + 1` | a table column's name is quoted when it isn't an identifier |
+| `AS "from"` printed as `AS from` | reserved words are quoted |
+| CSV date-times inferred as `Timestamp`, which no expression takes | read as strings |
+| one `2024-02-30` in a CSV's sampled rows made the file unreadable | a date column with an impossible date is strings |
+
+Of its 31 mutations, 25 left every test passing at its commit. Re-run against the suite after the property tests,
+12 still did; each now has a test, and all fail the suite (`git log` on `1ec4696` lists them). The round-trip
+property then found one more bug itself: `-(-0)` printed as `-0`, which binds back as the literal 0, not a negation
+(`0d191f7`).
 
 ## Design decisions
 
@@ -152,7 +177,7 @@ casts, integer division, a wrong nullability) fails them; see the commit that ad
 - No decimal, timestamp or `UInt64` arithmetic: such columns can be selected but not computed on.
 - CSV schemas are inferred from the first 1,000 rows by default; a later value of another type fails the scan that
   reaches it (`CsvOptions { infer_rows: None, .. }` reads the whole file to infer).
-- Integer literals must fit in 64 bits.
+- Integer literals must fit in 64 bits, and expressions nest at most 128 levels (a chain of 128 `OR`s).
 
 ## License
 
