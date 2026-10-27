@@ -5,8 +5,8 @@ use thiserror::Error;
 /// Everything that can go wrong between a SQL string and its result.
 ///
 /// The variants say whose fault it is: `Sql` and `Plan` are the query's (a syntax error, an unknown column, a type
-/// mismatch), `Unsupported` is the engine's (valid SQL it doesn't implement yet), and `Io`, `Arrow` and `Parquet`
-/// are the data's or the machine's.
+/// mismatch), `Unsupported` is the engine's (valid SQL it doesn't implement yet), and `Execution`, `Io`, `Arrow` and
+/// `Parquet` are the data's or the machine's.
 #[derive(Debug, Error)]
 pub enum QuarryError {
     /// The SQL text doesn't parse.
@@ -25,6 +25,11 @@ pub enum QuarryError {
     /// A table can't be read or registered.
     #[error("table error: {0}")]
     Table(String),
+
+    /// The query is valid but its data makes it fail: an integer overflow, a modulo by zero, a value that doesn't
+    /// cast.
+    #[error("execution error: {0}")]
+    Execution(String),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -48,5 +53,11 @@ macro_rules! unsupported {
     ($($arg:tt)*) => { $crate::error::QuarryError::Unsupported(format!($($arg)*)) };
 }
 
+/// `exec_err!("integer overflow in {expr}")` builds a `QuarryError::Execution` from a format string.
+macro_rules! exec_err {
+    ($($arg:tt)*) => { $crate::error::QuarryError::Execution(format!($($arg)*)) };
+}
+
+pub(crate) use exec_err;
 pub(crate) use plan_err;
 pub(crate) use unsupported;
