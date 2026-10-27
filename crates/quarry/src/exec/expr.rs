@@ -189,12 +189,25 @@ fn strict() -> CastOptions<'static> {
     }
 }
 
-/// `CAST(v AS to)`. A float cast to an integer rounds half to even first, as DuckDB does (Arrow truncates).
+/// `CAST(v AS to)`. A float cast to an integer rounds half to even first, as DuckDB does (Arrow truncates). A Float64
+/// beyond Float32's range fails its cast to Float32, as in DuckDB (Arrow makes it infinite); infinities and NaN cast.
 fn cast_value(v: Value, to: &DataType) -> Result<Value, ArrowError> {
     if v.data_type() == to {
         return Ok(v);
     }
     v.map(|a| {
+        if *a.data_type() == DataType::Float64 && *to == DataType::Float32 {
+            let too_big = a
+                .as_primitive::<Float64Type>()
+                .iter()
+                .flatten()
+                .find(|x| x.is_finite() && x.abs() > f64::from(f32::MAX));
+            if let Some(x) = too_big {
+                return Err(ArrowError::CastError(format!(
+                    "the value {x:e} is out of range for Float32"
+                )));
+            }
+        }
         let a: ArrayRef = match a.data_type() {
             DataType::Float64 if is_integer(to) => Arc::new(
                 a.as_primitive::<Float64Type>()
@@ -794,6 +807,19 @@ mod tests {
         assert!(e.contains("in CAST(t.f AS Int64)"), "NaN doesn't cast: {e}");
         let e = error("CAST(1e19 AS BIGINT)");
         assert!(e.contains("in CAST(1e19 AS Int64)"), "{e}");
+        // Found by the day-2 review: Arrow made these infinite. DuckDB 2.0 fails each ("out of range for the
+        // destination type FLOAT"); 3.40282357e38 is just past f32::MAX.
+        for sql in [
+            "CAST(1e300 AS REAL)",
+            "CAST(-1e300 AS REAL)",
+            "CAST(3.40282357e38 AS REAL)",
+        ] {
+            let e = error(sql);
+            assert!(e.contains("is out of range for Float32"), "{sql}: {e}");
+        }
+        assert_eq!(show("CAST(f AS REAL)"), ["-0.0", "NaN", "2.5", "NULL"]);
+        assert_eq!(show("CAST(1e308 * 10 AS REAL)"), ["inf"; 4]);
+        assert_eq!(show("CAST(3.4028234e38 AS REAL)"), ["3.4028235e38"; 4]); // rounds to f32::MAX
     }
 
     #[test]
