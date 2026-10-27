@@ -1,0 +1,13 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 28cf6ce1a8e548159c4db5e386a133fa88c81325e2a805a092bc5e8b20e66629 # shrinks to sql = "((-9223372036854775808) + (b + d))", rows = [(None, Some(0), None, None, Some(-1), None)], split = 0
+cc da442ae0b46fff33660996594cf06450ac2ec9cd57b2f0090e2d5855f6d20706 # shrinks to sql = "CAST((-0.0 NOT IN (f, a)) AS VARCHAR)", rows = [(Some(0), None, None, None, None, None)], split = 0
+cc 12afbda3453d65d202825690019896f52d424ac99215b62c736094312557960c # shrinks to sql = "(-1 BETWEEN CASE WHEN FALSE THEN a WHEN (7 IN (7, a, NULL)) THEN (0 * 0) END AND CASE a WHEN (7 * 9223372036854775807) THEN a ELSE a END)", rows = [(None, None, None, None, None, None)], split = 0
+cc 5bf49deda816d75af44f0b89b560e33bc0fc4b24613fa83739dd15646e40cff0 # shrinks to sql = "(((DATE '2024-02-29' - DATE '2024-02-29') * a) + CASE WHEN p THEN (a % b) ELSE a END)", rows = [(Some(0), Some(0), None, None, None, None), (None, None, None, None, None, Some(true))], split = 0
+cc f832cb82afcab102e2c8c954e13ef4d7a0e8db5ff9c29f3e2c851c9747036ee0 # shrinks to sql = "CAST((1.5 + 0.0) AS SMALLINT)", rows = [(None, None, None, None, None, None)], split = 0
+cc 3fbca34bac2738c76fdad8686bcdd03f8f62c8d7ed93c72bac5a63d79a2de71e # shrinks to sql = "(f + CASE WHEN FALSE THEN f ELSE (a % -1) END)", rows = [(Some(-9223372036854775808), None, None, None, None, None)], split = 0
+cc ebe2877a837b5273ba5ab23b8ac12eaad914c79c2e0b7f95dc7681bb15372e6a # shrinks to sql = "CASE WHEN ('_' LIKE s) THEN s END", rows = [(None, None, None, Some("\\_"), None, None)], split = 0

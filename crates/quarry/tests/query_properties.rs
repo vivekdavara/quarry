@@ -1,6 +1,7 @@
-//! Random GROUP BY queries over random rows, run by the engine at a random batch size and computed a second time by
-//! the reference below: plain Rust over the rows, grouping by value with SQL's rules (-0.0 is 0.0, NaNs are one value,
-//! NULL is a group of its own). The results must hold the same rows (in any order), or both must fail.
+//! Random GROUP BY and ORDER BY queries over random rows, run by the engine at a random batch size and computed a
+//! second time by the references below, in plain Rust over the rows: grouping by value with SQL's rules (-0.0 is 0.0,
+//! NaNs are one value, NULL is a group of its own), and a stable sort with NULLs placed as asked. Grouped results must
+//! hold the same rows in any order; sorted ones the same rows in the same order. Or both must fail.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -345,4 +346,111 @@ fn the_reference_sees_every_distinct_float_once() {
         .collect();
     let distinct: HashSet<String> = rows.iter().map(|r| format!("{:?}", cells(r)[2])).collect();
     assert_eq!(distinct.len(), 3);
+}
+
+/// One ORDER BY key: a column, descending, NULLS FIRST.
+type Key = (usize, bool, bool);
+
+/// The reference sort: stable, so ties keep the table's order, then OFFSET and LIMIT. Rows are output as their ids.
+fn sorted_ids(rows: &[Row], keys: &[Key], limit: Option<usize>, offset: usize) -> Vec<Vec<V>> {
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    let cells: Vec<[V; 5]> = rows.iter().map(cells).collect();
+    order.sort_by(|&x, &y| {
+        for &(c, desc, nulls_first) in keys {
+            let (a, b) = (&cells[x][c], &cells[y][c]);
+            let o = match (a, b) {
+                (V::Null, V::Null) => std::cmp::Ordering::Equal,
+                (V::Null, _) => {
+                    if nulls_first {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Greater
+                    }
+                }
+                (_, V::Null) => {
+                    if nulls_first {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Less
+                    }
+                }
+                _ => {
+                    let o = if less(a, b) {
+                        std::cmp::Ordering::Less
+                    } else if less(b, a) {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Equal
+                    };
+                    if desc { o.reverse() } else { o }
+                }
+            };
+            if o != std::cmp::Ordering::Equal {
+                return o;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    order
+        .into_iter()
+        .skip(offset)
+        .take(limit.unwrap_or(usize::MAX))
+        .map(|i| vec![V::Int(i as i64)])
+        .collect()
+}
+
+fn keys() -> impl Strategy<Value = Vec<Key>> {
+    proptest::collection::vec((0usize..5, any::<bool>(), any::<bool>()), 1..4)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(
+        std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(1000)
+    ))]
+
+    #[test]
+    fn order_by_agrees_with_a_stable_sort(
+        rows in rows(),
+        keys in keys(),
+        limit in proptest::option::of(0usize..12),
+        offset in 0usize..6,
+        batch_size in 1usize..8,
+    ) {
+        // An id column numbers the rows, so the output says which row came where.
+        let ids: Vec<i64> = (0..rows.len() as i64).collect();
+        let base = batch(&rows);
+        let mut fields = vec![Field::new("id", DataType::Int64, false)];
+        fields.extend(base.schema().fields().iter().map(|f| f.as_ref().clone()));
+        let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(ids))];
+        columns.extend(base.columns().iter().cloned());
+        let table = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        let mut catalog = Catalog::new();
+        catalog.register("t", Arc::new(MemTable::from_batch(table))).unwrap();
+        let order: Vec<String> = keys
+            .iter()
+            .map(|&(c, desc, nulls_first)| {
+                format!(
+                    "{} {} NULLS {}",
+                    COLUMNS[c],
+                    if desc { "DESC" } else { "ASC" },
+                    if nulls_first { "FIRST" } else { "LAST" }
+                )
+            })
+            .collect();
+        let mut query = format!("SELECT id FROM t ORDER BY {}", order.join(", "));
+        if let Some(n) = limit {
+            query += &format!(" LIMIT {n}");
+        }
+        query += &format!(" OFFSET {offset}");
+        let plan = sql::plan(&catalog, &query).unwrap();
+        let result = collect_with_batch_size(&plan, batch_size).unwrap();
+        prop_assert!(result.batches.iter().all(|b| b.num_rows() <= batch_size));
+        prop_assert_eq!(
+            engine_rows(&result),
+            sorted_ids(&rows, &keys, limit, offset),
+            "{}\nrows {:?}",
+            query,
+            rows
+        );
+    }
 }

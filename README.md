@@ -64,7 +64,7 @@ crates/quarry/          the engine (a library)
   src/sql/              parsing and the binder
   src/exec/             the executor: operators (mod.rs), expressions (expr.rs), aggregation (aggregate.rs)
   tests/                datasource.rs, binder.rs, binder_properties.rs, execute.rs, eval_properties.rs,
-                        aggregate_properties.rs
+                        query_properties.rs
   examples/             gen_orders.rs (synthetic Parquet data), time_queries.rs (the timings below)
 crates/quarry-cli/      the `quarry` binary and its tests
 examples/orders.csv     eight synthetic rows for the examples below
@@ -147,7 +147,7 @@ it on Linux (ubuntu-24.04) and macOS (macos-15) on every push.
 | `tests/binder_properties.rs` (3) | random expressions against a model of the type rules (below) |
 | `tests/execute.rs` (14) | queries end to end at batch sizes 1, 2, 3 and 8192 (which must agree): filters, projections, ORDER BY (NULLs, -0.0, ties, hidden keys), LIMIT/OFFSET and that a LIMIT stops reading, every aggregate, GROUP BY expressions, HAVING, DISTINCT, aggregates over no rows, float groups, i128 sums, errors; the same queries over CSV and Parquet files |
 | `tests/eval_properties.rs` (3) | random well-typed expressions over random rows, evaluated by the engine and by a row-at-a-time reference interpreter in the test (below) |
-| `tests/aggregate_properties.rs` (2) | random GROUP BY queries at random batch sizes against a reference grouping in plain Rust |
+| `tests/query_properties.rs` (3) | random GROUP BY queries, and random ORDER BY with LIMIT and OFFSET, at random batch sizes against a reference grouping and a stable sort in plain Rust |
 | unit tests (28) | the common-type rules, date parsing over every day from 1600 to 2400 and against Arrow's own cast, expression printing, the plan nodes' guards and schemas; each operator of the evaluator, with DuckDB 2.0's answers |
 | `quarry-cli/tests/cli.rs` (9) | the built binary: output, exit codes, errors on stderr, `quarry query`, and that this README's examples print what it says |
 
