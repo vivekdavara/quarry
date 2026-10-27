@@ -14,7 +14,8 @@ use arrow::compute::{
     SortColumn, SortOptions, concat_batches, filter_record_batch, lexsort_to_indices,
 };
 use arrow::datatypes::{DataType, Schema, SchemaRef};
-use arrow::util::pretty::pretty_format_batches;
+use arrow::util::display::FormatOptions;
+use arrow::util::pretty::pretty_format_batches_with_options;
 
 use crate::datasource::{BatchIter, DEFAULT_BATCH_SIZE, split_batch};
 use crate::error::{Result, exec_err, unsupported};
@@ -36,14 +37,16 @@ impl QueryResult {
         self.batches.iter().map(RecordBatch::num_rows).sum()
     }
 
-    /// The result as a text table, with a header even when there are no rows.
+    /// The result as a text table, NULLs shown as `NULL`, with a header even when there are no rows.
     pub fn to_table(&self) -> Result<String> {
-        let table = if self.batches.is_empty() {
-            pretty_format_batches(&[RecordBatch::new_empty(self.schema.clone())])?
+        let options = FormatOptions::default().with_null("NULL");
+        let empty = [RecordBatch::new_empty(self.schema.clone())];
+        let batches = if self.batches.is_empty() {
+            &empty[..]
         } else {
-            pretty_format_batches(&self.batches)?
+            &self.batches[..]
         };
-        Ok(table.to_string())
+        Ok(pretty_format_batches_with_options(batches, &options)?.to_string())
     }
 }
 

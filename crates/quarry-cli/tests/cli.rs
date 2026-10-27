@@ -146,6 +146,69 @@ fn a_bad_command_line_is_status_2() {
 }
 
 #[test]
+fn query_prints_the_result() {
+    let dir = TempDir::new().unwrap();
+    let orders = sample(dir.path());
+    let out = quarry(&[
+        "query",
+        "-t",
+        &orders,
+        "SELECT customer, count(*), sum(total) FROM orders GROUP BY customer ORDER BY customer",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "+----------+----------+------------+\n\
+         | customer | count(*) | sum(total) |\n\
+         +----------+----------+------------+\n\
+         | ada      | 2        | 10.5       |\n\
+         | bo       | 1        | 3.0        |\n\
+         +----------+----------+------------+\n\
+         2 rows\n"
+    );
+    let out = quarry(&[
+        "query",
+        "-t",
+        &orders,
+        "SELECT id, total FROM orders WHERE total IS NULL",
+    ]);
+    assert_eq!(
+        stdout(&out),
+        "+----+-------+\n| id | total |\n+----+-------+\n| 3  | NULL  |\n+----+-------+\n1 row\n"
+    );
+    let out = quarry(&["query", "-t", &orders, "SELECT id FROM orders WHERE FALSE"]);
+    assert_eq!(stdout(&out), "+----+\n| id |\n+----+\n+----+\n0 rows\n");
+    // EXPLAIN prints the plan instead of running it.
+    let out = quarry(&[
+        "query",
+        "-t",
+        &orders,
+        "EXPLAIN SELECT id FROM orders LIMIT 1",
+    ]);
+    assert_eq!(
+        stdout(&out),
+        "Limit: skip=0 fetch=1\n  Projection: orders.id\n    Scan: orders\n"
+    );
+}
+
+#[test]
+fn a_query_that_fails_while_running_is_status_1() {
+    let dir = TempDir::new().unwrap();
+    let out = quarry(&[
+        "query",
+        "-t",
+        &sample(dir.path()),
+        "SELECT id % (id - id) FROM orders",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stderr(&out),
+        "error: execution error: division by zero in orders.id % (orders.id - orders.id)\n"
+    );
+    assert!(stdout(&out).is_empty());
+}
+
+#[test]
 fn the_readme_examples_print_what_the_readme_says() {
     let orders = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/orders.csv");
     let readme =
@@ -165,6 +228,11 @@ fn the_readme_examples_print_what_the_readme_says() {
         "README's query differs from the test's"
     );
     assert!(readme.contains(&plan), "README's plan is stale:\n{plan}");
+    let result = stdout(&quarry(&["query", "-t", orders, sql]));
+    assert!(
+        readme.contains(&result),
+        "README's result is stale:\n{result}"
+    );
 
     let out = quarry(&[
         "plan",

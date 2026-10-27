@@ -94,8 +94,23 @@ Limit: skip=0 fetch=3
 ```
 
 The string `'2024-01-01'` became a `DATE` because it is compared with a date column; `count(*)` in `HAVING` is the
-same aggregate as in the select list, so the Aggregate computes it once. A query that doesn't make sense fails
-before anything is read, with status 1:
+same aggregate as in the select list, so the Aggregate computes it once. `quarry query` runs it:
+
+```bash
+./target/release/quarry query -t examples/orders.csv "SELECT customer, count(*) AS orders, sum(total) AS spent FROM orders WHERE status <> 'cancelled' AND placed >= '2024-01-01' GROUP BY customer HAVING count(*) > 1 ORDER BY spent DESC LIMIT 3"
+```
+
+```
++----------+--------+--------+
+| customer | orders | spent  |
++----------+--------+--------+
+| bo       | 2      | 275.0  |
+| ada      | 3      | 202.85 |
++----------+--------+--------+
+2 rows
+```
+
+A query that doesn't make sense fails before anything is read, with status 1:
 
 ```bash
 ./target/release/quarry plan -t examples/orders.csv "SELECT customer FROM orders WHERE total > 'big'"

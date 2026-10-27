@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 use quarry::arrow::record_batch::RecordBatch;
 use quarry::arrow::util::pretty::pretty_format_batches;
 use quarry::datasource::TableProvider;
+use quarry::exec;
 use quarry::sql::{self, BoundStatement};
 use quarry::{Catalog, QuarryError, Result};
 
@@ -40,6 +41,15 @@ enum Command {
         /// The query (`EXPLAIN SELECT ...` works too).
         sql: String,
     },
+    /// Run a query against the given tables and print its result as a table (`EXPLAIN SELECT ...` prints the plan
+    /// instead).
+    Query {
+        /// A table: `name=path`, or just `path` to name it after the file.
+        #[arg(short, long = "table", value_name = "NAME=PATH")]
+        tables: Vec<String>,
+        /// The query.
+        sql: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -61,17 +71,31 @@ fn run(command: Command) -> Result<String> {
         Command::Schema { file } => schema(&file),
         Command::Head { file, rows } => head(&file, rows),
         Command::Plan { tables, sql } => {
-            let mut catalog = Catalog::new();
-            for spec in &tables {
-                let (name, path) = parse_table(spec)?;
-                catalog.register_file(&name, path)?;
-            }
-            let plan = match sql::bind(&catalog, &sql)? {
+            let plan = match sql::bind(&catalog(&tables)?, &sql)? {
                 BoundStatement::Query(plan) | BoundStatement::Explain(plan) => plan,
             };
             Ok(plan.to_string())
         }
+        Command::Query { tables, sql } => match sql::bind(&catalog(&tables)?, &sql)? {
+            BoundStatement::Explain(plan) => Ok(plan.to_string()),
+            BoundStatement::Query(plan) => {
+                let result = exec::collect(&plan)?;
+                let rows = result.num_rows();
+                let noun = if rows == 1 { "row" } else { "rows" };
+                Ok(format!("{}\n{rows} {noun}\n", result.to_table()?))
+            }
+        },
     }
+}
+
+/// A catalog of `--table` arguments.
+fn catalog(tables: &[String]) -> Result<Catalog> {
+    let mut catalog = Catalog::new();
+    for spec in tables {
+        let (name, path) = parse_table(spec)?;
+        catalog.register_file(&name, path)?;
+    }
+    Ok(catalog)
 }
 
 /// `name=path`, or a bare path named after its file stem.
