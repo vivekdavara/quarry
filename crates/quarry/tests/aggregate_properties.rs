@@ -1,0 +1,348 @@
+//! Random GROUP BY queries over random rows, run by the engine at a random batch size and computed a second time by
+//! the reference below: plain Rust over the rows, grouping by value with SQL's rules (-0.0 is 0.0, NaNs are one value,
+//! NULL is a group of its own). The results must hold the same rows (in any order), or both must fail.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use arrow::array::{
+    Array, ArrayRef, AsArray, Date32Array, Float64Array, Int64Array, RecordBatch, StringArray,
+};
+use arrow::datatypes::{DataType, Date32Type, Field, Float64Type, Int64Type, Schema};
+use proptest::prelude::*;
+use quarry::datasource::MemTable;
+use quarry::exec::collect_with_batch_size;
+use quarry::{Catalog, sql};
+
+/// A value as the reference sees it. Floats are kept normalized (no -0.0, one NaN), as the engine outputs them.
+#[derive(Debug, Clone, PartialEq)]
+enum V {
+    Null,
+    Int(i64),
+    Float(u64),
+    Str(String),
+    Date(i32),
+}
+
+fn float(x: f64) -> V {
+    let x = if x.is_nan() { f64::NAN } else { x + 0.0 };
+    V::Float(x.to_bits())
+}
+
+/// The order MIN and MAX use: numbers by value with NaN the greatest, strings by bytes.
+fn less(a: &V, b: &V) -> bool {
+    match (a, b) {
+        (V::Int(x), V::Int(y)) => x < y,
+        (V::Float(x), V::Float(y)) => {
+            let (x, y) = (f64::from_bits(*x), f64::from_bits(*y));
+            !x.is_nan() && (y.is_nan() || x < y)
+        }
+        (V::Str(x), V::Str(y)) => x.as_bytes() < y.as_bytes(),
+        (V::Date(x), V::Date(y)) => x < y,
+        _ => panic!("comparing {a:?} with {b:?}"),
+    }
+}
+
+/// t(k INT8-ish BIGINT, g VARCHAR, f DOUBLE, v BIGINT, d DATE), all nullable.
+type Row = (
+    Option<i64>,
+    Option<&'static str>,
+    Option<f64>,
+    Option<i64>,
+    Option<i32>,
+);
+
+const KEYS: &[i64] = &[0, 1, 2, -1];
+const NAMES: &[&str] = &["a", "b", "B", "ä", ""];
+// Multiples of 1/4 add up exactly in any order, so float sums don't depend on it.
+const FLOATS: &[f64] = &[0.0, -0.0, 0.25, 1.5, -2.75, f64::NAN, 3.0];
+const VALUES: &[i64] = &[0, 1, -1, 5, -7, 1 << 62, -(1 << 62)];
+const DATES: &[i32] = &[0, 19_782, -1, 19_723];
+
+fn nullable<T: std::fmt::Debug + Clone + 'static>(
+    values: &'static [T],
+) -> impl Strategy<Value = Option<T>> {
+    prop_oneof![1 => Just(None), 5 => proptest::sample::select(values).prop_map(Some)]
+}
+
+fn rows() -> impl Strategy<Value = Vec<Row>> {
+    let row = (
+        nullable(KEYS),
+        nullable(NAMES),
+        nullable(FLOATS),
+        nullable(VALUES),
+        nullable(DATES),
+    );
+    proptest::collection::vec(row, 0..30)
+}
+
+fn batch(rows: &[Row]) -> RecordBatch {
+    let schema = Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("g", DataType::Utf8, true),
+        Field::new("f", DataType::Float64, true),
+        Field::new("v", DataType::Int64, true),
+        Field::new("d", DataType::Date32, true),
+    ]);
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(rows.iter().map(|r| r.0).collect::<Int64Array>()),
+        Arc::new(rows.iter().map(|r| r.1).collect::<StringArray>()),
+        Arc::new(rows.iter().map(|r| r.2).collect::<Float64Array>()),
+        Arc::new(rows.iter().map(|r| r.3).collect::<Int64Array>()),
+        Arc::new(rows.iter().map(|r| r.4).collect::<Date32Array>()),
+    ];
+    RecordBatch::try_new(Arc::new(schema), columns).unwrap()
+}
+
+/// A row's columns as values: k, g, f, v, d.
+fn cells(r: &Row) -> [V; 5] {
+    [
+        r.0.map_or(V::Null, V::Int),
+        r.1.map_or(V::Null, |s| V::Str(s.to_string())),
+        r.2.map_or(V::Null, float),
+        r.3.map_or(V::Null, V::Int),
+        r.4.map_or(V::Null, V::Date),
+    ]
+}
+
+const COLUMNS: [&str; 5] = ["k", "g", "f", "v", "d"];
+
+/// One aggregate: function, column, DISTINCT.
+#[derive(Debug, Clone, Copy)]
+struct Agg {
+    func: &'static str,
+    column: Option<usize>,
+    distinct: bool,
+}
+
+impl Agg {
+    fn sql(&self) -> String {
+        match self.column {
+            None => "count(*)".to_string(),
+            Some(c) => format!(
+                "{}({}{})",
+                self.func,
+                if self.distinct { "DISTINCT " } else { "" },
+                COLUMNS[c]
+            ),
+        }
+    }
+}
+
+fn aggregates() -> impl Strategy<Value = Vec<Agg>> {
+    let one = prop_oneof![
+        Just(Agg {
+            func: "count",
+            column: None,
+            distinct: false
+        }),
+        (
+            prop::sample::select(&["count", "min", "max"][..]),
+            0usize..5,
+            any::<bool>()
+        )
+            .prop_map(|(func, c, distinct)| Agg {
+                func,
+                column: Some(c),
+                distinct
+            }),
+        // SUM and AVG take numbers: f or v.
+        (
+            prop::sample::select(&["sum", "avg"][..]),
+            prop::sample::select(&[2usize, 3][..]),
+            any::<bool>()
+        )
+            .prop_map(|(func, c, distinct)| Agg {
+                func,
+                column: Some(c),
+                distinct
+            }),
+    ];
+    proptest::collection::vec(one, 1..5)
+}
+
+/// The reference: groups in order of first appearance, each a key and its rows' cells.
+fn reference(rows: &[Row], keys: &[usize], aggs: &[Agg]) -> Result<Vec<Vec<V>>, String> {
+    let mut groups: Vec<(Vec<V>, Vec<[V; 5]>)> = Vec::new();
+    if keys.is_empty() {
+        groups.push((vec![], vec![]));
+    }
+    for r in rows {
+        let c = cells(r);
+        let key: Vec<V> = keys.iter().map(|&k| c[k].clone()).collect();
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, members)) => members.push(c),
+            None => groups.push((key, vec![c])),
+        }
+    }
+    let mut out = Vec::new();
+    for (key, members) in groups {
+        let mut row = key;
+        for agg in aggs {
+            row.push(compute(agg, &members)?);
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
+fn compute(agg: &Agg, members: &[[V; 5]]) -> Result<V, String> {
+    let Some(c) = agg.column else {
+        return Ok(V::Int(members.len() as i64));
+    };
+    let mut values: Vec<V> = members
+        .iter()
+        .map(|m| m[c].clone())
+        .filter(|v| *v != V::Null)
+        .collect();
+    if agg.distinct {
+        let mut seen = Vec::new();
+        values.retain(|v| {
+            let new = !seen.contains(v);
+            if new {
+                seen.push(v.clone());
+            }
+            new
+        });
+    }
+    if agg.func == "count" {
+        return Ok(V::Int(values.len() as i64));
+    }
+    if values.is_empty() {
+        return Ok(V::Null);
+    }
+    match agg.func {
+        "min" | "max" => {
+            let mut best = values[0].clone();
+            for v in &values[1..] {
+                let better = if agg.func == "min" {
+                    less(v, &best)
+                } else {
+                    less(&best, v)
+                };
+                if better {
+                    best = v.clone();
+                }
+            }
+            Ok(best)
+        }
+        "sum" | "avg" => match &values[0] {
+            V::Int(_) => {
+                let sum: i128 = values
+                    .iter()
+                    .map(|v| match v {
+                        V::Int(x) => i128::from(*x),
+                        _ => unreachable!(),
+                    })
+                    .sum();
+                if agg.func == "avg" {
+                    Ok(float(sum as f64 / values.len() as f64))
+                } else {
+                    i64::try_from(sum)
+                        .map(V::Int)
+                        .map_err(|_| "overflow".to_string())
+                }
+            }
+            V::Float(_) => {
+                let sum: f64 = values
+                    .iter()
+                    .map(|v| match v {
+                        V::Float(x) => f64::from_bits(*x),
+                        _ => unreachable!(),
+                    })
+                    .sum();
+                Ok(float(if agg.func == "avg" {
+                    sum / values.len() as f64
+                } else {
+                    sum
+                }))
+            }
+            v => Err(format!("sum of {v:?}")),
+        },
+        f => Err(format!("unknown aggregate {f}")),
+    }
+}
+
+fn engine_rows(result: &quarry::QueryResult) -> Vec<Vec<V>> {
+    let mut out = Vec::new();
+    for b in &result.batches {
+        for i in 0..b.num_rows() {
+            out.push(
+                b.columns()
+                    .iter()
+                    .map(|a| {
+                        if a.logical_nulls().is_some_and(|n| n.is_null(i)) {
+                            return V::Null;
+                        }
+                        match a.data_type() {
+                            DataType::Int64 => V::Int(a.as_primitive::<Int64Type>().value(i)),
+                            DataType::Float64 => {
+                                let x = a.as_primitive::<Float64Type>().value(i);
+                                // The engine's outputs must already be normalized.
+                                assert_eq!(float(x), V::Float(x.to_bits()), "unnormalized {x}");
+                                V::Float(x.to_bits())
+                            }
+                            DataType::Utf8 => V::Str(a.as_string::<i32>().value(i).to_string()),
+                            DataType::Date32 => V::Date(a.as_primitive::<Date32Type>().value(i)),
+                            t => panic!("unexpected type {t}"),
+                        }
+                    })
+                    .collect(),
+            );
+        }
+    }
+    out
+}
+
+fn sorted(mut rows: Vec<Vec<V>>) -> Vec<String> {
+    let mut text: Vec<String> = rows.drain(..).map(|r| format!("{r:?}")).collect();
+    text.sort();
+    text
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(
+        std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(1000)
+    ))]
+
+    #[test]
+    fn group_by_agrees_with_the_reference(
+        rows in rows(),
+        keys in prop::sample::subsequence(vec![0usize, 1, 2, 4], 0..=2),
+        aggs in aggregates(),
+        batch_size in 1usize..8,
+    ) {
+        let mut catalog = Catalog::new();
+        catalog.register("t", Arc::new(MemTable::from_batch(batch(&rows)))).unwrap();
+        let mut select: Vec<String> = keys.iter().map(|&k| COLUMNS[k].to_string()).collect();
+        select.extend(aggs.iter().map(Agg::sql));
+        let mut query = format!("SELECT {} FROM t", select.join(", "));
+        if !keys.is_empty() {
+            let names: Vec<&str> = keys.iter().map(|&k| COLUMNS[k]).collect();
+            query += &format!(" GROUP BY {}", names.join(", "));
+        }
+        let plan = sql::plan(&catalog, &query).unwrap();
+        let engine = collect_with_batch_size(&plan, batch_size);
+        match (engine, reference(&rows, &keys, &aggs)) {
+            (Ok(result), Ok(want)) => {
+                let got = engine_rows(&result);
+                prop_assert_eq!(sorted(got), sorted(want), "{}\nrows {:?}", query, rows);
+            }
+            (Err(_), Err(_)) => {}
+            (Ok(result), Err(e)) => {
+                prop_assert!(false, "{query}\nrows {rows:?}\nengine {:?}\nreference fails: {e}", engine_rows(&result))
+            }
+            (Err(e), Ok(want)) => prop_assert!(false, "{query}\nrows {rows:?}\nengine fails: {e}\nreference {want:?}"),
+        }
+    }
+}
+
+#[test]
+fn the_reference_sees_every_distinct_float_once() {
+    let rows: Vec<Row> = [-0.0, 0.0, f64::NAN, -f64::NAN, 1.5]
+        .iter()
+        .map(|&x| (None, None, Some(x), None, None))
+        .collect();
+    let distinct: HashSet<String> = rows.iter().map(|r| format!("{:?}", cells(r)[2])).collect();
+    assert_eq!(distinct.len(), 3);
+}
