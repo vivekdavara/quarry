@@ -216,6 +216,40 @@ Because an expression is computed for rows. Row by row, a failing constant fails
 for; the property test's reference works that way, and the engine first disagreed on empty tables (it computed the
 scalar once and failed). Now `evaluate` returns an empty column for an empty batch without evaluating.
 
+## What went wrong on day 2
+
+**What did the review find?**
+Three bugs, from about 230 queries diffed against DuckDB at four batch sizes (README, "Review of day 2"). The most
+instructive: the fix for -0.0 had overshot. Normalizing floats was right for *comparing* (-0.0 = 0.0), but the
+normalized bytes were also what MIN, MAX and the GROUP BY keys decoded into the result, so a lone -0.0 came back as
+0.0; `1 / min(f)` showed it (`inf` instead of DuckDB's `-inf`). Now the normalized form is only the comparison and
+hash key; each group keeps its first row's key as it was, and MIN/MAX keep the winning value itself, the last of
+equal ones, which is what DuckDB returns too.
+
+**What was the LIMIT bug, and why didn't the batch-size tests catch it?**
+`SELECT 10 % (id - 3) FROM t LIMIT 2` should never compute row 3, and at batch sizes 1 and 2 it didn't; at 3 and up
+the projection computed the whole first batch, row 3 included, before the LIMIT sliced it, and failed. The tests ran
+every query at several batch sizes, but none had an error past the limit. The fix applies a LIMIT below projections
+(a projection makes one row of each input row, so that's always valid). Under an ORDER BY the select list is computed
+before the sort, for every row, so there the query still fails, and so does DuckDB's. A filter computes its predicate
+per batch too, so an error in a WHERE under a LIMIT can depend on the batch size; DESIGN.md says so rather than
+pretending otherwise.
+
+**Did the property tests miss anything the review found?**
+Not the bugs (the review ran at an earlier commit, before the property tests existed), but the mutations showed what
+the tests didn't check: of the review's 30 mutations, 7 survived, and 4 of those then failed the property tests. The
+other 3 needed hand-written tests; one of mine was wrong at first. I wrote a test for the final check of results
+against the plan's schema with `SELECT *`, and the mutant still passed: the projection that `SELECT *` becomes rebuilds
+its batches and caught the bad type itself. The test now runs a plan that is a bare Scan, which only the final check
+guards, and the mutant fails it.
+
+**What else surprised you?**
+Three Arrow behaviours that differ from SQL engines, each handled explicitly: float comparisons use IEEE's total
+order (-0.0 < 0.0, NaNs distinct); a float-to-integer cast truncates (DuckDB rounds half to even); and a Float64 too
+big for a Float32 casts to infinity even in Arrow's strict mode (DuckDB fails, the review found it). And one of my
+own: the first property-test failure was in the reference interpreter, not the engine (its date arithmetic overflowed
+an i64 on `i64::MAX` days).
+
 ## What went wrong on day 1
 
 **What did the review find?**
