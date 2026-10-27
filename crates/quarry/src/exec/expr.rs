@@ -189,25 +189,14 @@ fn strict() -> CastOptions<'static> {
     }
 }
 
-/// `CAST(v AS to)`. A float cast to an integer rounds half to even first, as DuckDB does (Arrow truncates). A Float64
-/// beyond Float32's range fails its cast to Float32, as in DuckDB (Arrow makes it infinite); infinities and NaN cast.
+/// `CAST(v AS to)`. A float cast to an integer rounds half to even first, as DuckDB does (Arrow truncates). A finite
+/// Float64 that rounds to an infinite Float32 fails its cast, as in DuckDB (Arrow makes it infinite); one just above
+/// f32::MAX rounds down to it, and infinities and NaN cast.
 fn cast_value(v: Value, to: &DataType) -> Result<Value, ArrowError> {
     if v.data_type() == to {
         return Ok(v);
     }
     v.map(|a| {
-        if *a.data_type() == DataType::Float64 && *to == DataType::Float32 {
-            let too_big = a
-                .as_primitive::<Float64Type>()
-                .iter()
-                .flatten()
-                .find(|x| x.is_finite() && x.abs() > f64::from(f32::MAX));
-            if let Some(x) = too_big {
-                return Err(ArrowError::CastError(format!(
-                    "the value {x:e} is out of range for Float32"
-                )));
-            }
-        }
         let a: ArrayRef = match a.data_type() {
             DataType::Float64 if is_integer(to) => Arc::new(
                 a.as_primitive::<Float64Type>()
@@ -219,7 +208,23 @@ fn cast_value(v: Value, to: &DataType) -> Result<Value, ArrowError> {
             ),
             _ => a.clone(),
         };
-        cast_with_options(&a, to, &strict())
+        let out = cast_with_options(&a, to, &strict())?;
+        if *a.data_type() == DataType::Float64 && *to == DataType::Float32 {
+            let overflowed = a
+                .as_primitive::<Float64Type>()
+                .iter()
+                .zip(out.as_primitive::<Float32Type>().iter())
+                .find_map(|pair| match pair {
+                    (Some(x), Some(y)) if x.is_finite() && y.is_infinite() => Some(x),
+                    _ => None,
+                });
+            if let Some(x) = overflowed {
+                return Err(ArrowError::CastError(format!(
+                    "the value {x:e} is out of range for Float32"
+                )));
+            }
+        }
+        Ok(out)
     })
 }
 
@@ -820,6 +825,11 @@ mod tests {
         assert_eq!(show("CAST(f AS REAL)"), ["-0.0", "NaN", "2.5", "NULL"]);
         assert_eq!(show("CAST(1e308 * 10 AS REAL)"), ["inf"; 4]);
         assert_eq!(show("CAST(3.4028234e38 AS REAL)"), ["3.4028235e38"; 4]); // rounds to f32::MAX
+        // Found by the second review: values just above f32::MAX round down to it, as in DuckDB 2.0 (Quarry's first
+        // check failed them, f32::MAX as printed included); 3.4028236e38 rounds to infinity and fails there too.
+        assert_eq!(show("CAST(3.4028235e38 AS REAL)"), ["3.4028235e38"; 4]);
+        assert_eq!(show("CAST(-3.40282356e38 AS REAL)"), ["-3.4028235e38"; 4]);
+        assert!(error("CAST(3.4028236e38 AS REAL)").contains("is out of range for Float32"));
     }
 
     #[test]
@@ -855,6 +865,16 @@ mod tests {
         assert_eq!(show("a IS NULL"), ["false", "false", "true", "false"]);
         assert_eq!(show("NULL IS NOT NULL"), ["false"; 4]);
         assert_eq!(show("NOT (a > 0)"), ["false", "true", "NULL", "false"]);
+    }
+
+    #[test]
+    fn a_null_over_a_huge_value_casts_to_real() {
+        // The value buffer under a NULL can hold anything; only valid slots are checked.
+        let values = Float64Array::new(vec![1e300, 1.5].into(), Some(vec![false, true].into()));
+        let out = cast_value(Value::Array(Arc::new(values)), &DataType::Float32).unwrap();
+        let out = out.values().as_primitive::<Float32Type>();
+        assert!(out.is_null(0));
+        assert_eq!(out.value(1), 1.5);
     }
 
     #[test]
