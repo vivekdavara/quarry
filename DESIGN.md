@@ -240,7 +240,10 @@ column can't be NULL and then makes a NULL fails there, instead of returning a w
 on `batch_size`; the tests run every query at several. One exception, which DuckDB shares: whether a query that fails
 on some row fails at all can depend on how far a LIMIT lets it read. `SELECT 10 % (id - 3) FROM t LIMIT 2` never
 computes row 3 (the limit runs below the projection), but a filter computes its predicate for whole batches, so
-`WHERE 10 % (id - 3) = 0 LIMIT 2` reaches row 3 only if it is in a batch the limit pulls.
+`WHERE 10 % (id - 3) = 0 LIMIT 2` reaches row 3 only if it is in a batch the limit pulls. Under an `ORDER BY`, the
+select list is computed for every row before the sort, so `SELECT CAST(s AS INT) FROM t ORDER BY id LIMIT 2` fails on
+any row whose `s` isn't a number; DuckDB computes such an item after its top-N, for the kept rows only (it doesn't for
+every expression: `10 % (id - 3)` fails there too). Day 3's top-k sort should do the same.
 
 **Expressions** (`exec::evaluate`) are computed a column at a time with Arrow's compute kernels. A literal stays a
 one-row scalar until an operator needs a column (Arrow's kernels take a column and a scalar), so `l_quantity < 24`

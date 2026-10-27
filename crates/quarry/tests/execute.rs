@@ -316,8 +316,9 @@ fn a_limit_over_a_projection_computes_only_the_rows_it_keeps() {
     );
     let e = error("SELECT 10 % (id - 3) FROM orders LIMIT 3");
     assert!(e.contains("division by zero"), "{e}");
-    // Under an ORDER BY the select list is computed for every row before the sort, so this fails at any batch size,
-    // as it does in DuckDB 2.0.
+    // Under an ORDER BY the select list is computed for every row before the sort, so this fails at any batch size.
+    // DuckDB 2.0 fails it too, but it computes some select items after its top-N (a CAST, found by the second
+    // review), where Quarry fails: day 3's top-k is the place to do the same.
     let e = error("SELECT 10 % (id - 4) FROM orders ORDER BY qty * -1, id LIMIT 3");
     assert!(e.contains("division by zero"), "{e}");
 }

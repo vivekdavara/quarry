@@ -206,13 +206,20 @@ each now fixed with its test in the suites:
 
 | Finding | Fix |
 |---|---|
-| `CAST(1e300 AS REAL)` gave `inf`: Arrow's float-to-float cast has no range check | a finite Float64 beyond Float32's range fails its cast, as in DuckDB (`a624684`) |
+| `CAST(1e300 AS REAL)` gave `inf`: Arrow's float-to-float cast has no range check | a finite Float64 that rounds to an infinite Float32 fails its cast, as in DuckDB (`a624684`; the first version also failed values just above f32::MAX that round down to it, found by the second review, `3270519`) |
 | -0.0 came back as 0.0 from MIN, MAX, GROUP BY keys and DISTINCT (`1 / min(f)` was `inf`, DuckDB `-inf`): the normalized bytes used to compare were decoded into the result | outputs are input values: a group's first key, the winning MIN/MAX value (`5d4ef95`) |
 | `SELECT 10 % (id - 3) FROM t LIMIT 2` failed at batch sizes 3 and up but not 1 or 2: the projection computed whole batches before the LIMIT sliced them | a LIMIT runs below projections (`b9776c4`) |
 
 Of its 30 mutations of `exec/`, seven left every test passing at its commit (one equivalent); four of those fail the
 property tests written since, and the other three got tests (`066093a`, `52b3f08`). Its judgement calls are in the
 limitations below.
+
+A second agent then reviewed the three fixes (8 minutes, at `dda4d6f`). It found a bug in one: the Float32 range check
+ran before rounding, so `CAST(3.4028235e38 AS REAL)` (f32::MAX as Quarry prints it) failed where DuckDB rounds to
+f32::MAX; the check now looks at the result (`3270519`). And it corrected a claim in the LIMIT fix: DuckDB computes
+some select items after its top-N (`SELECT CAST(s AS INT) FROM t ORDER BY id LIMIT 2` succeeds there and fails here),
+now a limitation for day 3. Of its 10 mutations of the fixes, 3 survived: an exact-f32::MAX boundary and a NULL over a
+huge value (both tested now), and DISTINCT passing normalized values on, which no aggregate today can show.
 
 ## Review of day 1
 
@@ -278,7 +285,8 @@ property then found one more bug itself: `-(-0)` printed as `-0`, which binds ba
   arithmetic, so `tinyint_col + tinyint_col` can't overflow where DuckDB's TINYINT would.
 - The binder allows any cast Arrow can do (`CAST(d AS INT)`, `CAST(7 AS DATE)`), several of which DuckDB refuses,
   and `%` takes integers only (DuckDB computes `5.5 % 2`).
-- An error in a WHERE under a LIMIT can depend on the batch size (DESIGN.md, "Execution"); DuckDB's can too.
+- An error in a WHERE under a LIMIT can depend on the batch size (DESIGN.md, "Execution"); DuckDB's can too. Under
+  `ORDER BY ... LIMIT`, every select item is computed for every row, where DuckDB computes some after its top-N.
 - No subqueries, `WITH`, `UNION`, window functions, `RIGHT`/`FULL` joins, intervals, or scalar functions other
   than `CAST`; each is a clear `Unsupported` error.
 - No decimal, timestamp or `UInt64` arithmetic: such columns can be selected but not computed on.

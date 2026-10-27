@@ -231,7 +231,9 @@ equal ones, which is what DuckDB returns too.
 the projection computed the whole first batch, row 3 included, before the LIMIT sliced it, and failed. The tests ran
 every query at several batch sizes, but none had an error past the limit. The fix applies a LIMIT below projections
 (a projection makes one row of each input row, so that's always valid). Under an ORDER BY the select list is computed
-before the sort, for every row, so there the query still fails, and so does DuckDB's. A filter computes its predicate
+before the sort, for every row, so there the query still fails. I first wrote that DuckDB fails it too; the second
+review showed that's only half true: DuckDB fails `10 % (id - 3)` there but computes `CAST(s AS INT)` after its
+top-N, for the kept rows only. Doing the same belongs with day 3's top-k. A filter computes its predicate
 per batch too, so an error in a WHERE under a LIMIT can depend on the batch size; DESIGN.md says so rather than
 pretending otherwise.
 
