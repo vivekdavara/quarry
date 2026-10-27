@@ -460,3 +460,65 @@ fn errors_name_the_expression() {
     let e = error("SELECT * FROM orders AS a JOIN orders AS b ON a.id = b.id");
     assert!(e.contains("not supported: running a join"), "{e}");
 }
+
+/// orders() written to a CSV file and to a Parquet file in row groups of two rows.
+fn file_catalogs(dir: &std::path::Path) -> Vec<(&'static str, Catalog)> {
+    use quarry::parquet::arrow::ArrowWriter;
+    use quarry::parquet::file::properties::WriterProperties;
+
+    let csv = dir.join("orders.csv");
+    std::fs::write(
+        &csv,
+        "id,customer,total,qty,placed,flag\n\
+         1,ada,10.5,2,2024-01-02,true\n\
+         2,bo,3.0,1,2024-01-03,false\n\
+         3,ada,,5,2024-02-01,\n\
+         4,cy,7.25,,2024-02-01,true\n\
+         5,bo,-0.0,3,2024-03-15,false\n\
+         6,ada,2.5,2,,true\n",
+    )
+    .unwrap();
+    let parquet = dir.join("orders.parquet");
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(2))
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        std::fs::File::create(&parquet).unwrap(),
+        orders().schema(),
+        Some(props),
+    )
+    .unwrap();
+    writer.write(&orders()).unwrap();
+    writer.close().unwrap();
+    let mut out = Vec::new();
+    for (label, path) in [("csv", csv), ("parquet", parquet)] {
+        let mut c = Catalog::new();
+        c.register_file("orders", path).unwrap();
+        out.push((label, c));
+    }
+    out
+}
+
+#[test]
+fn csv_and_parquet_files_give_the_same_answers_as_memory() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let queries = [
+        "SELECT * FROM orders",
+        "SELECT id, total * 2 AS t2 FROM orders WHERE customer = 'ada' AND total IS NOT NULL",
+        "SELECT customer, count(*), count(total), sum(qty), avg(total), min(placed), max(flag) FROM orders \
+         GROUP BY customer ORDER BY customer",
+        "SELECT id FROM orders ORDER BY total DESC LIMIT 3 OFFSET 1",
+        "SELECT DISTINCT placed FROM orders ORDER BY placed NULLS FIRST",
+        "SELECT count(*), count(DISTINCT total) FROM orders WHERE placed > '2024-01-02'",
+        "SELECT qty % 2 AS parity, sum(total) FROM orders GROUP BY parity ORDER BY parity",
+    ];
+    let memory = catalog();
+    let files = file_catalogs(dir.path());
+    for sql in queries {
+        let want = run_in(&memory, sql).unwrap();
+        for (label, c) in &files {
+            let got = run_in(c, sql).unwrap_or_else(|e| panic!("{label}: {sql}: {e}"));
+            assert_eq!(got, want, "{label}: {sql}");
+        }
+    }
+}
