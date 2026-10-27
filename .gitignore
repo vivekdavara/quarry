@@ -4,3 +4,5 @@ data/
 *.profraw
 .env
 .DS_Store
+# proptest failure seeds: the property tests run from fresh seeds; a real failure is fixed with a named test
+*.proptest-regressions

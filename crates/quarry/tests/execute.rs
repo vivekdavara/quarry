@@ -522,3 +522,32 @@ fn csv_and_parquet_files_give_the_same_answers_as_memory() {
         }
     }
 }
+
+/// A table whose scan hands out Int32 values under a schema that says Int64.
+#[derive(Debug)]
+struct WrongType;
+
+impl TableProvider for WrongType {
+    fn schema(&self) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]))
+    }
+
+    fn scan(&self, _projection: Option<&[usize]>, _batch_size: usize) -> Result<BatchIter> {
+        let schema = Schema::new(vec![Field::new("n", DataType::Int32, false)]);
+        let values: ArrayRef = Arc::new(quarry::arrow::array::Int32Array::from(vec![1, 2]));
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![values]).unwrap();
+        Ok(Box::new(std::iter::once(Ok(batch))))
+    }
+
+    fn statistics(&self) -> TableStatistics {
+        TableStatistics::default()
+    }
+}
+
+#[test]
+fn a_result_that_disagrees_with_the_plan_is_an_error() {
+    let mut c = Catalog::new();
+    c.register("t", Arc::new(WrongType)).unwrap();
+    let e = quarry::query(&c, "SELECT * FROM t").unwrap_err();
+    assert!(e.to_string().contains("Int32"), "{e}");
+}

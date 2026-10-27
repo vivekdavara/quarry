@@ -722,6 +722,17 @@ mod tests {
             ["two", "other", "other", "other"]
         );
         assert_eq!(show("CASE WHEN NULL THEN 1 ELSE 2 END"), ["2"; 4]);
+        // A later WHEN sees only the rows the earlier ones didn't take: row 1's b is 0.
+        assert_eq!(
+            show("CASE WHEN b = 0 THEN 'zero' WHEN a % b = 1 THEN 'odd' END"),
+            ["odd", "zero", "NULL", "NULL"]
+        );
+        // A NULL condition isn't TRUE, whatever value bit lies under the NULL (row 2's a is NULL over a 0, so
+        // `a < 1` has its value bit set).
+        assert_eq!(
+            show("CASE WHEN a < 1 THEN 'lt' ELSE 'other' END"),
+            ["other", "lt", "other", "other"]
+        );
         // A cast that fails on every non-NULL string runs only where its branch is taken.
         assert_eq!(
             show("CASE WHEN s IS NULL THEN CAST(s AS BIGINT) ELSE -1 END"),
@@ -771,6 +782,8 @@ mod tests {
         assert_eq!(show("CAST(-2.5 AS BIGINT)"), ["-2"; 4]);
         assert_eq!(show("CAST(2.7 AS INT)"), ["3"; 4]);
         assert_eq!(show("CAST(CAST(-2.5 AS REAL) AS SMALLINT)"), ["-2"; 4]);
+        assert_eq!(show("CAST(CAST(2.7 AS REAL) AS INT)"), ["3"; 4]);
+        assert_eq!(show("CAST(CAST(3.5 AS REAL) AS BIGINT)"), ["4"; 4]);
         assert_eq!(
             show("CAST(a AS VARCHAR)"),
             ["7", "-7", "NULL", "9223372036854775807"]
