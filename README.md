@@ -1,13 +1,14 @@
 # Quarry
 
 A SQL query engine over Parquet and CSV files, written in Rust on Apache Arrow (arrow-rs). It takes a SQL string,
-resolves every name and type against the files' schemas, builds a logical plan, and (from day 2) executes it with
-vectorized operators over Arrow record batches.
+resolves every name and type against the files' schemas, builds a logical plan, and executes it with vectorized
+operators over Arrow record batches.
 
-**Status: day 1 of 5.** The readers, the catalog, the logical plan and the binder (SQL to a typed plan) are done
-and tested; nothing executes yet. Day 2 adds execution of projection, filter, aggregate, sort and limit; day 3
-hash joins, predicate pushdown and optimizer rules; day 4 TPC-H-style queries checked against DuckDB, and
-benchmarks; day 5 a REPL and the release.
+**Status: day 2 of 5.** The readers, the catalog, the logical plan, the binder (SQL to a typed plan) and the
+executor (filter, projection, aggregate with GROUP BY and DISTINCT, sort, limit, and vectorized expressions) are done
+and tested; `quarry query` runs a query over files. Joins bind but don't run yet. Day 3 adds hash joins, predicate
+pushdown and optimizer rules; day 4 TPC-H-style queries checked against DuckDB, and benchmarks; day 5 a REPL and the
+release.
 
 ## Why
 
@@ -25,7 +26,7 @@ flowchart LR
     catalog[("catalog")] --> binder
     binder --> logical["LogicalPlan"]
     logical --> opt["optimizer<br/>(day 3)"]
-    opt --> exec["vectorized operators<br/>(days 2-3)"]
+    opt --> exec["vectorized operators<br/>(day 2; joins day 3)"]
     files[("Parquet / CSV")] --> catalog
     files --> exec
     exec --> batches["Arrow RecordBatches"]
@@ -40,8 +41,17 @@ flowchart LR
 - **Binder** (`sql/`): one SELECT, clause by clause in SQL's logical order (FROM, WHERE, GROUP BY and aggregates,
   HAVING, the select list, DISTINCT, ORDER BY, LIMIT). Every mistake a query can contain is reported here, before
   any data is read.
+- **Executor** (`exec/mod.rs`): each plan node is an iterator of record batches pulling from its input's. Filter,
+  projection and limit stream (a LIMIT stops reading once it has its rows); sort and aggregate drain their input.
+  Every result batch is checked against the plan's types and nullability.
+- **Expressions** (`exec/expr.rs`): a column at a time with Arrow's kernels, literals kept as scalars; `AND`, `OR`
+  and `CASE` evaluate later operands only on the rows still undecided, so `b <> 0 AND a % b = 1` never divides by
+  zero. Overflow, `% 0` and failed casts are errors, as in DuckDB 2.0.
+- **Aggregation** (`exec/aggregate.rs`): group keys encoded in Arrow's row format and hashed; one accumulator per
+  aggregate (integer sums in i128); `DISTINCT` by remembering (group, value) pairs.
 
-DESIGN.md is the specification: the type rules, name resolution, each node, and the eight binding steps.
+DESIGN.md is the specification: the type rules, name resolution, each node, the eight binding steps, and execution
+(each rule where engines differ, checked on DuckDB 2.0).
 
 ## Layout
 
@@ -52,7 +62,10 @@ crates/quarry/          the engine (a library)
   src/types.rs          type classes, the common-type rules, strict dates
   src/plan/             LogicalPlan, bound Expr, printing
   src/sql/              parsing and the binder
-  tests/                datasource.rs, binder.rs, binder_properties.rs
+  src/exec/             the executor: operators (mod.rs), expressions (expr.rs), aggregation (aggregate.rs)
+  tests/                datasource.rs, binder.rs, binder_properties.rs, execute.rs, eval_properties.rs,
+                        aggregate_properties.rs
+  examples/             gen_orders.rs (synthetic Parquet data), time_queries.rs (the timings below)
 crates/quarry-cli/      the `quarry` binary and its tests
 examples/orders.csv     eight synthetic rows for the examples below
 DESIGN.md               the specification
@@ -132,8 +145,11 @@ it on Linux (ubuntu-24.04) and macOS (macos-15) on every push.
 | `tests/datasource.rs` (22) | Parquet and CSV files written in the test read back equal; projections in any order and with repeats; empty projections still count rows; batch sizes (0 included); inferred CSV types, NULLs, timestamps and impossible dates; the catalog's names |
 | `tests/binder.rs` (41) | each binding rule in DESIGN.md: the printed plan, or the error and its message; the review's findings; the depth limit on a 2 MiB stack |
 | `tests/binder_properties.rs` (3) | random expressions against a model of the type rules (below) |
-| unit tests (14) | the common-type rules, date parsing over every day from 1600 to 2400 and against Arrow's own cast, expression printing, the plan nodes' guards and schemas |
-| `quarry-cli/tests/cli.rs` (7) | the built binary: output, exit codes, errors on stderr, and that this README's examples print what it says |
+| `tests/execute.rs` (14) | queries end to end at batch sizes 1, 2, 3 and 8192 (which must agree): filters, projections, ORDER BY (NULLs, -0.0, ties, hidden keys), LIMIT/OFFSET and that a LIMIT stops reading, every aggregate, GROUP BY expressions, HAVING, DISTINCT, aggregates over no rows, float groups, i128 sums, errors; the same queries over CSV and Parquet files |
+| `tests/eval_properties.rs` (3) | random well-typed expressions over random rows, evaluated by the engine and by a row-at-a-time reference interpreter in the test (below) |
+| `tests/aggregate_properties.rs` (2) | random GROUP BY queries at random batch sizes against a reference grouping in plain Rust |
+| unit tests (28) | the common-type rules, date parsing over every day from 1600 to 2400 and against Arrow's own cast, expression printing, the plan nodes' guards and schemas; each operator of the evaluator, with DuckDB 2.0's answers |
+| `quarry-cli/tests/cli.rs` (9) | the built binary: output, exit codes, errors on stderr, `quarry query`, and that this README's examples print what it says |
 
 The property tests bind `SELECT <expr> FROM t` for expressions from two generators (a random grammar of every
 supported operator, mostly ill-typed, and a type-directed one that builds well-typed trees three operators deep)
@@ -143,6 +159,14 @@ nothing may panic; every bound operator must see one type on both sides; and the
 to the same tree. Mutating the binder (dropping its casts, integer division, a wrong nullability, LIKE's printing
 precedence) fails them. `PROPTEST_CASES=100000 cargo test --release -p quarry --test binder_properties` searches
 longer (about 5 s here); CI's Linux job runs that on every push.
+
+The evaluator's property test generates well-typed SQL expressions (every operator, `CASE`, `IN`, `LIKE`, casts,
+date arithmetic) over random rows full of edge values (i64::MIN and MAX, -0.0, NaN, infinity, backslashes, newlines)
+and evaluates each with the engine and with an interpreter in the test that applies DESIGN.md's rules one row at a
+time over plain Rust values. The two must agree on every value, floats bit for bit, or both fail, and two slices of
+the batch must give the same as the whole. The GROUP BY property does the same for random queries (no key, or one or
+two of four columns; one to four aggregates, each maybe DISTINCT) against a grouping in plain Rust. Twelve mutations
+of the engine (six in the evaluator, six in aggregation) each fail one of them. CI runs both at 100,000 cases.
 
 ## Review of day 1
 
@@ -182,11 +206,26 @@ property then found one more bug itself: `-(-0)` printed as `-0`, which binds ba
 - **PostgreSQL's rules for ORDER BY and GROUP BY names**: an output name counts only as a bare name (`ORDER BY x +
   1` doesn't see the alias `x`), and in GROUP BY a FROM column wins over an alias of the same name.
 - **Errors, never panics, on any query or file.** `QuarryError` says whose fault it is: the query's (`Sql`,
-  `Plan`), the engine's (`Unsupported`, naming what), or the data's (`Table`, `Io`, `Arrow`, `Parquet`).
+  `Plan`), the engine's (`Unsupported`, naming what), or the data's (`Execution`, `Table`, `Io`, `Arrow`,
+  `Parquet`).
+- **Batches, pulled.** Operators are iterators of Arrow record batches (8,192 rows by default): an expression is
+  dispatched once per batch and runs as a tight loop inside Arrow's kernels, and a consumer that stops pulling (a
+  LIMIT) stops the work below it.
+- **Lazy AND, OR and CASE**, as in DuckDB: guards such as `b <> 0 AND a % b = 1` work, at the cost of taking the
+  undecided rows out of the batch and putting the results back.
+- **Errors over NULLs.** Overflow, `% 0` and a failed cast stop the query (DuckDB's behaviour), so no answer is
+  silently missing values; it also keeps the plan's nullability honest.
+- **Group by bytes.** Arrow's row format turns any combination of key columns into one comparable, hashable byte
+  string, so grouping, DISTINCT and MIN/MAX each have one implementation for every type, not one per type.
 
-## Limitations (day 1)
+## Limitations (day 2)
 
-- Nothing executes yet: `quarry plan` prints a plan, nothing runs one.
+- Joins bind but don't run (day 3). Sort sorts its whole input even under a LIMIT (day 3's top-k), and sort and
+  aggregate hold their whole input or all groups in memory; there is no spilling to disk, and one thread does all
+  the work.
+- Where Arrow's kernels and DuckDB differ in details not covered by DESIGN.md's table, Quarry follows Arrow: string to
+  number casts don't trim spaces (`CAST(' 12' AS INT)` fails; DuckDB gives 12), floats print as Arrow prints them.
+- `SUM` of integers is an Int64 and fails past it (DuckDB returns a 128-bit integer); dates end at Date32's range.
 - No subqueries, `WITH`, `UNION`, window functions, `RIGHT`/`FULL` joins, intervals, or scalar functions other
   than `CAST`; each is a clear `Unsupported` error.
 - No decimal, timestamp or `UInt64` arithmetic: such columns can be selected but not computed on.
