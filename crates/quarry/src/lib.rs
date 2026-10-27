@@ -16,6 +16,12 @@ pub use {arrow, parquet};
 
 pub use catalog::Catalog;
 pub use error::{QuarryError, Result};
+pub use exec::QueryResult;
+
+/// Parses, binds and runs one query against the catalog.
+pub fn query(catalog: &Catalog, sql: &str) -> Result<QueryResult> {
+    exec::collect(&sql::plan(catalog, sql)?)
+}
 
 /// The engine's version, as `quarry --version` prints it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
