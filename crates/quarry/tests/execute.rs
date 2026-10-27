@@ -303,6 +303,26 @@ impl TableProvider for FailsAfterOneBatch {
 }
 
 #[test]
+fn a_limit_over_a_projection_computes_only_the_rows_it_keeps() {
+    // Found by the day-2 review: the projection computed whole batches before the LIMIT sliced them, so row 3's
+    // division by zero failed the query at batch sizes 3 and up but not at 1 or 2. DuckDB 2.0: [0, 0] and [0].
+    assert_eq!(
+        run("SELECT 10 % (id - 3) FROM orders LIMIT 2"),
+        table(&[&["0"], &["0"]])
+    );
+    assert_eq!(
+        run("SELECT 10 % (id - 3) FROM orders LIMIT 1 OFFSET 1"),
+        table(&[&["0"]])
+    );
+    let e = error("SELECT 10 % (id - 3) FROM orders LIMIT 3");
+    assert!(e.contains("division by zero"), "{e}");
+    // Under an ORDER BY the select list is computed for every row before the sort, so this fails at any batch size,
+    // as it does in DuckDB 2.0.
+    let e = error("SELECT 10 % (id - 4) FROM orders ORDER BY qty * -1, id LIMIT 3");
+    assert!(e.contains("division by zero"), "{e}");
+}
+
+#[test]
 fn limit_stops_reading() {
     let mut c = Catalog::new();
     c.register("t", Arc::new(FailsAfterOneBatch)).unwrap();

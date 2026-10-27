@@ -230,14 +230,17 @@ becomes an iterator of Arrow `RecordBatch`es that pulls from its input's iterato
 | `Empty` | one batch of one row and no columns, or nothing |
 | `Filter` | evaluates the predicate on each batch and keeps the rows where it is `TRUE` (Arrow's `filter`) |
 | `Projection` | evaluates each expression on each batch |
-| `Limit` | slices batches; once it has `fetch` rows it stops pulling, so the rest of the input is never read |
+| `Limit` | slices batches; once it has `fetch` rows it stops pulling, so the rest of the input is never read. Over projections it runs below them (a projection makes one row of each input row), so they compute only the rows it keeps |
 | `Sort` | reads its whole input, evaluates the keys, sorts with Arrow's `lexsort`; the row number is the last key, so ties keep their input order |
 | `Aggregate` | reads its whole input into a hash table of groups (below), then hands out one row per group |
 | `Join` | not yet: it binds, and running it is an `Unsupported` error until day 3 |
 
 Every batch of the result is checked against the plan's output schema (types and nullability): a plan that claims a
 column can't be NULL and then makes a NULL fails there, instead of returning a wrong answer. The result doesn't depend
-on `batch_size`; the tests run every query at several.
+on `batch_size`; the tests run every query at several. One exception, which DuckDB shares: whether a query that fails
+on some row fails at all can depend on how far a LIMIT lets it read. `SELECT 10 % (id - 3) FROM t LIMIT 2` never
+computes row 3 (the limit runs below the projection), but a filter computes its predicate for whole batches, so
+`WHERE 10 % (id - 3) = 0 LIMIT 2` reaches row 3 only if it is in a batch the limit pulls.
 
 **Expressions** (`exec::evaluate`) are computed a column at a time with Arrow's compute kernels. A literal stays a
 one-row scalar until an operator needs a column (Arrow's kernels take a column and a scalar), so `l_quantity < 24`

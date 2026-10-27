@@ -101,16 +101,12 @@ fn stream(plan: &LogicalPlan, batch_size: usize) -> Result<BatchIter> {
             Ok(Box::new(batches.into_iter()))
         }
         LogicalPlan::Filter(f) => filter(f, batch_size),
-        LogicalPlan::Projection(p) => projection(p, batch_size),
+        LogicalPlan::Projection(p) => project(p, stream(&p.input, batch_size)?),
         LogicalPlan::Aggregate(a) => {
             aggregate::aggregate(a, stream(&a.input, batch_size)?, batch_size)
         }
         LogicalPlan::Sort(s) => sort(s, batch_size),
-        LogicalPlan::Limit(l) => Ok(Box::new(LimitStream {
-            input: stream(&l.input, batch_size)?,
-            skip: l.skip,
-            fetch: l.fetch,
-        })),
+        LogicalPlan::Limit(l) => limited(&l.input, l.skip, l.fetch, batch_size),
         LogicalPlan::Join(_) => Err(unsupported!(
             "running a join (the plan binds; day 3 adds the join operators)"
         )),
@@ -141,8 +137,27 @@ fn filter(f: &Filter, batch_size: usize) -> Result<BatchIter> {
     ))
 }
 
-fn projection(p: &Projection, batch_size: usize) -> Result<BatchIter> {
-    let input = stream(&p.input, batch_size)?;
+/// `LIMIT` over `plan`. A projection makes one row of each input row, so the limit is applied below it (below a chain
+/// of them): the projection then computes only the rows the limit keeps, and `SELECT 10 % (id - 3) FROM t LIMIT 2`
+/// never computes row 3's division by zero, whatever the batch size.
+fn limited(
+    plan: &LogicalPlan,
+    skip: usize,
+    fetch: Option<usize>,
+    batch_size: usize,
+) -> Result<BatchIter> {
+    match plan {
+        LogicalPlan::Projection(p) => project(p, limited(&p.input, skip, fetch, batch_size)?),
+        other => Ok(Box::new(LimitStream {
+            input: stream(other, batch_size)?,
+            skip,
+            fetch,
+        })),
+    }
+}
+
+/// Evaluates a projection's expressions over each batch of its input.
+fn project(p: &Projection, input: BatchIter) -> Result<BatchIter> {
     let in_schema = p.input.schema().clone();
     let out_schema = Arc::new(p.schema.to_arrow());
     let exprs = p.exprs.clone();
