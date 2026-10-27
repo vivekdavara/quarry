@@ -2,8 +2,10 @@
 //! aggregate per group (DESIGN.md, "Execution").
 //!
 //! Arrow's row format encodes a row's key columns as bytes that compare and hash as the values do, for any types, so
-//! a `HashMap` from those bytes to a group number is the whole grouping. Floats are normalized first (-0.0 is 0.0,
-//! one NaN), because the format orders floats by IEEE 754's total order, which tells those apart.
+//! a `HashMap` from those bytes to a group number is the whole grouping. Floats are normalized for that (-0.0 is 0.0,
+//! one NaN), because the format orders floats by IEEE 754's total order, which tells those apart; but what comes out
+//! is a value from the input, as in DuckDB: a group's key is its first row's (-0.0 stays -0.0), MIN and MAX are the
+//! winning value itself.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -19,6 +21,7 @@ use super::{evaluate, normalize_floats, rows};
 use crate::datasource::{BatchIter, split_batch};
 use crate::error::{Result, exec_err};
 use crate::plan::{Aggregate, AggregateFunction, Expr, PlanSchema};
+use crate::types::is_float;
 
 /// Reads the whole input, then hands out one row per group: the group keys, then the aggregates. Without a GROUP BY
 /// there is exactly one group, even over no rows (`SELECT count(*) FROM t WHERE FALSE` is 0); with one, no rows make
@@ -65,12 +68,13 @@ pub(super) fn aggregate(
     Ok(Box::new(split_batch(&out, batch_size).into_iter().map(Ok)))
 }
 
-/// The groups seen so far: each distinct key (its row-format bytes) and its group number, in order of first
-/// appearance.
+/// The groups seen so far: each distinct key and its group number, in order of first appearance.
 struct Groups {
     /// `None` without a GROUP BY: every row is in group 0, which exists from the start.
     converter: Option<RowConverter>,
+    /// Group numbers by the row-format bytes of the normalized key.
     numbers: HashMap<Vec<u8>, usize>,
+    /// Each group's key as its first row had it (not normalized), in row format, for the output.
     keys: Vec<Vec<u8>>,
 }
 
@@ -112,17 +116,27 @@ impl Groups {
         };
         let columns = group_by
             .iter()
-            .map(|g| Ok(normalize_floats(&evaluate(g, schema, batch)?)))
+            .map(|g| evaluate(g, schema, batch))
             .collect::<Result<Vec<_>>>()?;
-        let encoded = converter.convert_columns(&columns)?;
+        let normalized: Vec<ArrayRef> = columns.iter().map(normalize_floats).collect();
+        let encoded = converter.convert_columns(&normalized)?;
+        // Only float keys change when normalized; otherwise the encoded rows are the keys as they are.
+        let originals = match columns.iter().any(|c| is_float(c.data_type())) {
+            true => Some(converter.convert_columns(&columns)?),
+            false => None,
+        };
         let mut ids = Vec::with_capacity(batch.num_rows());
-        for row in encoded.iter() {
+        for (i, row) in encoded.iter().enumerate() {
             let bytes: &[u8] = row.as_ref();
             let id = match self.numbers.get(bytes) {
                 Some(&id) => id,
                 None => {
                     let id = self.keys.len();
-                    self.keys.push(bytes.to_vec());
+                    let original = match &originals {
+                        Some(o) => o.row(i).as_ref().to_vec(),
+                        None => bytes.to_vec(),
+                    };
+                    self.keys.push(original);
                     self.numbers.insert(bytes.to_vec(), id);
                     id
                 }
@@ -197,7 +211,9 @@ fn accumulator(agg: &Expr, schema: &PlanSchema) -> Result<Box<dyn Accumulator>> 
         }
         (f, t) => return Err(exec_err!("no accumulator for {} over {t:?}", f.name())),
     };
-    if *distinct {
+    // MIN(DISTINCT x) is MIN(x); DuckDB computes it so too.
+    let min_max = matches!(func, AggregateFunction::Min | AggregateFunction::Max);
+    if *distinct && !min_max {
         let t = arg_type.expect("DISTINCT has an argument");
         return Ok(Box::new(Distinct {
             converter: RowConverter::new(vec![SortField::new(t)])?,
@@ -348,13 +364,15 @@ impl Accumulator for FloatSum {
 }
 
 /// MIN or MAX of any type the row format encodes: the values are compared as their row-format bytes, which order as
-/// the values do (floats normalized first, so NaN is the greatest, as in DuckDB). The best row so far is kept per
-/// group, and decoded back to the argument's type at the end.
+/// the values do (floats normalized first, so NaN is the greatest, as in DuckDB). Per group it keeps the best value's
+/// normalized bytes, to compare, and its bytes as it was, to decode back to the argument's type at the end. Among
+/// equal values (-0.0 and 0.0) the last one wins, as in DuckDB.
 struct MinMax {
     data_type: DataType,
     /// `None` for the NULL type, whose MIN and MAX are NULL.
     converter: Option<RowConverter>,
-    best: Vec<Option<Vec<u8>>>,
+    /// (normalized, original) bytes.
+    best: Vec<Option<(Vec<u8>, Vec<u8>)>>,
     max: bool,
 }
 
@@ -384,9 +402,14 @@ impl Accumulator for MinMax {
         let Some(converter) = &self.converter else {
             return Ok(());
         };
-        let values = normalize_floats(values.expect("MIN has an argument"));
-        let valid = valid(&values);
-        let encoded = converter.convert_columns(std::slice::from_ref(&values))?;
+        let values = values.expect("MIN has an argument");
+        let valid = valid(values);
+        let normalized = normalize_floats(values);
+        let encoded = converter.convert_columns(std::slice::from_ref(&normalized))?;
+        let originals = match is_float(values.data_type()) {
+            true => Some(converter.convert_columns(std::slice::from_ref(values))?),
+            false => None,
+        };
         for (i, &g) in groups.iter().enumerate() {
             if !valid(i) {
                 continue;
@@ -395,11 +418,15 @@ impl Accumulator for MinMax {
             let row: &[u8] = row.as_ref();
             let better = match &self.best[g] {
                 None => true,
-                Some(best) if self.max => row > best.as_slice(),
-                Some(best) => row < best.as_slice(),
+                Some((best, _)) if self.max => row >= best.as_slice(),
+                Some((best, _)) => row <= best.as_slice(),
             };
             if better {
-                self.best[g] = Some(row.to_vec());
+                let original = match &originals {
+                    Some(o) => o.row(i).as_ref().to_vec(),
+                    None => row.to_vec(),
+                };
+                self.best[g] = Some((row.to_vec(), original));
             }
         }
         Ok(())
@@ -412,7 +439,12 @@ impl Accumulator for MinMax {
         };
         // Decode the groups that have a value, then spread them out with NULLs for the groups that don't.
         let parser = converter.parser();
-        let found = converter.convert_rows(self.best.iter().flatten().map(|b| parser.parse(b)))?;
+        let found = converter.convert_rows(
+            self.best
+                .iter()
+                .flatten()
+                .map(|(_, original)| parser.parse(original)),
+        )?;
         let mut next = 0u32;
         let positions: UInt32Array = self
             .best
@@ -428,8 +460,8 @@ impl Accumulator for MinMax {
     }
 }
 
-/// `agg(DISTINCT x)`: passes each group's first occurrence of each value on to the aggregate, by remembering the
-/// (group, value) pairs it has seen (values in row format, floats normalized: -0.0 and 0.0 are one value).
+/// `agg(DISTINCT x)`: passes each group's first occurrence of each value on to the aggregate, as it was, by remembering
+/// the (group, value) pairs it has seen (values in row format, floats normalized: -0.0 and 0.0 are one value).
 struct Distinct {
     converter: RowConverter,
     seen: HashSet<(usize, Vec<u8>)>,
@@ -443,11 +475,11 @@ impl Accumulator for Distinct {
         values: Option<&ArrayRef>,
         num_groups: usize,
     ) -> Result<()> {
-        let values = normalize_floats(values.expect("DISTINCT has an argument"));
-        let valid = valid(&values);
+        let values = values.expect("DISTINCT has an argument");
+        let valid = valid(values);
         let encoded = self
             .converter
-            .convert_columns(std::slice::from_ref(&values))?;
+            .convert_columns(&[normalize_floats(values)])?;
         let mut keep = Vec::new();
         let mut kept_groups = Vec::new();
         for (i, &g) in groups.iter().enumerate() {
@@ -456,7 +488,7 @@ impl Accumulator for Distinct {
                 kept_groups.push(g);
             }
         }
-        let kept = take(&values, &UInt32Array::from(keep), None)?;
+        let kept = take(values, &UInt32Array::from(keep), None)?;
         self.inner.update(&kept_groups, Some(&kept), num_groups)
     }
 

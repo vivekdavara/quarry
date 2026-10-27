@@ -439,14 +439,50 @@ fn distinct_aggregates() {
 
 #[test]
 fn floats_group_and_count_as_duckdb_does() {
-    // -0.0 and 0.0 are one group, every NaN another, as DuckDB 2.0 groups them; NaN sorts after the numbers.
+    // -0.0 and 0.0 are one group, every NaN another, as DuckDB 2.0 groups them; NaN sorts after the numbers. A group's
+    // key is its first row's value (here -0.0), as DuckDB prints it.
     assert_eq!(
         run("SELECT x, count(*) FROM floats GROUP BY x ORDER BY x"),
-        table(&[&["0.0", "2"], &["1.0", "1"], &["NaN", "2"], &["NULL", "1"]])
+        table(&[&["-0.0", "2"], &["1.0", "1"], &["NaN", "2"], &["NULL", "1"]])
     );
+    // MIN takes the last of two equal values (0.0 after -0.0), as DuckDB does.
     assert_eq!(
         run("SELECT count(DISTINCT x), min(x), max(x) FROM floats"),
         table(&[&["3", "0.0", "NaN"]])
+    );
+}
+
+#[test]
+fn results_are_values_from_the_input_not_their_normalized_forms() {
+    // Found by the day-2 review: -0.0 came back as 0.0 from MIN/MAX, group keys and DISTINCT, because the normalized
+    // bytes used to compare were decoded into the result. 1 / x shows the sign. DuckDB 2.0, line by line: -inf, -inf;
+    // -inf; -0.0; -inf, -inf; inf (MIN(DISTINCT) is MIN, and among equal values the last wins); inf.
+    let mut c = catalog();
+    c.register(
+        "z",
+        column("f", Arc::new(Float64Array::from(vec![-0.0, 0.0]))),
+    )
+    .unwrap();
+    c.register(
+        "zr",
+        column("f", Arc::new(Float64Array::from(vec![0.0, -0.0]))),
+    )
+    .unwrap();
+    let one = |sql: &str| run_in(&c, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    assert_eq!(
+        one("SELECT 1 / min(f), 1 / max(f) FROM z WHERE 1 / f < 0"),
+        table(&[&["-inf", "-inf"]])
+    );
+    assert_eq!(one("SELECT 1 / f FROM z GROUP BY f"), table(&[&["-inf"]]));
+    assert_eq!(one("SELECT DISTINCT f FROM z"), table(&[&["-0.0"]]));
+    assert_eq!(
+        one("SELECT 1 / min(f), 1 / max(f) FROM zr"),
+        table(&[&["-inf", "-inf"]])
+    );
+    assert_eq!(one("SELECT 1 / min(DISTINCT f) FROM z"), table(&[&["inf"]]));
+    assert_eq!(
+        one("SELECT 1 / sum(DISTINCT f) FROM zr"),
+        table(&[&["inf"]])
     );
 }
 

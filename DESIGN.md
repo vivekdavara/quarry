@@ -264,7 +264,7 @@ DuckDB by hand:
 | `x / 0`, `0 / 0` | `inf` (or `-inf`) and `NaN`: `/` is always Float64, and floats follow IEEE 754 |
 | a float cast to an integer | rounds half to even (`CAST(2.5 AS BIGINT)` is 2, `3.5` is 4); Arrow truncates, so Quarry rounds first |
 | a cast that fails (`CAST('abc' AS INT)`, `CAST(300 AS SMALLINT)`, NaN to BIGINT) | an error, never NULL (Arrow's "safe" mode would make NULLs; the plan's nullability assumes casts don't) |
-| `-0.0 = 0.0`, `NaN = NaN` | both `TRUE`; NaN is greater than every other number. Arrow's kernels order floats by IEEE 754's total order, which tells -0.0 from 0.0 and one NaN from another, so floats are normalized (-0.0 to 0.0, every NaN to one NaN) before comparisons, grouping, DISTINCT, MIN/MAX and sorting |
+| `-0.0 = 0.0`, `NaN = NaN` | both `TRUE`; NaN is greater than every other number. Arrow's kernels order floats by IEEE 754's total order, which tells -0.0 from 0.0 and one NaN from another, so floats are normalized (-0.0 to 0.0, every NaN to one NaN) before comparisons, grouping, DISTINCT, MIN/MAX and sorting. What comes out is still a value from the input: a group's key is its first row's (-0.0 stays -0.0), MIN and MAX the winning value, the last of equal ones (DuckDB's choices) |
 | strings | compared and sorted by their UTF-8 bytes (`'B' < 'a' < 'é'`) |
 | `LIKE` | no escape character: a backslash is an ordinary character (Arrow's kernel treats `\` as an escape, so Quarry doubles each one); `%` and `_` match newlines; `ILIKE` folds Unicode case |
 | `'a' \|\| NULL` | NULL |
@@ -274,6 +274,7 @@ DuckDB by hand:
 **Aggregation.** Rows are grouped by their group keys encoded in Arrow's row format: bytes that compare and hash as
 the values do, for any types and any number of keys, so one `HashMap<bytes, group number>` is the whole grouping (the
 floats normalized first, so -0.0 and 0.0 are one group and NaNs another, as in DuckDB; NULL is a group of its own).
+The key a group outputs is its first row's, as it was.
 Each aggregate keeps an accumulator with a slot per group:
 
 | Aggregate | State per group | Result |
@@ -281,8 +282,8 @@ Each aggregate keeps an accumulator with a slot per group:
 | `COUNT(*)`, `COUNT(x)` | a count of rows, or of non-NULL values | Int64, 0 for no rows |
 | `SUM`, `AVG` of integers | an i128 sum and a count | SUM: Int64, an error if the total doesn't fit (DuckDB's SUM returns a 128-bit HUGEINT instead); AVG: the sum divided by the count, as Float64, at the end |
 | `SUM`, `AVG` of floats | an f64 sum and a count | Float64 |
-| `MIN`, `MAX` | the best value's row-format bytes | the argument's type, decoded from the bytes |
-| `agg(DISTINCT x)` | the (group, value) pairs seen | the aggregate over each group's first occurrence of each value |
+| `MIN`, `MAX` | the best value's row-format bytes, normalized (to compare) and as it was (to output); the last of equal values wins | the argument's type, decoded from the bytes |
+| `agg(DISTINCT x)` | the (group, value) pairs seen | the aggregate over each group's first occurrence of each value; MIN and MAX ignore DISTINCT, which doesn't change them |
 
 `SUM`, `AVG`, `MIN` and `MAX` of no values are NULL. Without a `GROUP BY` there is exactly one group, even over no
 rows (`SELECT count(*) FROM t WHERE FALSE` is one row, 0); with one, no rows make no groups.

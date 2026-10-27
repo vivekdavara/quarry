@@ -15,7 +15,8 @@ use quarry::datasource::MemTable;
 use quarry::exec::collect_with_batch_size;
 use quarry::{Catalog, sql};
 
-/// A value as the reference sees it. Floats are kept normalized (no -0.0, one NaN), as the engine outputs them.
+/// A value as the reference sees it. A float keeps its bits, so -0.0 and 0.0 differ in results (as DuckDB outputs
+/// them); `same` is SQL's equality for grouping.
 #[derive(Debug, Clone, PartialEq)]
 enum V {
     Null,
@@ -26,8 +27,18 @@ enum V {
 }
 
 fn float(x: f64) -> V {
-    let x = if x.is_nan() { f64::NAN } else { x + 0.0 };
     V::Float(x.to_bits())
+}
+
+/// Equal as GROUP BY and DISTINCT see it: -0.0 is 0.0, all NaNs are one value, NULL equals NULL.
+fn same(a: &V, b: &V) -> bool {
+    match (a, b) {
+        (V::Float(x), V::Float(y)) => {
+            let (x, y) = (f64::from_bits(*x), f64::from_bits(*y));
+            (x.is_nan() && y.is_nan()) || x == y
+        }
+        _ => a == b,
+    }
 }
 
 /// The order MIN and MAX use: numbers by value with NaN the greatest, strings by bytes.
@@ -171,7 +182,11 @@ fn reference(rows: &[Row], keys: &[usize], aggs: &[Agg]) -> Result<Vec<Vec<V>>, 
     for r in rows {
         let c = cells(r);
         let key: Vec<V> = keys.iter().map(|&k| c[k].clone()).collect();
-        match groups.iter_mut().find(|(k, _)| *k == key) {
+        // A group's key is its first row's value.
+        match groups
+            .iter_mut()
+            .find(|(k, _)| k.iter().zip(&key).all(|(a, b)| same(a, b)))
+        {
             Some((_, members)) => members.push(c),
             None => groups.push((key, vec![c])),
         }
@@ -196,10 +211,12 @@ fn compute(agg: &Agg, members: &[[V; 5]]) -> Result<V, String> {
         .map(|m| m[c].clone())
         .filter(|v| *v != V::Null)
         .collect();
-    if agg.distinct {
-        let mut seen = Vec::new();
+    // DISTINCT keeps each value's first occurrence; MIN and MAX ignore it (DuckDB's choice, and the same answer up
+    // to which of two equal values is returned).
+    if agg.distinct && agg.func != "min" && agg.func != "max" {
+        let mut seen: Vec<V> = Vec::new();
         values.retain(|v| {
-            let new = !seen.contains(v);
+            let new = !seen.iter().any(|s| same(s, v));
             if new {
                 seen.push(v.clone());
             }
@@ -214,12 +231,13 @@ fn compute(agg: &Agg, members: &[[V; 5]]) -> Result<V, String> {
     }
     match agg.func {
         "min" | "max" => {
+            // Among equal values (-0.0 and 0.0) the last wins, as in DuckDB.
             let mut best = values[0].clone();
             for v in &values[1..] {
                 let better = if agg.func == "min" {
-                    less(v, &best)
+                    !less(&best, v)
                 } else {
-                    less(&best, v)
+                    !less(v, &best)
                 };
                 if better {
                     best = v.clone();
@@ -245,13 +263,14 @@ fn compute(agg: &Agg, members: &[[V; 5]]) -> Result<V, String> {
                 }
             }
             V::Float(_) => {
+                // From +0.0, in row order, as the engine adds.
                 let sum: f64 = values
                     .iter()
                     .map(|v| match v {
                         V::Float(x) => f64::from_bits(*x),
                         _ => unreachable!(),
                     })
-                    .sum();
+                    .fold(0.0, |a, b| a + b);
                 Ok(float(if agg.func == "avg" {
                     sum / values.len() as f64
                 } else {
@@ -277,12 +296,7 @@ fn engine_rows(result: &quarry::QueryResult) -> Vec<Vec<V>> {
                         }
                         match a.data_type() {
                             DataType::Int64 => V::Int(a.as_primitive::<Int64Type>().value(i)),
-                            DataType::Float64 => {
-                                let x = a.as_primitive::<Float64Type>().value(i);
-                                // The engine's outputs must already be normalized.
-                                assert_eq!(float(x), V::Float(x.to_bits()), "unnormalized {x}");
-                                V::Float(x.to_bits())
-                            }
+                            DataType::Float64 => float(a.as_primitive::<Float64Type>().value(i)),
                             DataType::Utf8 => V::Str(a.as_string::<i32>().value(i).to_string()),
                             DataType::Date32 => V::Date(a.as_primitive::<Date32Type>().value(i)),
                             t => panic!("unexpected type {t}"),
@@ -339,13 +353,24 @@ proptest! {
 }
 
 #[test]
-fn the_reference_sees_every_distinct_float_once() {
-    let rows: Vec<Row> = [-0.0, 0.0, f64::NAN, -f64::NAN, 1.5]
+fn the_reference_groups_floats_as_sql_does() {
+    let values: Vec<V> = [-0.0, 0.0, f64::NAN, -f64::NAN, 1.5]
         .iter()
-        .map(|&x| (None, None, Some(x), None, None))
+        .map(|&x| float(x))
         .collect();
-    let distinct: HashSet<String> = rows.iter().map(|r| format!("{:?}", cells(r)[2])).collect();
-    assert_eq!(distinct.len(), 3);
+    let mut distinct: Vec<&V> = Vec::new();
+    for v in &values {
+        if !distinct.iter().any(|d| same(d, v)) {
+            distinct.push(v);
+        }
+    }
+    assert_eq!(distinct, [&float(-0.0), &float(f64::NAN), &float(1.5)]);
+    let text: HashSet<String> = values.iter().map(|v| format!("{v:?}")).collect();
+    assert_eq!(
+        text.len(),
+        5,
+        "results tell -0.0 from 0.0, and NaNs by their bits"
+    );
 }
 
 /// One ORDER BY key: a column, descending, NULLS FIRST.
