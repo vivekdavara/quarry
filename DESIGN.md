@@ -32,9 +32,9 @@ flowchart LR
    error a user can make in a query is found here, before any data is read.
 3. **Optimize** (day 3). Rules rewrite the logical plan: constant folding, projection pushdown into scans, predicate
    pushdown into Parquet row groups.
-4. **Execute** (days 2–3). A physical plan of operators, each a stream of Arrow `RecordBatch`es: scan, filter,
-   projection, hash aggregate, hash join, sort, limit. Expressions evaluate a whole column at a time with Arrow's
-   compute kernels.
+4. **Execute** (day 2, "Execution" below). Each node runs as a stream of Arrow `RecordBatch`es: scan, filter,
+   projection, aggregate (by hashing), sort, limit; day 3 adds the hash join and a physical plan. Expressions evaluate
+   a whole column at a time with Arrow's compute kernels.
 
 ## Data sources and the catalog
 
@@ -219,12 +219,77 @@ than 128 deep (`MAX_EXPR_DEPTH`: a chain of `OR`s is one level per operator, and
 recurse once per level), and statements other than
 `SELECT` (and `EXPLAIN SELECT`, which prints the plan).
 
+## Execution
+
+`exec::execute(plan, batch_size)` runs a logical plan as it stands (day 3 puts a physical plan in between). Each node
+becomes an iterator of Arrow `RecordBatch`es that pulls from its input's iterator, a batch at a time:
+
+| Node | How it runs |
+|---|---|
+| `Scan` | the provider's `scan`, at most `batch_size` rows a batch |
+| `Empty` | one batch of one row and no columns, or nothing |
+| `Filter` | evaluates the predicate on each batch and keeps the rows where it is `TRUE` (Arrow's `filter`) |
+| `Projection` | evaluates each expression on each batch |
+| `Limit` | slices batches; once it has `fetch` rows it stops pulling, so the rest of the input is never read |
+| `Sort` | reads its whole input, evaluates the keys, sorts with Arrow's `lexsort`; the row number is the last key, so ties keep their input order |
+| `Aggregate` | reads its whole input into a hash table of groups (below), then hands out one row per group |
+| `Join` | not yet: it binds, and running it is an `Unsupported` error until day 3 |
+
+Every batch of the result is checked against the plan's output schema (types and nullability): a plan that claims a
+column can't be NULL and then makes a NULL fails there, instead of returning a wrong answer. The result doesn't depend
+on `batch_size`; the tests run every query at several.
+
+**Expressions** (`exec::evaluate`) are computed a column at a time with Arrow's compute kernels. A literal stays a
+one-row scalar until an operator needs a column (Arrow's kernels take a column and a scalar), so `l_quantity < 24`
+doesn't build a column of 24s, and an expression of literals alone is computed once a batch. Over a batch of no rows
+an expression isn't computed at all: `9223372036854775807 + 1` fails only when a row needs it, as it would row by row.
+
+Three operators are **lazy**, as in DuckDB: `AND` evaluates its right side only on the rows where the left isn't
+`FALSE`, `OR` only where it isn't `TRUE`, and each `CASE` branch only on the rows that reach it. That is what makes
+`b <> 0 AND a % b = 1` and `CASE WHEN b = 0 THEN 0 ELSE a % b END` safe: the modulo never sees a zero. The rows still
+undecided are taken out of the batch (`take`), the operand is evaluated on them, and the results are put back in
+place (`interleave`).
+
+**The rules where SQL engines differ** follow DuckDB 2.0.0, the oracle day 4 compares against; each was checked on
+DuckDB by hand:
+
+| Case | Quarry (and DuckDB 2.0) |
+|---|---|
+| integer `+ - *`, unary minus overflowing Int64 | an error ("overflow in ...") |
+| `x % 0` | an error ("division by zero in ...") |
+| `i64::MIN % -1` | an error (it overflows in the division; Arrow's kernel returns 0) |
+| `x / 0`, `0 / 0` | `inf` (or `-inf`) and `NaN`: `/` is always Float64, and floats follow IEEE 754 |
+| a float cast to an integer | rounds half to even (`CAST(2.5 AS BIGINT)` is 2, `3.5` is 4); Arrow truncates, so Quarry rounds first |
+| a cast that fails (`CAST('abc' AS INT)`, `CAST(300 AS SMALLINT)`, NaN to BIGINT) | an error, never NULL (Arrow's "safe" mode would make NULLs; the plan's nullability assumes casts don't) |
+| `-0.0 = 0.0`, `NaN = NaN` | both `TRUE`; NaN is greater than every other number. Arrow's kernels order floats by IEEE 754's total order, which tells -0.0 from 0.0 and one NaN from another, so floats are normalized (-0.0 to 0.0, every NaN to one NaN) before comparisons, grouping, DISTINCT, MIN/MAX and sorting |
+| strings | compared and sorted by their UTF-8 bytes (`'B' < 'a' < 'é'`) |
+| `LIKE` | no escape character: a backslash is an ordinary character (Arrow's kernel treats `\` as an escape, so Quarry doubles each one); `%` and `_` match newlines; `ILIKE` folds Unicode case |
+| `'a' \|\| NULL` | NULL |
+| `x IN (1, NULL)` | `TRUE` if `x` is 1, else NULL (three-valued, as `x = 1 OR x = NULL`) |
+| date `+`/`-` days | a date; past Date32's range (about 5.8 million years either way) an error, where DuckDB's dates reach further |
+
+**Aggregation.** Rows are grouped by their group keys encoded in Arrow's row format: bytes that compare and hash as
+the values do, for any types and any number of keys, so one `HashMap<bytes, group number>` is the whole grouping (the
+floats normalized first, so -0.0 and 0.0 are one group and NaNs another, as in DuckDB; NULL is a group of its own).
+Each aggregate keeps an accumulator with a slot per group:
+
+| Aggregate | State per group | Result |
+|---|---|---|
+| `COUNT(*)`, `COUNT(x)` | a count of rows, or of non-NULL values | Int64, 0 for no rows |
+| `SUM`, `AVG` of integers | an i128 sum and a count | SUM: Int64, an error if the total doesn't fit (DuckDB's SUM returns a 128-bit HUGEINT instead); AVG: the sum divided by the count, as Float64, at the end |
+| `SUM`, `AVG` of floats | an f64 sum and a count | Float64 |
+| `MIN`, `MAX` | the best value's row-format bytes | the argument's type, decoded from the bytes |
+| `agg(DISTINCT x)` | the (group, value) pairs seen | the aggregate over each group's first occurrence of each value |
+
+`SUM`, `AVG`, `MIN` and `MAX` of no values are NULL. Without a `GROUP BY` there is exactly one group, even over no
+rows (`SELECT count(*) FROM t WHERE FALSE` is one row, 0); with one, no rows make no groups.
+
 ## The days
 
-- **Day 1 (this file):** the workspace, the readers and the catalog, the logical plan, the binder, a CLI that prints
+- **Day 1:** the workspace, the readers and the catalog, the logical plan, the binder, a CLI that prints
   a file's schema, its rows, and a query's plan; CI.
 - **Day 2:** execution of projection, filter, aggregate (with `GROUP BY`), sort and limit, and vectorized
-  expression evaluation over Arrow arrays.
+  expression evaluation over Arrow arrays ("Execution" above); `quarry query`.
 - **Day 3:** physical operators (hash aggregate, hash join, sort), predicate pushdown into Parquet row groups,
   optimizer rules (constant folding, projection pushdown).
 - **Day 4:** TPC-H-style queries over generated data; differential tests against DuckDB (Python `duckdb` as the
@@ -240,4 +305,11 @@ recurse once per level), and statements other than
 - **No panics:** a property test generates random expressions from a grammar of the supported SQL (columns of each
   type, literals, every operator) and binds them; the binder must return a plan or an error, never panic, and a
   plan's types must equal an independent type function's.
-- From day 2, every query result is compared with DuckDB's on the same files.
+- **Evaluation (day 2):** a property test generates well-typed expressions over random rows (NULLs, i64::MIN and
+  MAX, -0.0, NaN, infinities, backslashes, newlines) and evaluates each with the engine and with a reference
+  interpreter in the test that applies this file's rules one row at a time; the values must be equal, or both must
+  fail, and splitting the rows into batches mustn't change them. A second one does the same for random `GROUP BY`
+  queries against a reference grouping in plain Rust. Every query in `tests/execute.rs` runs at batch sizes 1, 2, 3
+  and 8192, over memory, CSV and Parquet, and must give the same rows.
+- **Against DuckDB (day 4):** TPC-H-style queries over generated files, each result compared with DuckDB's. Day 2's
+  rules above were checked against DuckDB 2.0.0 by hand.
