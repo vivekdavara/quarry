@@ -546,6 +546,11 @@ impl TableProvider for WrongType {
 
 #[test]
 fn a_result_that_disagrees_with_the_plan_is_an_error() {
+    // A projection rebuilds its batches against its own schema, which catches this too; a bare Scan passes the
+    // table's batches through, so only the final check against the plan's schema stands in the way.
+    let plan = quarry::plan::LogicalPlan::scan("t", "t", Arc::new(WrongType));
+    let e = collect_with_batch_size(&plan, 8192).unwrap_err();
+    assert!(e.to_string().contains("Int32"), "{e}");
     let mut c = Catalog::new();
     c.register("t", Arc::new(WrongType)).unwrap();
     let e = quarry::query(&c, "SELECT * FROM t").unwrap_err();
