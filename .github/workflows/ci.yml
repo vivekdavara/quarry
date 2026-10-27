@@ -41,7 +41,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-
       - name: Format, Clippy with warnings as errors, tests, docs without broken links
         run: make check
-      - name: The binder's, the evaluator's and GROUP BY and ORDER BY property tests at 100,000 cases each (release build)
+      - name: The property tests (binder, evaluator, GROUP BY and ORDER BY) at 100,000 cases each (release build)
         if: runner.os == 'Linux'
         run: >-
           cargo test --release --locked -p quarry

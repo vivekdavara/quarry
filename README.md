@@ -66,6 +66,7 @@ crates/quarry/          the engine (a library)
   tests/                datasource.rs, binder.rs, binder_properties.rs, execute.rs, eval_properties.rs,
                         query_properties.rs
   examples/             gen_orders.rs (synthetic Parquet data), time_queries.rs (the timings below)
+scripts/duckdb_times.py the same timings in DuckDB, for scale
 crates/quarry-cli/      the `quarry` binary and its tests
 examples/orders.csv     eight synthetic rows for the examples below
 DESIGN.md               the specification
@@ -145,7 +146,7 @@ it on Linux (ubuntu-24.04) and macOS (macos-15) on every push.
 | `tests/datasource.rs` (22) | Parquet and CSV files written in the test read back equal; projections in any order and with repeats; empty projections still count rows; batch sizes (0 included); inferred CSV types, NULLs, timestamps and impossible dates; the catalog's names |
 | `tests/binder.rs` (41) | each binding rule in DESIGN.md: the printed plan, or the error and its message; the review's findings; the depth limit on a 2 MiB stack |
 | `tests/binder_properties.rs` (3) | random expressions against a model of the type rules (below) |
-| `tests/execute.rs` (14) | queries end to end at batch sizes 1, 2, 3 and 8192 (which must agree): filters, projections, ORDER BY (NULLs, -0.0, ties, hidden keys), LIMIT/OFFSET and that a LIMIT stops reading, every aggregate, GROUP BY expressions, HAVING, DISTINCT, aggregates over no rows, float groups, i128 sums, errors; the same queries over CSV and Parquet files |
+| `tests/execute.rs` (17) | queries end to end at batch sizes 1, 2, 3 and 8192 (which must agree): filters, projections, ORDER BY (NULLs, -0.0, ties, hidden keys), LIMIT/OFFSET, that a LIMIT stops reading and computes only its rows, every aggregate, GROUP BY expressions, HAVING, DISTINCT, aggregates over no rows, float groups, i128 sums, errors; the same queries over CSV and Parquet files |
 | `tests/eval_properties.rs` (3) | random well-typed expressions over random rows, evaluated by the engine and by a row-at-a-time reference interpreter in the test (below) |
 | `tests/query_properties.rs` (3) | random GROUP BY queries, and random ORDER BY with LIMIT and OFFSET, at random batch sizes against a reference grouping and a stable sort in plain Rust |
 | unit tests (28) | the common-type rules, date parsing over every day from 1600 to 2400 and against Arrow's own cast, expression printing, the plan nodes' guards and schemas; each operator of the evaluator, with DuckDB 2.0's answers |
@@ -167,6 +168,51 @@ time over plain Rust values. The two must agree on every value, floats bit for b
 the batch must give the same as the whole. The GROUP BY property does the same for random queries (no key, or one or
 two of four columns; one to four aggregates, each maybe DISTINCT) against a grouping in plain Rust. Twelve mutations
 of the engine (six in the evaluator, six in aggregation) each fail one of them. CI runs both at 100,000 cases.
+
+## Results (day 2)
+
+Seven queries over 10,000,000 synthetic orders in one Parquet file (75 MB, zstd, 10 row groups), each run in process
+once to warm up and then five times; the median, at commit `5d4ef95`. Apple M3, macOS 26.6.2, Rust 1.99.0 release
+build, on battery (Low Power Mode off), 2026-10-27; no run had the machine asleep. One thread.
+
+```bash
+cargo run --release -p quarry --example gen_orders -- 10000000 data/orders_10m.parquet
+cargo run --release -p quarry --example time_queries -- data/orders_10m.parquet 5
+```
+
+| Query | Quarry | Rows/s | DuckDB 2.0, 1 thread | DuckDB, 8 threads |
+|---|---|---|---|---|
+| `count(*)` | 217.5 ms | 46 M | 0.2 ms | 0.3 ms |
+| filter (`status = 'shipped' AND total > 500`) + count | 508.9 ms | 20 M | 84.8 ms | 22.1 ms |
+| GROUP BY status (3 groups): count, sum, avg | 481.4 ms | 21 M | 97.5 ms | 24.6 ms |
+| filter, GROUP BY customer (10,000 groups), top 5 | 314.5 ms | 32 M | 86.5 ms | 24.1 ms |
+| filter, `sum(total * qty)`, `avg(qty * 2 + 1)` | 263.1 ms | 38 M | 85.3 ms | 23.1 ms |
+| `count(DISTINCT customer)` | 682.3 ms | 15 M | 17.9 ms | 5.9 ms |
+| ORDER BY total DESC, order_id LIMIT 10 | 2,051.9 ms | 5 M | 135.7 ms | 33.4 ms |
+
+The DuckDB columns are the same queries on the same file through its Python API (`python
+scripts/duckdb_times.py data/orders_10m.parquet`, median of five after a warm-up), for scale, not as a race: both gave the same answers (the sums differ in the last
+digits, from adding in another order). What the numbers say about day 3: every scan decodes all six columns, because
+nothing tells it which are needed (projection pushdown), so even `count(*)` reads the whole file, where DuckDB reads
+the row count from the footer; a filter copies all six columns of the rows it keeps; and `ORDER BY ... LIMIT 10`
+sorts all 10 million rows and gathers every column for them, where a top-k needs ten.
+
+## Review of day 2
+
+One review agent read the executor at `b28260b` (23 minutes, in its own worktree, DuckDB 2.0 at hand as an oracle):
+about 230 queries over Parquet and CSV files DuckDB had written, each at batch sizes 1, 2, 3 and 8192, diffed against
+DuckDB's answers, plus in-memory edge cases (NULL-typed columns, Utf8View, empty batches). It reproduced three bugs,
+each now fixed with its test in the suites:
+
+| Finding | Fix |
+|---|---|
+| `CAST(1e300 AS REAL)` gave `inf`: Arrow's float-to-float cast has no range check | a finite Float64 beyond Float32's range fails its cast, as in DuckDB (`a624684`) |
+| -0.0 came back as 0.0 from MIN, MAX, GROUP BY keys and DISTINCT (`1 / min(f)` was `inf`, DuckDB `-inf`): the normalized bytes used to compare were decoded into the result | outputs are input values: a group's first key, the winning MIN/MAX value (`5d4ef95`) |
+| `SELECT 10 % (id - 3) FROM t LIMIT 2` failed at batch sizes 3 and up but not 1 or 2: the projection computed whole batches before the LIMIT sliced them | a LIMIT runs below projections (`b9776c4`) |
+
+Of its 30 mutations of `exec/`, seven left every test passing at its commit (one equivalent); four of those fail the
+property tests written since, and the other three got tests (`066093a`, `52b3f08`). Its judgement calls are in the
+limitations below.
 
 ## Review of day 1
 
@@ -225,7 +271,14 @@ property then found one more bug itself: `-(-0)` printed as `-0`, which binds ba
   the work.
 - Where Arrow's kernels and DuckDB differ in details not covered by DESIGN.md's table, Quarry follows Arrow: string to
   number casts don't trim spaces (`CAST(' 12' AS INT)` fails; DuckDB gives 12), floats print as Arrow prints them.
-- `SUM` of integers is an Int64 and fails past it (DuckDB returns a 128-bit integer); dates end at Date32's range.
+- `SUM` of integers is an Int64 and fails past it (DuckDB returns a 128-bit integer); dates end at Date32's range,
+  and a date past about ±262,000 years computes but can't be printed.
+- A number with a point is a Float64, where DuckDB makes it a DECIMAL: `CAST(2.5 AS SMALLINT)` is 2 here (half to
+  even) and 3 in DuckDB, and `9223372036854775807.0` doesn't cast back to BIGINT. Small integers widen to Int64 for
+  arithmetic, so `tinyint_col + tinyint_col` can't overflow where DuckDB's TINYINT would.
+- The binder allows any cast Arrow can do (`CAST(d AS INT)`, `CAST(7 AS DATE)`), several of which DuckDB refuses,
+  and `%` takes integers only (DuckDB computes `5.5 % 2`).
+- An error in a WHERE under a LIMIT can depend on the batch size (DESIGN.md, "Execution"); DuckDB's can too.
 - No subqueries, `WITH`, `UNION`, window functions, `RIGHT`/`FULL` joins, intervals, or scalar functions other
   than `CAST`; each is a clear `Unsupported` error.
 - No decimal, timestamp or `UInt64` arithmetic: such columns can be selected but not computed on.
