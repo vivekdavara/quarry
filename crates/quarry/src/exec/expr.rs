@@ -25,7 +25,13 @@ use crate::types::is_integer;
 
 /// Evaluates `expr` over `batch`, whose columns are `schema`'s (the input of the plan node holding the expression;
 /// it names the columns in error messages). The result has one value per row of the batch.
+///
+/// An expression is computed for rows: over no rows it is never evaluated, so `9223372036854775807 + 1` fails only
+/// when there is a row to compute it for, as it would row by row.
 pub fn evaluate(expr: &Expr, schema: &PlanSchema, batch: &RecordBatch) -> Result<ArrayRef> {
+    if batch.num_rows() == 0 {
+        return Ok(new_empty_array(&expr.data_type(schema)));
+    }
     Ok(Evaluator { schema }
         .eval(expr, batch)?
         .into_array(batch.num_rows())?)
