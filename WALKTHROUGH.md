@@ -1,13 +1,13 @@
 # Walkthrough
 
 Questions an interviewer is likely to ask about Quarry, with short answers grounded in the code. Day 1 covers the
-readers, the logical plan and the binder; later days add sections.
+readers, the logical plan and the binder; day 2 execution; later days add sections.
 
 ## The big picture
 
 **What is Quarry, in one sentence?**
 A SQL engine for analytical queries over Parquet and CSV files: SQL text → `sqlparser` AST → a bound, typed
-`LogicalPlan` → (from day 2) vectorized operators over Arrow record batches.
+`LogicalPlan` → vectorized operators over Arrow record batches.
 
 **Why Arrow?**
 Arrow is a columnar in-memory format with compute kernels (comparison, arithmetic, filtering, casting) that work on
@@ -127,6 +127,95 @@ A random grammar over every operator mostly makes ill-typed trees (322 typable o
 tests the refusals well and the deep casts badly. The type-directed generator builds well-typed trees three
 operators deep, where casts nest inside `CASE`s inside arithmetic.
 
+## Execution (day 2)
+
+**How does a plan run?**
+`exec::execute` (`exec/mod.rs`) turns each plan node into an iterator of `RecordBatch`es that pulls from its input's
+iterator: the Volcano model, but a batch of up to 8,192 rows at a time instead of a row. A Scan is the table's own
+iterator; Filter, Projection and Limit map each batch as it comes; Sort and Aggregate have to see everything, so they
+drain their input first and then hand out their result in batches. Because each node only pulls, `LIMIT 10` over a
+billion-row file stops reading after the batch that completes its ten rows (`limit_stops_reading` proves it with a
+table whose second batch is an error).
+
+**Why batches rather than rows?**
+Per-row interpretation pays a dispatch (which operator? which type?) for every value. With batches, an expression is
+dispatched once per batch and the work inside is a tight loop over a typed array (Arrow's kernels), which the
+compiler vectorizes. Batches are also small enough to stay in cache, which whole columns wouldn't be.
+
+**What does "vectorized evaluation" mean in the code?**
+`exec::evaluate` (`exec/expr.rs`) takes a bound `Expr` and a batch and returns a whole column. `a + b` is one call to
+Arrow's `numeric::add` on two arrays. A literal is a one-row `Value::Scalar`, and Arrow's kernels accept a column and
+a scalar (the `Datum` trait), so `l_quantity < 24` never builds a column of 24s, and `1 + 2` is computed once per
+batch.
+
+**How does `WHERE b <> 0 AND a % b = 1` avoid dividing by zero, if both sides are computed a column at a time?**
+It wouldn't, if both were. `AND` evaluates its left side first; the rows where that is `FALSE` are decided. Only the
+other rows are taken out of the batch (`take_rows`), the right side is evaluated on them, and the results are put
+back in place with NULLs at the decided rows (`scatter`, via Arrow's `interleave`), which three-valued `AND` then
+ignores. `OR` does the same with `TRUE`, and `CASE` evaluates each `THEN` only on the rows whose `WHEN` took them.
+DuckDB behaves the same way, which I checked; PostgreSQL documents the same guarantee for `CASE`.
+
+**Why does `%` by zero fail but `/` by zero return infinity?**
+To match DuckDB 2.0, the oracle for day 4: `/` is always float division in Quarry (the binder casts both sides to
+Float64), and IEEE floats have an answer for x/0. Integer `%` has none, so it is an error, as is integer overflow.
+DESIGN.md's "Execution" table lists every such rule; I checked each one on DuckDB before writing it.
+
+**Why does a cast that fails raise an error instead of returning NULL?**
+Two reasons. DuckDB's `CAST` fails too (`TRY_CAST` is the one that returns NULL). And the plan's nullability analysis
+assumes a cast doesn't create NULLs: `CAST(id AS INT)` of a non-null column is typed non-null. Arrow's cast has a
+"safe" mode that makes NULLs; Quarry uses the strict one. One more difference handled by hand: Arrow truncates a
+float cast to an integer and DuckDB rounds half to even, so Quarry rounds first.
+
+**How does GROUP BY work?**
+`exec/aggregate.rs`. Each batch's group-key columns are encoded with Arrow's row format (`RowConverter`): every row
+becomes a byte string that compares and hashes as the values do, whatever the types and however many keys. A
+`HashMap<Vec<u8>, usize>` maps those bytes to a group number, so grouping is one lookup per row. Each aggregate has an
+accumulator with a slot per group (`Count`, `IntSum`, `FloatSum`, `MinMax`, `Distinct`); after the input is drained,
+the group keys are decoded back into columns and each accumulator produces its column.
+
+**Why are floats "normalized" before grouping and comparing?**
+Arrow orders floats by IEEE 754's total order, which puts -0.0 before 0.0 and distinguishes NaNs by their bits. SQL
+(and DuckDB) says -0.0 = 0.0 and NaN = NaN. So before comparing, grouping, deduplicating or sorting, Quarry maps
+-0.0 to 0.0 and every NaN to one NaN (`normalize_floats`); the property tests caught every mutant that skipped it.
+
+**Why sum integers in an i128?**
+So a partial sum can't overflow: `[i64::MAX, 1, -1]` sums to `i64::MAX` even though the first two overflow an i64
+on the way. Only the final total must fit in an Int64; if it doesn't, the query fails (DuckDB returns a 128-bit
+integer there instead; Quarry's SUM type is Int64). AVG keeps the same i128 and divides at the end, so integers above
+2^53 aren't rounded before they're added.
+
+**What do MIN and MAX keep for each group?**
+The row-format bytes of the best value so far. Comparing bytes works for every type the row format encodes
+(strings, dates, booleans, any integer width), so one accumulator covers them all, and the bytes are decoded back to
+the argument's type at the end.
+
+**`SELECT count(*) FROM t WHERE FALSE` returns a row. Why, and why doesn't the same query with GROUP BY?**
+SQL's rule: without GROUP BY, an aggregate query is one group, even over no rows, so the answer is one row with
+`count(*) = 0` and `sum(x)` NULL. With GROUP BY, groups come from rows; no rows make no groups. `Groups::len` is 1
+from the start when there is no GROUP BY.
+
+**What does the final schema check catch?**
+`execute` rebuilds every result batch against the plan's output schema, and Arrow refuses a batch whose array types
+differ from the schema or whose non-nullable column holds a NULL. So if the binder's type or nullability analysis
+were wrong, the query would fail loudly instead of returning a wrong answer.
+
+**How do you know the vectorized evaluator computes the right thing?**
+`tests/eval_properties.rs` generates well-typed SQL expressions (every operator, `CASE`, `IN`, `LIKE`, casts, date
+arithmetic) over random rows full of edge values (i64::MIN and MAX, -0.0, NaN, infinity, backslashes, newlines) and
+evaluates each twice: with the engine, and with an interpreter in the test that applies DESIGN.md's rules one row at
+a time over plain Rust values, sharing no code with the engine. They must agree on every value, bit for bit, or both
+fail; and two slices of the batch must give the same as the whole. `tests/aggregate_properties.rs` does the same for
+random GROUP BY queries against a grouping written in plain Rust. Then I mutated the engine (no -0.0 normalization,
+AND evaluating every row, CASE evaluating untaken branches, truncating casts, `\` as a LIKE escape, `i64::MIN % -1`
+as 0; six mutations of the aggregates) and each made a property fail. One survived at first: the LIKE backslash
+mutant, because the generator rarely paired a backslash string with a backslash pattern; adding `_`, `\_` and
+`%\%` to its data fixed that.
+
+**Why does an expression over an empty batch return nothing, even `9223372036854775807 + 1`?**
+Because an expression is computed for rows. Row by row, a failing constant fails only if a row exists to compute it
+for; the property test's reference works that way, and the engine first disagreed on empty tables (it computed the
+scalar once and failed). Now `evaluate` returns an empty column for an empty batch without evaluating.
+
 ## What went wrong on day 1
 
 **What did the review find?**
@@ -163,7 +252,7 @@ than `CAST`. Each is a `QuarryError::Unsupported` naming what it was, never a pa
 (`unsupported_sql_is_named`).
 
 **What comes next?**
-Day 2 executes the plan: a physical operator per node and expression evaluation with Arrow kernels. Day 3 adds the
-hash join, predicate pushdown into Parquet row groups (the footer is already read once per table; day 3 reads its
-per-column min and max) and optimizer rules.
-Day 4 compares every result with DuckDB's on TPC-H-style data.
+Day 3 adds a physical plan between the logical plan and the operators: the hash join (joins bind today but don't run),
+a top-k sort for `ORDER BY ... LIMIT` (today's sort sorts everything), predicate pushdown into Parquet row groups
+(the footer is already read once per table; day 3 reads its per-column min and max) and optimizer rules (constant
+folding must keep a failing constant lazy, see above). Day 4 compares every result with DuckDB's on TPC-H-style data.
