@@ -8,11 +8,11 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Date32Array, Float64Array, Int64Array, RecordBatch,
-    StringArray,
+    Array, ArrayRef, AsArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int64Array,
+    RecordBatch, StringArray,
 };
 use arrow::datatypes::{
-    DataType, Date32Type, Field, Float64Type, Int16Type, Int32Type, Int64Type, Schema,
+    DataType, Date32Type, Field, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Schema,
 };
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
@@ -259,7 +259,17 @@ mod reference {
                 }
             }
             (V::Int(x), DataType::Float64) => Ok(V::Float(*x as f64)),
+            // A Float32 is held as the f64 of the same value, so widening it changes nothing.
             (V::Float(_), DataType::Float64) => Ok(v),
+            (V::Float(x), DataType::Float32) => {
+                // Round to the nearest Float32; a finite value that becomes infinite doesn't fit.
+                let y = *x as f32;
+                if x.is_finite() && y.is_infinite() {
+                    Err(failed())
+                } else {
+                    Ok(V::Float(f64::from(y)))
+                }
+            }
             (V::Int(x), DataType::Utf8) => Ok(V::Str(x.to_string())),
             (V::Bool(b), DataType::Utf8) => Ok(V::Str(b.to_string())),
             (V::Date(d), DataType::Utf8) => Ok(V::Str(format_date32(*d))),
@@ -293,7 +303,7 @@ mod reference {
     }
 }
 
-// The table: t(a BIGINT, b BIGINT, f DOUBLE, s VARCHAR, d DATE, p BOOLEAN), every column nullable.
+// The table: t(a BIGINT, b BIGINT, f DOUBLE, s VARCHAR, d DATE, p BOOLEAN, r REAL), every column nullable.
 
 const INTS: &[i64] = &[0, 1, -1, 2, 7, -7, 3, i64::MAX, i64::MIN, 4_000_000_000];
 const FLOATS: &[f64] = &[
@@ -325,6 +335,7 @@ const STRINGS: &[&str] = &[
     r"\_",
 ];
 const DATES: &[i32] = &[19_782, 0, -1, 2_932_896, -719_528, 19_723];
+const REALS: &[f32] = &[0.0, -0.0, 2.5, -3.5, f32::MAX, f32::NAN, 1e-45];
 
 fn nullable<T: std::fmt::Debug + Clone + 'static>(
     values: &'static [T],
@@ -339,6 +350,7 @@ type Row = (
     Option<&'static str>,
     Option<i32>,
     Option<bool>,
+    Option<f32>,
 );
 
 fn rows() -> impl Strategy<Value = Vec<Row>> {
@@ -349,6 +361,7 @@ fn rows() -> impl Strategy<Value = Vec<Row>> {
         nullable(STRINGS),
         nullable(DATES),
         prop_oneof![1 => Just(None), 3 => any::<bool>().prop_map(Some)],
+        nullable(REALS),
     );
     proptest::collection::vec(row, 0..24)
 }
@@ -361,6 +374,7 @@ fn batch(rows: &[Row]) -> RecordBatch {
         Field::new("s", DataType::Utf8, true),
         Field::new("d", DataType::Date32, true),
         Field::new("p", DataType::Boolean, true),
+        Field::new("r", DataType::Float32, true),
     ]);
     let columns: Vec<ArrayRef> = vec![
         Arc::new(rows.iter().map(|r| r.0).collect::<Int64Array>()),
@@ -369,6 +383,7 @@ fn batch(rows: &[Row]) -> RecordBatch {
         Arc::new(rows.iter().map(|r| r.3).collect::<StringArray>()),
         Arc::new(rows.iter().map(|r| r.4).collect::<Date32Array>()),
         Arc::new(rows.iter().map(|r| r.5).collect::<BooleanArray>()),
+        Arc::new(rows.iter().map(|r| r.6).collect::<Float32Array>()),
     ];
     RecordBatch::try_new(Arc::new(schema), columns).unwrap()
 }
@@ -384,6 +399,7 @@ fn row_values(r: &Row) -> Vec<V> {
         opt(r.3, |s| V::Str(s.to_string())),
         opt(r.4, V::Date),
         opt(r.5, V::Bool),
+        opt(r.6, |x| V::Float(f64::from(x))),
     ]
 }
 
@@ -401,6 +417,7 @@ fn values(a: &ArrayRef) -> Vec<V> {
                 DataType::Int32 => V::Int(i64::from(a.as_primitive::<Int32Type>().value(i))),
                 DataType::Int16 => V::Int(i64::from(a.as_primitive::<Int16Type>().value(i))),
                 DataType::Float64 => V::Float(a.as_primitive::<Float64Type>().value(i)),
+                DataType::Float32 => V::Float(f64::from(a.as_primitive::<Float32Type>().value(i))),
                 DataType::Utf8 => V::Str(a.as_string::<i32>().value(i).to_string()),
                 DataType::Date32 => V::Date(a.as_primitive::<Date32Type>().value(i)),
                 t => panic!("no reference value for {t}"),
@@ -438,7 +455,17 @@ fn leaf(t: T) -> BoxedStrategy<String> {
             "(-9223372036854775808)",
             "NULL",
         ]),
-        T::Float => pick(&["f", "0.0", "-0.0", "1.5", "-2.5", "1e308"]),
+        T::Float => pick(&[
+            "f",
+            "r",
+            "0.0",
+            "-0.0",
+            "1.5",
+            "-2.5",
+            "1e308",
+            "3.4028235e38",
+            "3.4028236e38",
+        ]),
         T::Str => pick(&[
             "s", "''", "'a'", "'a_b'", "'12'", "'%b'", "'A%'", "'_'", "'ä%'", r"'a\b'", r"'%\'",
             r"'\_'", r"'%\%'",
@@ -501,6 +528,7 @@ fn typed_sql(t: T, depth: u32) -> BoxedStrategy<String> {
             fill("({} / {})", &[Float, Float], depth),
             fill("(- {})", &[Float], depth),
             fill("CAST({} AS DOUBLE)", &[Int], depth),
+            fill("CAST({} AS REAL)", &[Float], depth),
             fill("CAST({} AS DOUBLE)", &[Str], depth),
             fill(
                 "CASE WHEN {} THEN {} ELSE {} END",
@@ -674,6 +702,7 @@ fn the_generator_reaches_errors_and_values() {
             Some("12"),
             Some(0),
             Some(true),
+            Some(2.5),
         ),
         (
             Some(7),
@@ -681,6 +710,7 @@ fn the_generator_reaches_errors_and_values() {
             Some(f64::NAN),
             Some("a"),
             Some(19_782),
+            None,
             None,
         ),
     ];
