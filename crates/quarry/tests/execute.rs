@@ -488,6 +488,51 @@ fn results_are_values_from_the_input_not_their_normalized_forms() {
 }
 
 #[test]
+fn a_float_key_next_to_an_integer_key_keeps_its_first_value() {
+    // Only the float key is encoded a second time, as it was; the integer key next to it must still group and come
+    // out right. DuckDB 2.0 on the same rows: (1, 0.0, inf, 2), (1, nan, nan, 1), (2, -0.0, -inf, 2), (2, NULL, NULL, 1).
+    let schema = Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("f", DataType::Float64, true),
+    ]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 1, 2, 1, 2])),
+            Arc::new(Float64Array::from(vec![
+                Some(0.0),
+                Some(-0.0),
+                Some(-0.0),
+                Some(0.0),
+                Some(f64::NAN),
+                None,
+            ])),
+        ],
+    )
+    .unwrap();
+    let mut c = Catalog::new();
+    c.register("m", Arc::new(MemTable::from_batch(batch)))
+        .unwrap();
+    assert_eq!(
+        run_in(
+            &c,
+            "SELECT k, f, 1 / f, count(*) FROM m GROUP BY k, f ORDER BY k, f"
+        )
+        .unwrap(),
+        table(&[
+            &["1", "0.0", "inf", "2"],
+            &["1", "NaN", "NaN", "1"],
+            &["2", "-0.0", "-inf", "2"],
+            &["2", "NULL", "NULL", "1"],
+        ])
+    );
+    assert_eq!(
+        run_in(&c, "SELECT DISTINCT f, k FROM m ORDER BY k, f").unwrap(),
+        table(&[&["0.0", "1"], &["NaN", "1"], &["-0.0", "2"], &["NULL", "2"]])
+    );
+}
+
+#[test]
 fn sums_add_in_128_bits_and_fail_if_the_total_does_not_fit() {
     // MAX + 1 overflows an Int64 on the way, but MAX + 1 - 1 is back in range at the end.
     assert_eq!(
