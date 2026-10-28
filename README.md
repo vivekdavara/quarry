@@ -140,6 +140,23 @@ same aggregate as in the select list, so the Aggregate computes it once. `quarry
 2 rows
 ```
 
+`EXPLAIN` in `quarry query` prints the plan that runs: optimized (the scan reads four of the five columns) and with
+each node's operator (the sort under the LIMIT is a top-k of three rows):
+
+```bash
+./target/release/quarry query -t examples/orders.csv "EXPLAIN SELECT customer, count(*) AS orders, sum(total) AS spent FROM orders WHERE status <> 'cancelled' AND placed >= '2024-01-01' GROUP BY customer HAVING count(*) > 1 ORDER BY spent DESC LIMIT 3"
+```
+
+```
+Limit: skip=0 fetch=3
+  TopK: k=3 spent DESC NULLS LAST
+    Projection: orders.customer, count(*) AS orders, sum(orders.total) AS spent
+      Filter: count(*) > 1
+        Aggregate: group_by=[orders.customer] aggregates=[count(*), sum(orders.total)]
+          Filter: orders.status <> 'cancelled' AND orders.placed >= DATE '2024-01-01'
+            Scan: orders projection=[customer, status, total, placed]
+```
+
 A query that doesn't make sense fails before anything is read, with status 1:
 
 ```bash

@@ -243,6 +243,11 @@ fn the_readme_examples_print_what_the_readme_says() {
         readme.contains(&result),
         "README's result is stale:\n{result}"
     );
+    let explain = stdout(&quarry(&["query", "-t", orders, &format!("EXPLAIN {sql}")]));
+    assert!(
+        readme.contains(&explain),
+        "README's EXPLAIN is stale:\n{explain}"
+    );
 
     let out = quarry(&[
         "plan",
