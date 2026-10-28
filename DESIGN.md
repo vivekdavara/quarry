@@ -256,9 +256,10 @@ evaluated on the candidate pairs, at most `batch_size` pairs at a time, and the 
 `LEFT` join's left row with no such pair comes out once, with NULLs on the right, in its place.
 
 So the output is in the left input's order, each left row's matches in the build side's order, whatever the batch
-size, and the tests can compare joins row for row. The residual is computed only for pairs with equal keys, as in
-DuckDB: `ON o.customer = c.name AND 5 % (c.rank - 4) = 1` never divides by the rank of a customer no order names, where
-`ON 5 % (c.rank - 4) = 1` alone (a nested loop) does and fails. An inner join whose build side has no rows doesn't
+size, and the tests can compare joins row for row. The residual is computed only for pairs with equal keys: the join
+alone never computes `ON o.customer = c.name AND 5 % (c.rank - 4) = 1`'s division for a customer no order names,
+where `ON 5 % (c.rank - 4) = 1` alone (a nested loop) does and fails. (The optimizer then moves that condition, which
+reads the right side only, below the join, where it does fail, as on DuckDB 2.0: "The optimizer" below.) An inner join whose build side has no rows doesn't
 read its left input at all. The build side is always the right input; choosing the smaller side would need the
 output order to stop being the left's.
 
@@ -307,6 +308,39 @@ Each aggregate keeps an accumulator with a slot per group:
 
 `SUM`, `AVG`, `MIN` and `MAX` of no values are NULL. Without a `GROUP BY` there is exactly one group, even over no
 rows (`SELECT count(*) FROM t WHERE FALSE` is one row, 0); with one, no rows make no groups.
+
+## The optimizer
+
+`optimizer::optimize` (day 3) rewrites the bound plan; `quarry::query` and the CLI run what it returns. Three rules
+run once each, in order. Each keeps the plan's output columns (names, types, order), and `tests/execute.rs` runs
+every query bound and optimized, at every batch size, and requires the same rows (or the same error).
+
+1. **Constant folding** (`optimizer/fold.rs`). A subexpression that reads no column is computed once, over a single
+   row, and replaced by its value (`a + (1 + 2) * 3` is `a + 9`), largest first. A constant that fails (`7 % 0`,
+   `CAST('x' AS INT)`) stays as it is, with its operands folded, to fail only if a row reaches it, as it would
+   without the rule: `CASE WHEN a > 0 THEN 1 ELSE 7 % 0 END` over positive `a`s gives 1s. A value whose type no
+   literal holds (an `INT`, a `REAL`) stays computed. Then `AND` and `OR` with a constant operand are simplified where
+   that changes nothing computed: they are lazy, so `FALSE AND x` is FALSE without computing `x`, and `TRUE AND x`
+   and `x AND TRUE` are `x`; `x AND FALSE` stays, since `x` is computed on every row and may fail. A filter that is
+   then TRUE goes away; one that is FALSE or NULL becomes `Empty: no rows`, and its input isn't read.
+2. **Predicate pushdown** (`optimizer/predicates.rs`). A filter over an inner or cross join joins its `ON` (for an
+   inner join they mean the same; a cross join with an `ON` is an inner join, so `FROM t, u WHERE t.a = u.a` is a
+   hash join). The `ON`'s conjuncts that read one side only become a filter on that side, the `ON`'s own first, then
+   the `WHERE`'s; the rest stay in the `ON`. Over a `LEFT` join, `WHERE`'s conjuncts on the left go down to the left
+   (a left row they drop would only make rows they drop) and the others stay above (they see the NULLs of unmatched
+   rows); of its `ON`, conjuncts on the right go down to the right (a build row they reject can't match) and those on
+   the left stay (they decide matching, not which left rows come out). Conjuncts that land in one place keep their
+   order. A condition that fails on some row is then computed on rows the original order wouldn't have reached:
+   `JOIN customers c ON o.customer = c.name AND 5 % (c.rank - 4) = 1` divides by zero for the customer no order
+   names, because the condition now filters every customer. DuckDB 2.0 moves conditions the same way and fails the
+   same queries (each case checked by hand).
+3. **Projection pushdown** (`optimizer/columns.rs`). Walking down from the root with the columns each node's parent
+   needs, every scan gets a projection of what is used above it, and every expression above a narrowed scan is
+   renumbered (bound expressions refer to columns by position). `SELECT count(*) FROM t` reads no column at all,
+   only row counts. Projections and aggregates keep all their outputs (an unused one is still computed), so only
+   scans drop columns. It runs last because it renumbers.
+
+`EXPLAIN` (in `quarry query`) prints the optimized plan, which is what runs; `quarry plan` prints the bound plan.
 
 ## The days
 

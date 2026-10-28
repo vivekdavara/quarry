@@ -176,23 +176,32 @@ fn rows_of(result: &QueryResult) -> Vec<Vec<String>> {
     rows
 }
 
-/// Runs a query over `catalog` at every batch size and returns its rows, after checking they are the same each time.
+/// Runs a query over `catalog` at every batch size, as bound and as optimized, and returns its rows, after checking
+/// they are the same each time (or that every run fails, with the same error).
 fn run_in(catalog: &Catalog, sql: &str) -> Result<Vec<Vec<String>>> {
-    let plan = quarry::sql::plan(catalog, sql)?;
-    let mut first: Option<Vec<Vec<String>>> = None;
-    for size in BATCH_SIZES {
-        let result = collect_with_batch_size(&plan, size)?;
-        assert!(
-            result.batches.iter().all(|b| b.num_rows() <= size),
-            "{sql}: a batch over {size} rows"
-        );
-        let rows = rows_of(&result);
-        match &first {
-            None => first = Some(rows),
-            Some(expected) => assert_eq!(&rows, expected, "{sql} at batch size {size}"),
+    let bound = quarry::sql::plan(catalog, sql)?;
+    let optimized = quarry::optimizer::optimize(&bound)?;
+    let mut first: Option<Result<Vec<Vec<String>>, String>> = None;
+    for (label, plan) in [("bound", &bound), ("optimized", &optimized)] {
+        for size in BATCH_SIZES {
+            let rows = collect_with_batch_size(plan, size).map(|result| {
+                assert!(
+                    result.batches.iter().all(|b| b.num_rows() <= size),
+                    "{sql}: a batch over {size} rows"
+                );
+                rows_of(&result)
+            });
+            let rows = rows.map_err(|e| e.to_string());
+            match &first {
+                None => first = Some(rows),
+                Some(expected) => assert_eq!(
+                    &rows, expected,
+                    "{sql}, {label}, at batch size {size}\n{optimized}"
+                ),
+            }
         }
     }
-    Ok(first.unwrap())
+    first.unwrap().map_err(QuarryError::Execution)
 }
 
 fn run(sql: &str) -> Vec<Vec<String>> {
@@ -755,17 +764,29 @@ fn join_keys_compare_as_sql_does() {
 }
 
 #[test]
-fn the_rest_of_on_is_computed_only_for_pairs_with_equal_keys() {
-    // rank 4 is the NULL name's, which no order's key meets, so the division by zero is never computed (DuckDB 2.0
-    // too). In a nested loop every pair is a candidate, and it fails.
-    assert_eq!(
-        run(
-            "SELECT o.id FROM orders o JOIN customers c ON o.customer = c.name AND 5 % (c.rank - 4) = 1"
-        ),
-        table(&[&["2"], &["5"]])
-    );
+fn the_rest_of_on_is_computed_only_for_pairs_with_equal_keys_until_it_is_pushed_down() {
+    // rank 4 is the NULL name's, which no order's key meets, so the hash join alone never computes the division by
+    // zero; in a nested loop every pair is a candidate, and it fails.
+    let c = catalog();
+    let sql = "SELECT o.id FROM orders o JOIN customers c ON o.customer = c.name AND 5 % (c.rank - 4) = 1";
+    let bound = quarry::sql::plan(&c, sql).unwrap();
+    for size in BATCH_SIZES {
+        let rows = rows_of(&collect_with_batch_size(&bound, size).unwrap());
+        assert_eq!(rows, table(&[&["2"], &["5"]]));
+    }
     let e = error("SELECT o.id FROM orders o JOIN customers c ON 5 % (c.rank - 4) = 1");
     assert!(e.contains("division by zero"), "{e}");
+    // The optimizer moves the condition, which reads the right side only, below the join, onto every customer: then
+    // it fails, as it does on DuckDB 2.0 (which moves it too).
+    let optimized = quarry::optimizer::optimize(&bound).unwrap();
+    assert!(
+        optimized
+            .to_string()
+            .contains("Filter: 5 % (c.rank - 4) = 1"),
+        "{optimized}"
+    );
+    let e = collect_with_batch_size(&optimized, 8192).unwrap_err();
+    assert!(e.to_string().contains("division by zero"), "{e}");
 }
 
 #[test]

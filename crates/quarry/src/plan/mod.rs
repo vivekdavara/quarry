@@ -404,6 +404,49 @@ impl LogicalPlan {
         }
     }
 
+    /// The node with its inputs replaced (left to right, as [`inputs`](Self::inputs) lists them), keeping its own
+    /// expressions and output schema. For the optimizer's rules: each new input must have the old one's output
+    /// columns, in order, with their types.
+    pub fn with_new_inputs(&self, inputs: Vec<LogicalPlan>) -> LogicalPlan {
+        assert_eq!(inputs.len(), self.inputs().len(), "one new input per input");
+        let mut inputs = inputs.into_iter().map(Arc::new);
+        let mut next = || inputs.next().expect("counted above");
+        match self {
+            LogicalPlan::Scan(_) | LogicalPlan::Empty(_) => self.clone(),
+            LogicalPlan::Filter(f) => LogicalPlan::Filter(Filter {
+                input: next(),
+                predicate: f.predicate.clone(),
+            }),
+            LogicalPlan::Projection(p) => LogicalPlan::Projection(Projection {
+                input: next(),
+                exprs: p.exprs.clone(),
+                schema: p.schema.clone(),
+            }),
+            LogicalPlan::Aggregate(a) => LogicalPlan::Aggregate(Aggregate {
+                input: next(),
+                group_by: a.group_by.clone(),
+                aggregates: a.aggregates.clone(),
+                schema: a.schema.clone(),
+            }),
+            LogicalPlan::Join(j) => LogicalPlan::Join(Join {
+                left: next(),
+                right: next(),
+                kind: j.kind,
+                on: j.on.clone(),
+                schema: j.schema.clone(),
+            }),
+            LogicalPlan::Sort(s) => LogicalPlan::Sort(Sort {
+                input: next(),
+                keys: s.keys.clone(),
+            }),
+            LogicalPlan::Limit(l) => LogicalPlan::Limit(Limit {
+                input: next(),
+                skip: l.skip,
+                fetch: l.fetch,
+            }),
+        }
+    }
+
     /// The node's own line in the printed plan, without its inputs.
     fn describe(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
