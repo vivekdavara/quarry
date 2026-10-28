@@ -601,12 +601,53 @@ fn bind(sql: &str, rows: &[Row]) -> Option<(Expr, Arc<quarry::plan::PlanSchema>)
     }
 }
 
+/// The same query optimized: its (folded) expression, the scan's schema and the table columns the scan reads.
+fn optimized(sql: &str, rows: &[Row]) -> (Expr, Arc<quarry::plan::PlanSchema>, Vec<usize>) {
+    let mut catalog = Catalog::new();
+    catalog
+        .register("t", Arc::new(MemTable::from_batch(batch(rows))))
+        .unwrap();
+    let plan = sql::plan(&catalog, &format!("SELECT {sql} FROM t")).unwrap();
+    match quarry::optimizer::optimize(&plan).unwrap() {
+        LogicalPlan::Projection(p) => match p.input.as_ref() {
+            LogicalPlan::Scan(s) => (
+                p.exprs[0].clone(),
+                p.input.schema().clone(),
+                s.projection.clone().expect("projection pushdown sets one"),
+            ),
+            other => panic!("expected a scan, got {other}"),
+        },
+        other => panic!("expected a projection, got {other}"),
+    }
+}
+
 fn check(sql: &str, rows: &[Row], split: usize) -> Result<(), TestCaseError> {
     let Some((expr, schema)) = bind(sql, rows) else {
         return Ok(());
     };
     let b = batch(rows);
     let engine = evaluate(&expr, &schema, &b);
+    // Optimized (constants folded, the scan narrowed), it must give the same values bit for bit, or fail too.
+    let (folded, narrow_schema, columns) = optimized(sql, rows);
+    let narrow = b.project(&columns).unwrap();
+    match (&engine, &evaluate(&folded, &narrow_schema, &narrow)) {
+        (Ok(a), Ok(o)) => {
+            prop_assert_eq!(a.data_type(), o.data_type(), "{}", sql);
+            prop_assert!(
+                values(a) == values(o),
+                "{sql}\nrows {rows:?}\nbound     {:?}\noptimized {:?}\n{folded:?}",
+                values(a),
+                values(o)
+            );
+        }
+        (Err(_), Err(_)) => {}
+        (a, o) => prop_assert!(
+            false,
+            "{sql}\nrows {rows:?}\nbound {:?}\noptimized {:?}\n{folded:?}",
+            a.as_ref().map(values),
+            o.as_ref().map(values)
+        ),
+    }
     // Row by row: the first row that fails fails the whole column, as it does in the engine.
     let expected: Result<Vec<V>, String> = rows
         .iter()

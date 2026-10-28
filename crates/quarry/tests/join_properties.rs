@@ -1,5 +1,5 @@
-//! Random joins of two random tables, run by the engine at a random batch size and computed a second time by a nested
-//! loop in plain Rust that evaluates `ON` row by row with SQL's rules (`=` is NULL when either side is NULL; -0.0 equals
+//! Random joins of two random tables, with or without a WHERE, run by the engine at a random batch size (as bound and as
+//! optimized) and computed a second time by a nested loop in plain Rust that evaluates `ON` row by row with SQL's rules (`=` is NULL when either side is NULL; -0.0 equals
 //! 0.0 and NaN equals NaN). The engine's output order is defined (the left input's, each left row's matches in the
 //! right input's order, a LEFT join's unmatched row in its place), so the rows must be the same in the same order.
 
@@ -124,20 +124,31 @@ fn out(a: &Row, b: Option<&Row>) -> Out {
     ]
 }
 
-fn reference(left: &[Row], right: &[Row], on: &[Conjunct], outer: bool) -> Vec<Out> {
+/// The join's rows, then the WHERE's: a LEFT join's unmatched row has NULLs for b's columns, which WHERE sees.
+fn reference(
+    left: &[Row],
+    right: &[Row],
+    on: &[Conjunct],
+    outer: bool,
+    where_: Option<&[Conjunct]>,
+) -> Vec<Out> {
+    const NULLS: Row = (None, None, None);
     let mut rows = Vec::new();
     for a in left {
         let before = rows.len();
         for b in right {
             if holds(on, a, b) {
-                rows.push(out(a, Some(b)));
+                rows.push((a, Some(b)));
             }
         }
         if outer && rows.len() == before {
-            rows.push(out(a, None));
+            rows.push((a, None));
         }
     }
-    rows
+    rows.into_iter()
+        .filter(|(a, b)| where_.is_none_or(|w| holds(w, a, b.unwrap_or(&NULLS))))
+        .map(|(a, b)| out(a, b))
+        .collect()
 }
 
 fn engine_rows(result: &quarry::QueryResult) -> Vec<Out> {
@@ -172,6 +183,7 @@ proptest! {
         left in rows(12),
         right in rows(12),
         on in conjuncts(),
+        where_ in proptest::option::of(conjuncts()),
         outer in any::<bool>(),
         batch_size in 1usize..8,
     ) {
@@ -180,15 +192,23 @@ proptest! {
         catalog.register("b", table(&right)).unwrap();
         let condition = on.iter().map(|c| c.sql()).collect::<Vec<_>>().join(" AND ");
         let kind = if outer { "LEFT JOIN" } else { "JOIN" };
-        let query = format!("SELECT a.k, a.f, a.v, b.k, b.f, b.v FROM a {kind} b ON {condition}");
-        let plan = sql::plan(&catalog, &query).unwrap();
-        let result = collect_with_batch_size(&plan, batch_size)
-            .unwrap_or_else(|e| panic!("{query}: {e}"));
-        prop_assert!(result.batches.iter().all(|b| b.num_rows() <= batch_size));
-        prop_assert_eq!(
-            engine_rows(&result),
-            reference(&left, &right, &on, outer),
-            "{} at batch size {}", query, batch_size
-        );
+        let mut query = format!("SELECT a.k, a.f, a.v, b.k, b.f, b.v FROM a {kind} b ON {condition}");
+        if let Some(w) = &where_ {
+            query += " WHERE ";
+            query += &w.iter().map(|c| c.sql()).collect::<Vec<_>>().join(" AND ");
+        }
+        let bound = sql::plan(&catalog, &query).unwrap();
+        // Optimized, the one-sided conditions move below the join and the constants fold; the rows must not change.
+        let optimized = quarry::optimizer::optimize(&bound).unwrap();
+        for plan in [&bound, &optimized] {
+            let result = collect_with_batch_size(plan, batch_size)
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            prop_assert!(result.batches.iter().all(|b| b.num_rows() <= batch_size));
+            prop_assert_eq!(
+                engine_rows(&result),
+                reference(&left, &right, &on, outer, where_.as_deref()),
+                "{} at batch size {}\n{}", query, batch_size, plan
+            );
+        }
     }
 }

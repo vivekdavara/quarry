@@ -336,18 +336,21 @@ proptest! {
             let names: Vec<&str> = keys.iter().map(|&k| COLUMNS[k]).collect();
             query += &format!(" GROUP BY {}", names.join(", "));
         }
-        let plan = sql::plan(&catalog, &query).unwrap();
-        let engine = collect_with_batch_size(&plan, batch_size);
-        match (engine, reference(&rows, &keys, &aggs)) {
-            (Ok(result), Ok(want)) => {
-                let got = engine_rows(&result);
-                prop_assert_eq!(sorted(got), sorted(want), "{}\nrows {:?}", query, rows);
+        let bound = sql::plan(&catalog, &query).unwrap();
+        let optimized = quarry::optimizer::optimize(&bound).unwrap();
+        for plan in [&bound, &optimized] {
+            let engine = collect_with_batch_size(plan, batch_size);
+            match (engine, reference(&rows, &keys, &aggs)) {
+                (Ok(result), Ok(want)) => {
+                    let got = engine_rows(&result);
+                    prop_assert_eq!(sorted(got), sorted(want), "{}\nrows {:?}\n{}", query, rows, plan);
+                }
+                (Err(_), Err(_)) => {}
+                (Ok(result), Err(e)) => {
+                    prop_assert!(false, "{query}\nrows {rows:?}\nengine {:?}\nreference fails: {e}", engine_rows(&result))
+                }
+                (Err(e), Ok(want)) => prop_assert!(false, "{query}\nrows {rows:?}\nengine fails: {e}\nreference {want:?}"),
             }
-            (Err(_), Err(_)) => {}
-            (Ok(result), Err(e)) => {
-                prop_assert!(false, "{query}\nrows {rows:?}\nengine {:?}\nreference fails: {e}", engine_rows(&result))
-            }
-            (Err(e), Ok(want)) => prop_assert!(false, "{query}\nrows {rows:?}\nengine fails: {e}\nreference {want:?}"),
         }
     }
 }
@@ -467,15 +470,19 @@ proptest! {
             query += &format!(" LIMIT {n}");
         }
         query += &format!(" OFFSET {offset}");
-        let plan = sql::plan(&catalog, &query).unwrap();
-        let result = collect_with_batch_size(&plan, batch_size).unwrap();
-        prop_assert!(result.batches.iter().all(|b| b.num_rows() <= batch_size));
-        prop_assert_eq!(
-            engine_rows(&result),
-            sorted_ids(&rows, &keys, limit, offset),
-            "{}\nrows {:?}",
-            query,
-            rows
-        );
+        let bound = sql::plan(&catalog, &query).unwrap();
+        let optimized = quarry::optimizer::optimize(&bound).unwrap();
+        for plan in [&bound, &optimized] {
+            let result = collect_with_batch_size(plan, batch_size).unwrap();
+            prop_assert!(result.batches.iter().all(|b| b.num_rows() <= batch_size));
+            prop_assert_eq!(
+                engine_rows(&result),
+                sorted_ids(&rows, &keys, limit, offset),
+                "{}\nrows {:?}\n{}",
+                query,
+                rows,
+                plan
+            );
+        }
     }
 }
