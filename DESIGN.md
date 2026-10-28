@@ -231,7 +231,7 @@ becomes an iterator of Arrow `RecordBatch`es that pulls from its input's iterato
 | `Filter` | evaluates the predicate on each batch and keeps the rows where it is `TRUE` (Arrow's `filter`) |
 | `Projection` | evaluates each expression on each batch |
 | `Limit` | slices batches; once it has `fetch` rows it stops pulling, so the rest of the input is never read. Over projections it runs below them (a projection makes one row of each input row), so they compute only the rows it keeps |
-| `Sort` | reads its whole input, evaluates the keys, sorts with Arrow's `lexsort`; the row number is the last key, so ties keep their input order |
+| `Sort` | reads its whole input, evaluates the keys, sorts with Arrow's `lexsort`; the row number is the last key, so ties keep their input order. Under a `LIMIT` (`ORDER BY ... LIMIT n OFFSET m`) it is a **top-k** of `k = n + m` rows: input batches are buffered until there are `2k` rows (and a batch more than `k`), then cut back to the best `k` by a partial sort (`lexsort` with a limit), each row keeping its input position as the last key, so the rows and their order are exactly the full sort's first `k` (day 3) |
 | `Aggregate` | reads its whole input into a hash table of groups (below), then hands out one row per group |
 | `Join` | a hash join on `ON`'s equalities, or a nested loop without any ("Joins" below); the right input is read whole, the left streams |
 

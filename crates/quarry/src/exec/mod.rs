@@ -10,9 +10,9 @@ mod join;
 
 use std::sync::Arc;
 
-use arrow::array::{AsArray, RecordBatch, RecordBatchOptions, UInt32Array};
+use arrow::array::{ArrayRef, AsArray, RecordBatch, RecordBatchOptions, UInt32Array, UInt64Array};
 use arrow::compute::{
-    SortColumn, SortOptions, concat_batches, filter_record_batch, lexsort_to_indices,
+    SortColumn, SortOptions, concat, concat_batches, filter_record_batch, lexsort_to_indices, take,
 };
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::util::display::FormatOptions;
@@ -144,7 +144,7 @@ fn filter(f: &Filter, batch_size: usize) -> Result<BatchIter> {
 
 /// `LIMIT` over `plan`. A projection makes one row of each input row, so the limit is applied below it (below a chain
 /// of them): the projection then computes only the rows the limit keeps, and `SELECT 10 % (id - 3) FROM t LIMIT 2`
-/// never computes row 3's division by zero, whatever the batch size.
+/// never computes row 3's division by zero, whatever the batch size. Over a sort, a limit is a top-k.
 fn limited(
     plan: &LogicalPlan,
     skip: usize,
@@ -153,6 +153,11 @@ fn limited(
 ) -> Result<BatchIter> {
     match plan {
         LogicalPlan::Projection(p) => project(p, limited(&p.input, skip, fetch, batch_size)?),
+        LogicalPlan::Sort(s) if fetch.is_some() => Ok(Box::new(LimitStream {
+            input: top_k(s, skip.saturating_add(fetch.unwrap_or(0)), batch_size)?,
+            skip,
+            fetch,
+        })),
         other => Ok(Box::new(LimitStream {
             input: stream(other, batch_size)?,
             skip,
@@ -188,10 +193,28 @@ fn sort(s: &Sort, batch_size: usize) -> Result<BatchIter> {
         return Ok(Box::new(std::iter::empty()));
     };
     let all = concat_batches(&first.schema(), &batches)?;
+    let rows =
+        u32::try_from(all.num_rows()).map_err(|_| unsupported!("sorting more than 2^32 rows"))?;
+    let position: ArrayRef = Arc::new(UInt32Array::from_iter_values(0..rows));
+    let order = sort_order(s, &all, position, None)?;
+    let sorted = take_rows(&all, order.values())?;
+    Ok(Box::new(
+        split_batch(&sorted, batch_size).into_iter().map(Ok),
+    ))
+}
+
+/// The order of a batch's rows by the sort's keys, then by `position` (each row's place in the input, which makes
+/// the order total, so ties keep their input order); only the first `limit` if given.
+fn sort_order(
+    s: &Sort,
+    batch: &RecordBatch,
+    position: ArrayRef,
+    limit: Option<usize>,
+) -> Result<UInt32Array> {
     let schema = s.input.schema();
     let mut columns = Vec::with_capacity(s.keys.len() + 1);
     for key in &s.keys {
-        let values = normalize_floats(&evaluate(&key.expr, schema, &all)?);
+        let values = normalize_floats(&evaluate(&key.expr, schema, batch)?);
         // A NULL-typed key (ORDER BY NULL) is the same for every row.
         if *values.data_type() == DataType::Null {
             continue;
@@ -204,17 +227,60 @@ fn sort(s: &Sort, batch_size: usize) -> Result<BatchIter> {
             }),
         });
     }
-    let position = 0..u32::try_from(all.num_rows())
-        .map_err(|_| unsupported!("sorting more than 2^32 rows"))?;
     columns.push(SortColumn {
-        values: Arc::new(UInt32Array::from_iter_values(position)),
+        values: position,
         options: None,
     });
-    let order = lexsort_to_indices(&columns, None)?;
-    let sorted = take_rows(&all, order.values())?;
-    Ok(Box::new(
-        split_batch(&sorted, batch_size).into_iter().map(Ok),
-    ))
+    Ok(lexsort_to_indices(&columns, limit)?)
+}
+
+/// The first `k` rows of the sorted input (`ORDER BY ... LIMIT`), without sorting all of it. Input batches are
+/// buffered until there are `2k` rows (and at least a batch more than `k`), then cut back to the best `k` by a
+/// partial sort, so each row takes part in a constant number of sorts of `O(k)` rows. Each row keeps its input
+/// position as the last key, so the rows and their order are exactly the full sort's first `k`.
+fn top_k(s: &Sort, k: usize, batch_size: usize) -> Result<BatchIter> {
+    if k == 0 {
+        return Ok(Box::new(std::iter::empty()));
+    }
+    let threshold = k.saturating_mul(2).max(k.saturating_add(batch_size));
+    let mut kept: Vec<RecordBatch> = Vec::new();
+    let mut positions: Vec<ArrayRef> = Vec::new();
+    let (mut buffered, mut seen) = (0usize, 0u64);
+    for batch in stream(&s.input, batch_size)? {
+        let batch = batch?;
+        let n = batch.num_rows();
+        positions.push(Arc::new(UInt64Array::from_iter_values(
+            seen..seen + n as u64,
+        )));
+        seen += n as u64;
+        buffered += n;
+        kept.push(batch);
+        if buffered >= threshold {
+            let (best, best_positions) = best_k(s, &kept, &positions, k)?;
+            buffered = best.num_rows();
+            kept = vec![best];
+            positions = vec![best_positions];
+        }
+    }
+    if kept.is_empty() {
+        return Ok(Box::new(std::iter::empty()));
+    }
+    let (best, _) = best_k(s, &kept, &positions, k)?;
+    Ok(Box::new(split_batch(&best, batch_size).into_iter().map(Ok)))
+}
+
+/// The best `k` of the buffered rows, sorted, with their input positions.
+fn best_k(
+    s: &Sort,
+    batches: &[RecordBatch],
+    positions: &[ArrayRef],
+    k: usize,
+) -> Result<(RecordBatch, ArrayRef)> {
+    let all = concat_batches(&batches[0].schema(), batches)?;
+    let position = concat(&positions.iter().map(|p| p.as_ref()).collect::<Vec<_>>())?;
+    let order = sort_order(s, &all, position.clone(), Some(k))?;
+    let best = take_rows(&all, order.values())?;
+    Ok((best, take(&position, &order, None)?))
 }
 
 /// `LIMIT fetch OFFSET skip` over a stream: it stops pulling from its input once it has `fetch` rows.
