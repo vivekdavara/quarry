@@ -18,8 +18,7 @@ flowchart LR
     catalog[("catalog<br/>name → table")] --> binder
     binder --> logical["LogicalPlan<br/>(bound: column indices, explicit casts)"]
     logical --> optimizer["optimizer rules<br/>(day 3)"]
-    optimizer --> physical["physical plan<br/>(days 2-3)"]
-    physical --> exec["operators over<br/>Arrow RecordBatches"]
+    optimizer --> exec["operators over<br/>Arrow RecordBatches<br/>(hash or nested-loop join, top-k)"]
     files[("Parquet / CSV files")] --> exec
     exec --> result["RecordBatches"]
 ```
@@ -357,7 +356,10 @@ Predicate pushdown also hands a filter's conjuncts to the scan below it, when it
 (`TableProvider::uses_filters`: Parquet files), as `Scan.filters` over the table's own column numbers. The filter
 stays: a scan's filters only let it skip data, never decide a row.
 
-`EXPLAIN` (in `quarry query`) prints the optimized plan, which is what runs; `quarry plan` prints the bound plan.
+`EXPLAIN` (in `quarry query`) prints the optimized plan as it runs (`exec::explain`): each join named by the operator
+the executor picks for it, `HashJoin` with its keys and residual or `NestedLoopJoin`, and a sort under a LIMIT as the
+`TopK` it is, with its `k`; `quarry plan` prints the bound plan. There is no separate physical plan: the executor
+chooses each node's operator as it builds the stream, and `explain` makes the same choices.
 
 ## Row-group pruning
 

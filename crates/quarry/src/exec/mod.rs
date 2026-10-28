@@ -51,6 +51,63 @@ impl QueryResult {
     }
 }
 
+/// The plan as it runs, for `EXPLAIN`: the plan's tree with each join named by the operator that runs it (`HashJoin`
+/// with its keys and the rest of `ON`, or `NestedLoopJoin`) and each sort under a limit shown as the `TopK` it is.
+pub fn explain(plan: &LogicalPlan) -> String {
+    let mut out = String::new();
+    explain_node(plan, 0, None, &mut out);
+    out
+}
+
+/// One node's line and its inputs'; `top_k` is the limit's row count when a LIMIT above reaches this node through
+/// projections only (as `limited` does).
+fn explain_node(plan: &LogicalPlan, depth: usize, top_k: Option<usize>, out: &mut String) {
+    let line = match plan {
+        LogicalPlan::Join(j) => {
+            let left = j.left.schema();
+            let c = join::split_condition(j.on.as_ref(), left.len());
+            if c.left_keys.is_empty() || !join::same_types(&c, left, j.right.schema()) {
+                match &j.on {
+                    Some(on) => {
+                        format!("NestedLoopJoin: {:?} on {}", j.kind, on.display(&j.schema))
+                    }
+                    None => format!("NestedLoopJoin: {:?}", j.kind),
+                }
+            } else {
+                let keys: Vec<String> = c
+                    .left_keys
+                    .iter()
+                    .zip(&c.right_keys)
+                    .map(|(l, r)| format!("{} = {}", l.display(left), r.display(j.right.schema())))
+                    .collect();
+                let mut line = format!("HashJoin: {:?} keys=[{}]", j.kind, keys.join(", "));
+                if let Some(residual) = &c.residual {
+                    line += &format!(" residual={}", residual.display(&j.schema));
+                }
+                line
+            }
+        }
+        LogicalPlan::Sort(_) if top_k.is_some() => {
+            let line = plan.line();
+            format!(
+                "TopK: k={} {}",
+                top_k.unwrap_or(0),
+                line.trim_start_matches("Sort: ")
+            )
+        }
+        other => other.line(),
+    };
+    out.push_str(&format!("{:width$}{line}\n", "", width = depth * 2));
+    let pass = match plan {
+        LogicalPlan::Limit(l) => l.fetch.map(|n| l.skip.saturating_add(n)),
+        LogicalPlan::Projection(_) => top_k,
+        _ => None,
+    };
+    for input in plan.inputs() {
+        explain_node(input, depth + 1, pass, out);
+    }
+}
+
 /// Runs a plan to completion with the default batch size.
 pub fn collect(plan: &LogicalPlan) -> Result<QueryResult> {
     collect_with_batch_size(plan, DEFAULT_BATCH_SIZE)

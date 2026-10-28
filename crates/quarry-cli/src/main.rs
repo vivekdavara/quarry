@@ -44,7 +44,7 @@ enum Command {
         sql: String,
     },
     /// Run a query against the given tables and print its result as a table (`EXPLAIN SELECT ...` prints the
-    /// optimized plan, the one that runs, instead).
+    /// optimized plan as it runs instead: hash or nested-loop joins, top-k sorts).
     Query {
         /// A table: `name=path`, or just `path` to name it after the file.
         #[arg(short, long = "table", value_name = "NAME=PATH")]
@@ -79,7 +79,7 @@ fn run(command: Command) -> Result<String> {
             Ok(plan.to_string())
         }
         Command::Query { tables, sql } => match sql::bind(&catalog(&tables)?, &sql)? {
-            BoundStatement::Explain(plan) => Ok(optimize(&plan)?.to_string()),
+            BoundStatement::Explain(plan) => Ok(exec::explain(&optimize(&plan)?)),
             BoundStatement::Query(plan) => {
                 let result = exec::collect(&optimize(&plan)?)?;
                 let rows = result.num_rows();

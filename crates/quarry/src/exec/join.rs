@@ -82,6 +82,14 @@ pub(crate) fn split_condition(on: Option<&Expr>, left_width: usize) -> JoinCondi
     condition
 }
 
+/// Whether each key's two sides have the same type (else the join runs as a nested loop over all of `ON`).
+pub(crate) fn same_types(c: &JoinCondition, left: &PlanSchemaRef, right: &PlanSchemaRef) -> bool {
+    c.left_keys
+        .iter()
+        .zip(&c.right_keys)
+        .all(|(l, r)| l.data_type(left) == r.data_type(right))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JoinSide {
     Left,
@@ -95,12 +103,7 @@ pub(super) fn join(node: &Join, batch_size: usize) -> Result<BatchIter> {
     let mut condition = split_condition(node.on.as_ref(), left_schema.len());
     // Keys of different types (the binder casts both sides of `=` to one type, so this is a safeguard) are compared
     // by the residual instead.
-    let same_types = condition
-        .left_keys
-        .iter()
-        .zip(&condition.right_keys)
-        .all(|(l, r)| l.data_type(&left_schema) == r.data_type(&right_schema));
-    if !same_types {
+    if !same_types(&condition, &left_schema, &right_schema) {
         condition = JoinCondition {
             left_keys: vec![],
             right_keys: vec![],

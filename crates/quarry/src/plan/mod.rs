@@ -546,6 +546,17 @@ impl LogicalPlan {
         }
     }
 
+    /// The node's own line in the printed plan, without its inputs or a newline.
+    pub fn line(&self) -> String {
+        struct Line<'a>(&'a LogicalPlan);
+        impl fmt::Display for Line<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.describe(f)
+            }
+        }
+        Line(self).to_string()
+    }
+
     fn fmt_indent(&self, f: &mut fmt::Formatter<'_>, depth: usize) -> fmt::Result {
         write!(f, "{:width$}", "", width = depth * 2)?;
         self.describe(f)?;

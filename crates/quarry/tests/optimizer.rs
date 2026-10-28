@@ -199,3 +199,65 @@ fn a_left_join_moves_only_what_cannot_change_which_left_rows_come_out() {
         ])
     );
 }
+
+/// The optimized plan as `EXPLAIN` prints it: with the operator that runs each join and sort.
+fn explained(sql: &str) -> String {
+    let plan = quarry::sql::plan(&catalog(), sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    quarry::exec::explain(&quarry::optimizer::optimize(&plan).unwrap())
+}
+
+#[test]
+fn explain_names_the_join_and_sort_operators_that_run() {
+    // A comma join with an equality is a hash join; the rest of the condition is its residual.
+    assert_eq!(
+        explained("SELECT t.b FROM t, u WHERE t.a = u.a AND t.d < u.y"),
+        lines(&[
+            "Projection: t.b",
+            "  HashJoin: Inner keys=[t.a = u.a] residual=t.d < u.y",
+            "    Scan: t projection=[a, b, d]",
+            "    Scan: u projection=[a, y]",
+        ])
+    );
+    // Keys written either way round, and expressions of one side, are keys; the right's key is over the right input.
+    assert_eq!(
+        explained("SELECT t.b FROM t LEFT JOIN u ON u.y = t.d + 1 AND t.b = u.x")
+            .lines()
+            .nth(1)
+            .unwrap(),
+        "  HashJoin: Left keys=[t.d + 1 = u.y, t.b = u.x]"
+    );
+    // No equality between the sides: a nested loop.
+    assert_eq!(
+        explained("SELECT count(*) FROM t JOIN u ON t.a < u.a OR t.b = u.x")
+            .lines()
+            .nth(2)
+            .unwrap(),
+        "    NestedLoopJoin: Inner on t.a < u.a OR t.b = u.x"
+    );
+    assert_eq!(
+        explained("SELECT count(*) FROM t, u")
+            .lines()
+            .nth(2)
+            .unwrap(),
+        "    NestedLoopJoin: Cross"
+    );
+    // A sort under a LIMIT (through the projections between them) is a top-k of LIMIT + OFFSET rows; without one,
+    // a full sort.
+    assert_eq!(
+        explained("SELECT b FROM t ORDER BY d DESC LIMIT 2 OFFSET 3"),
+        lines(&[
+            "Limit: skip=3 fetch=2",
+            "  Projection: t.b",
+            "    TopK: k=5 __order_0 DESC NULLS LAST",
+            "      Projection: t.b, t.d AS __order_0",
+            "        Scan: t projection=[b, d]",
+        ])
+    );
+    for sql in [
+        "SELECT b FROM t ORDER BY d",
+        "SELECT b FROM t ORDER BY d OFFSET 2",
+    ] {
+        let plan = explained(sql);
+        assert!(plan.contains("Sort: ") && !plan.contains("TopK"), "{plan}");
+    }
+}
