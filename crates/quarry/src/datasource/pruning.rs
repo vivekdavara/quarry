@@ -278,3 +278,84 @@ fn without_nans(a: &ArrayRef) -> Option<ArrayRef> {
     };
     nullif(a, &nans).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::Field;
+    use parquet::arrow::ArrowWriter;
+    use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+    use parquet::file::metadata::RowGroupMetaData;
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::statistics::Statistics as ParquetStatistics;
+
+    #[test]
+    fn a_missing_null_count_is_unknown_not_zero() {
+        // x = [NULL, 1] in one row group, written by parquet-rs (which records the null count), then the footer
+        // rebuilt without null counts, as another writer may leave it. `x IS NULL` must keep the row group: reading a
+        // missing count as 0 (the converter's default) would skip the group holding the NULL.
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![None, Some(1)]))],
+        )
+        .unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("x.parquet");
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(&path).unwrap(),
+            schema.clone(),
+            Some(WriterProperties::builder().build()),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let loaded = ArrowReaderMetadata::load(
+            &std::fs::File::open(&path).unwrap(),
+            ArrowReaderOptions::new(),
+        )
+        .unwrap();
+        let metadata = loaded.metadata();
+        let is_null = Expr::IsNull(Box::new(Expr::Column(0)));
+        assert_eq!(
+            row_groups(std::slice::from_ref(&is_null), &schema, metadata),
+            vec![0]
+        );
+
+        let without_counts: Vec<RowGroupMetaData> = metadata
+            .row_groups()
+            .iter()
+            .map(|rg| {
+                let columns = rg
+                    .columns()
+                    .iter()
+                    .map(|c| {
+                        let stats = ParquetStatistics::int64(Some(1), Some(1), None, None, false);
+                        c.clone()
+                            .into_builder()
+                            .set_statistics(stats)
+                            .build()
+                            .unwrap()
+                    })
+                    .collect();
+                rg.clone()
+                    .into_builder()
+                    .set_column_metadata(columns)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let stripped = ParquetMetaData::new(metadata.file_metadata().clone(), without_counts);
+        assert_eq!(row_groups(&[is_null], &schema, &stripped), vec![0]);
+        // The min and max still prune: x > 5 can't hold where min = max = 1.
+        let above = Expr::binary(
+            BinaryOp::Gt,
+            Expr::Column(0),
+            Expr::Literal(ScalarValue::Int64(5)),
+        );
+        assert_eq!(
+            row_groups(&[above], &schema, &stripped),
+            Vec::<usize>::new()
+        );
+    }
+}

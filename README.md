@@ -187,7 +187,7 @@ it on Linux (ubuntu-24.04) and macOS (macos-15) on every push.
 | `tests/pruning.rs` (4) | random rows in Parquet row groups of 1-4 rows under random filters give the same rows pruned and unpruned; which row groups an ordered file skips, floats included; EXPLAIN's scan filters |
 | `tests/skipped_errors.rs` (3) | the documented cases where the optimized plan succeeds and the bound one fails, as on DuckDB 2.0: a pruned row group's bad row, a pushed-down condition that is NULL, an unread CSV column that doesn't parse |
 | `tests/optimizer_properties.rs` (1) | random whole queries (comma, inner and LEFT joins; WHERE with constants, comparisons, OR, NOT, IS NULL; GROUP BY or expressions; ORDER BY; LIMIT) give the same rows in the same order bound and optimized |
-| unit tests (32) | the common-type rules, date parsing over every day from 1600 to 2400 and against Arrow's own cast, expression printing, the plan nodes' guards and schemas; each operator of the evaluator, with DuckDB 2.0's answers; constant folding; which ON conjuncts become join keys |
+| unit tests (33) | the common-type rules, date parsing over every day from 1600 to 2400 and against Arrow's own cast, expression printing, the plan nodes' guards and schemas; each operator of the evaluator, with DuckDB 2.0's answers; constant folding; which ON conjuncts become join keys; a footer without null counts |
 | `quarry-cli/tests/cli.rs` (9) | the built binary: output, exit codes, errors on stderr, `quarry query`, and that this README's examples print what it says |
 
 The property tests bind `SELECT <expr> FROM t` for expressions from two generators (a random grammar of every
@@ -267,10 +267,10 @@ below a join drops rows (those where it is NULL included) before a later conjunc
 reads isn't parsed. DuckDB 2.0 gives the optimized answer in all three (I checked each); they are now documented
 (DESIGN.md, "The optimizer") and pinned by `tests/skipped_errors.rs`. Of its mutations, six survived every test:
 two are equivalent (a NULL-typed key check `logical_nulls` already covers; a filter-merge order no plan reaches), two
-guard cases the binder already rules out (AND/OR operands are always BOOLEAN), one needs a Parquet file with
-statistics but no null counts, which parquet-rs doesn't write (`with_missing_null_counts_as_zero(false)`; DESIGN says
-a missing count is never 0), and one, the join's pair budget, panics on overflow in the debug build `make check`
-runs.
+guard cases the binder already rules out (AND/OR operands are always BOOLEAN; checked with `quarry plan`), one
+needed a footer with statistics but no null counts, which parquet-rs doesn't write (now tested by rebuilding a footer
+without them: `with_missing_null_counts_as_zero(true)` fails it), and one, the join's pair budget, panics on overflow
+in the debug build `make check` runs.
 
 The second (at `d59dc46`, on the code written after the first: the top-k, the timing tools, and the property tests
 run optimized; 9 minutes, cut short when the disk filled up) found **no wrong rows** either: a 20,000-case property
