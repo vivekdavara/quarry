@@ -893,10 +893,34 @@ fn file_catalogs(dir: &std::path::Path) -> Vec<(&'static str, Catalog)> {
     .unwrap();
     writer.write(&orders()).unwrap();
     writer.close().unwrap();
+    // customers(): the NULL name is an empty CSV field, as orders' NULLs are.
+    let customers_csv = dir.join("customers.csv");
+    std::fs::write(
+        &customers_csv,
+        "name,city,rank\nada,Oslo,1\nbo,Lima,2\nbo,Rome,3\ndee,Pune,\n,Nowhere,4\n",
+    )
+    .unwrap();
+    let customers_parquet = dir.join("customers.parquet");
+    let mut writer = ArrowWriter::try_new(
+        std::fs::File::create(&customers_parquet).unwrap(),
+        customers().schema(),
+        Some(
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(2))
+                .build(),
+        ),
+    )
+    .unwrap();
+    writer.write(&customers()).unwrap();
+    writer.close().unwrap();
     let mut out = Vec::new();
-    for (label, path) in [("csv", csv), ("parquet", parquet)] {
+    for (label, orders, customers) in [
+        ("csv", csv, customers_csv),
+        ("parquet", parquet, customers_parquet),
+    ] {
         let mut c = Catalog::new();
-        c.register_file("orders", path).unwrap();
+        c.register_file("orders", orders).unwrap();
+        c.register_file("customers", customers).unwrap();
         out.push((label, c));
     }
     out
@@ -914,6 +938,12 @@ fn csv_and_parquet_files_give_the_same_answers_as_memory() {
         "SELECT DISTINCT placed FROM orders ORDER BY placed NULLS FIRST",
         "SELECT count(*), count(DISTINCT total) FROM orders WHERE placed > '2024-01-02'",
         "SELECT qty % 2 AS parity, sum(total) FROM orders GROUP BY parity ORDER BY parity",
+        // Joins over files, pushdown into Parquet scans, and row groups that pruning skips (ids 5 and 6 are one).
+        "SELECT o.id, c.city FROM orders o LEFT JOIN customers c ON o.customer = c.name AND c.rank > 1",
+        "SELECT c.city, count(*), sum(o.qty) FROM orders o, customers c WHERE o.customer = c.name AND o.id < 5 \
+         GROUP BY c.city ORDER BY c.city",
+        "SELECT o.id, o.total FROM orders o JOIN customers c ON o.qty = c.rank WHERE o.id >= 5 AND c.city <> 'Lima'",
+        "SELECT count(*) FROM orders WHERE id > 4 OR placed IS NULL",
     ];
     let memory = catalog();
     let files = file_catalogs(dir.path());
