@@ -368,6 +368,10 @@ property then found one more bug itself: `-(-0)` printed as `-0`, which binds ba
   compare rows in order.
 - **Optimizer rules that keep the schema**, checked by running every test query with and without them: a rule that
   changes rows fails a hundred existing tests, not one new one.
+- **No separate physical plan (yet).** The executor picks each node's operator as it builds the stream (a hash join
+  when `ON` has a key, a top-k when a LIMIT reaches a sort), and `exec::explain` makes the same calls for EXPLAIN. With
+  one choice per node that is simpler than a second plan tree to keep in step; a cost-based choice (which side to
+  build, join order) would be the point to add one.
 - **Pruning as a hint, evaluated by the engine.** Scans get the filters but the filter node stays, and the statistics
   conditions run through the same evaluator as the query, so pruning can only be too cautious, never differently
   typed or ordered than the filter; random data checks it can't drop a row.
