@@ -169,6 +169,12 @@ impl Statistics<'_> {
                     Expr::Column(0),
                 ))
             }
+            Expr::Like {
+                expr,
+                pattern,
+                negated: false,
+                case_insensitive: false,
+            } => self.like_prefix(expr, pattern),
             Expr::InList {
                 expr,
                 list,
@@ -214,6 +220,44 @@ impl Statistics<'_> {
             ))),
             _ => return None,
         })
+    }
+
+    /// `x LIKE 'abc%...'`: every value it keeps starts with the pattern's prefix before its first wildcard, so it is at
+    /// least that prefix, and (for an ASCII prefix) below the prefix with its last byte one higher. A pattern that
+    /// starts with a wildcard has no prefix and says nothing.
+    fn like_prefix(&mut self, x: &Expr, pattern: &Expr) -> Option<Expr> {
+        let Expr::Literal(ScalarValue::Utf8(pattern)) = pattern else {
+            return None;
+        };
+        let prefix: String = pattern
+            .chars()
+            .take_while(|c| *c != '%' && *c != '_')
+            .collect();
+        if prefix.is_empty() || !matches!(x, Expr::Column(_)) {
+            return None;
+        }
+        let (column, _) = self.target(x)?;
+        if self.fields[column].data_type != DataType::Utf8 {
+            return None;
+        }
+        let text = |s: String| Expr::Literal(ScalarValue::Utf8(s));
+        let at_least = Expr::binary(
+            BinaryOp::GtEq,
+            Expr::Column(column + 1),
+            text(prefix.clone()),
+        );
+        let last = *prefix.as_bytes().last().expect("not empty");
+        if !prefix.is_ascii() || last == 0x7F {
+            return Some(at_least);
+        }
+        let mut upper = prefix.into_bytes();
+        *upper.last_mut().expect("not empty") += 1;
+        let upper = String::from_utf8(upper).expect("ASCII stays UTF-8");
+        Some(Expr::binary(
+            BinaryOp::And,
+            at_least,
+            Expr::binary(BinaryOp::Lt, Expr::Column(column), text(upper)),
+        ))
     }
 
     /// The statistics of the column `e` reads, if `e` is a column or a cast of one that keeps order (an integer to

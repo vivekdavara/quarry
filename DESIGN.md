@@ -374,6 +374,7 @@ into a condition on the statistics, over a batch with one row per row group:
 | `x = v` | `min(x) <= v AND max(x) >= v` |
 | `x <> v` | `NOT (min(x) = v AND max(x) = v)` |
 | `x IN (v1, v2)` | the `=` conditions, ORed |
+| `x LIKE 'ab%'` (a string column; the prefix before the first `%` or `_`) | `max(x) >= 'ab' AND min(x) < 'ac'` (the last byte one higher; only the first half for a non-ASCII prefix) |
 | `x IS NULL`, `x IS NOT NULL` | `nulls(x) > 0`, `nulls(x) < rows` |
 | `a AND b` | both conditions; one alone if the other is unknown |
 | `a OR b` | both conditions ORed; unknown if either is |
@@ -381,7 +382,7 @@ into a condition on the statistics, over a batch with one row per row group:
 The condition is evaluated by the engine's own evaluator, so it compares exactly as the filter will (strings by
 bytes, -0.0 as 0.0, a cast as the filter casts), and a row group is skipped only where it is FALSE: a missing
 statistic is NULL and keeps the group, and so does any filter the table above doesn't cover (`x + 1 > 9`, `NOT`,
-`LIKE`) and any error (a constant that fails). The casts allowed keep order: an integer to BIGINT or DOUBLE, a float
+`ILIKE`, a pattern that starts with a wildcard) and any error (a constant that fails). The casts allowed keep order: an integer to BIGINT or DOUBLE, a float
 to a DOUBLE (`CAST(i AS DOUBLE) > 7.5` uses `CAST(max(i) AS DOUBLE)`).
 
 **Floats.** Parquet writers leave NaN out of min and max (parquet-rs does, once a row group has a non-NaN value), and

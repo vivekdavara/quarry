@@ -1,7 +1,7 @@
 //! Row-group pruning (DESIGN.md, "Row-group pruning"): skipping is only an optimization, so a query must give the
 //! same rows with it as without it. Random rows (NULLs, -0.0, NaNs, strings, dates) are written to a Parquet file in
-//! row groups of 1-4 rows, and random filters run over it optimized (pruned) and bound (every row group read). The
-//! tests also check that pruning happens where the statistics allow it.
+//! row groups of 1-4 rows, and random filters (LIKE included) run over it optimized (pruned) and bound (every row group
+//! read). The tests also check that pruning happens where the statistics allow it.
 
 use std::sync::Arc;
 
@@ -116,6 +116,8 @@ fn filter() -> impl Strategy<Value = String> {
         }),
         1 => (column, proptest::collection::vec(constant, 1..3))
             .prop_map(|(c, ks)| format!("{c} IN ({})", ks.join(", "))),
+        1 => proptest::sample::select(&["a%", "ab%", "a", "%b", "_b%", "a_", "ä%", "B%", "%", "z\u{7f}%"][..])
+            .prop_map(|p| format!("g LIKE '{p}'")),
     ];
     leaf.prop_recursive(2, 6, 2, |inner| {
         prop_oneof![
@@ -228,6 +230,10 @@ fn row_groups_are_skipped_where_the_statistics_allow() {
         ("i + 1 > 9", &[0, 1, 2, 3, 4]), // an expression of the column: not known
         ("NOT (i > 6)", &[0, 1, 2, 3, 4]),
         ("g >= 'i'", &[4]),
+        ("g LIKE 'c%'", &[1]),
+        ("g LIKE 'b%' OR g LIKE 'e'", &[0, 2]),
+        ("g LIKE '%c'", &[0, 1, 2, 3, 4]),  // no prefix
+        ("g ILIKE 'c%'", &[0, 1, 2, 3, 4]), // case folds: not by bytes
         ("g < 'b'", &[0]),
         ("d = DATE '1970-01-04'", &[1]),
         ("s > 2", &[1, 3]), // an INT column, compared after a cast to BIGINT
