@@ -233,7 +233,7 @@ becomes an iterator of Arrow `RecordBatch`es that pulls from its input's iterato
 | `Limit` | slices batches; once it has `fetch` rows it stops pulling, so the rest of the input is never read. Over projections it runs below them (a projection makes one row of each input row), so they compute only the rows it keeps |
 | `Sort` | reads its whole input, evaluates the keys, sorts with Arrow's `lexsort`; the row number is the last key, so ties keep their input order |
 | `Aggregate` | reads its whole input into a hash table of groups (below), then hands out one row per group |
-| `Join` | not yet: it binds, and running it is an `Unsupported` error until day 3 |
+| `Join` | a hash join on `ON`'s equalities, or a nested loop without any ("Joins" below); the right input is read whole, the left streams |
 
 Every batch of the result is checked against the plan's output schema (types and nullability): a plan that claims a
 column can't be NULL and then makes a NULL fails there, instead of returning a wrong answer. The result doesn't depend
@@ -244,6 +244,23 @@ computes row 3 (the limit runs below the projection), but a filter computes its 
 select list is computed for every row before the sort, so `SELECT CAST(s AS INT) FROM t ORDER BY id LIMIT 2` fails on
 any row whose `s` isn't a number; DuckDB computes such an item after its top-N, for the kept rows only (it doesn't for
 every expression: `10 % (id - 3)` fails there too). Day 3's top-k sort should do the same.
+
+**Joins** (`exec/join.rs`, day 3). `ON` is split into its conjuncts (the operands of a chain of `AND`s). A conjunct
+`l = r` is a **key** when `l` reads only left columns and `r` only right columns (or the other way round), each at
+least one; every other conjunct is the **residual**, kept in its order. The right input is the build side: it is read
+whole, and with keys its rows are grouped by key in a hash table (the keys in Arrow's row format with floats
+normalized, as for GROUP BY, so -0.0 meets 0.0 and NaN meets NaN; a row with a NULL key goes in no group, since NULL
+equals nothing). Each left row looks up its candidates, the build rows with its key, in their input order; with no
+keys every build row is a candidate (a nested loop, as for `CROSS JOIN` and `ON o.qty > c.rank`). The residual is
+evaluated on the candidate pairs, at most `batch_size` pairs at a time, and the pairs where it is TRUE come out. A
+`LEFT` join's left row with no such pair comes out once, with NULLs on the right, in its place.
+
+So the output is in the left input's order, each left row's matches in the build side's order, whatever the batch
+size, and the tests can compare joins row for row. The residual is computed only for pairs with equal keys, as in
+DuckDB: `ON o.customer = c.name AND 5 % (c.rank - 4) = 1` never divides by the rank of a customer no order names, where
+`ON 5 % (c.rank - 4) = 1` alone (a nested loop) does and fails. An inner join whose build side has no rows doesn't
+read its left input at all. The build side is always the right input; choosing the smaller side would need the
+output order to stop being the left's.
 
 **Expressions** (`exec::evaluate`) are computed a column at a time with Arrow's compute kernels. A literal stays a
 one-row scalar until an operator needs a column (Arrow's kernels take a column and a scalar), so `l_quantity < 24`

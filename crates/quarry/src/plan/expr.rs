@@ -433,6 +433,52 @@ impl Expr {
         }
     }
 
+    /// The input columns the expression reads, in ascending order, each once.
+    pub fn columns(&self) -> Vec<usize> {
+        let mut columns = Vec::new();
+        self.visit(&mut |e| {
+            if let Expr::Column(i) = e {
+                columns.push(*i);
+            }
+        });
+        columns.sort_unstable();
+        columns.dedup();
+        columns
+    }
+
+    /// The expression with each column `i` replaced by column `f(i)` (for moving it to another input's schema).
+    pub fn map_columns(&self, f: &impl Fn(usize) -> usize) -> Expr {
+        self.transform(&mut |e| match e {
+            Expr::Column(i) => Some(Expr::Column(f(*i))),
+            _ => None,
+        })
+    }
+
+    /// The operands of a chain of `AND`s, left to right (`a AND (b AND c)` is `[a, b, c]`); any other expression is
+    /// its own only conjunct.
+    pub fn conjuncts(&self) -> Vec<&Expr> {
+        match self {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => {
+                let mut all = left.conjuncts();
+                all.extend(right.conjuncts());
+                all
+            }
+            other => vec![other],
+        }
+    }
+
+    /// The conjuncts joined by `AND`, left-deep and in order (so `AND`'s left-to-right laziness keeps their order);
+    /// `None` for none.
+    pub fn and_all(conjuncts: impl IntoIterator<Item = Expr>) -> Option<Expr> {
+        conjuncts
+            .into_iter()
+            .reduce(|all, c| Expr::binary(BinaryOp::And, all, c))
+    }
+
     /// The expression printed with its columns' names from `input`.
     pub fn display<'a>(&'a self, input: &'a PlanSchema) -> ExprDisplay<'a> {
         ExprDisplay { expr: self, input }

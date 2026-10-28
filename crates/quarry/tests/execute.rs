@@ -107,7 +107,46 @@ fn catalog() -> Catalog {
         column("n", Arc::new(Int64Array::from(vec![i64::MAX, 1, -1]))),
     )
     .unwrap();
+    c.register("customers", Arc::new(MemTable::from_batch(customers())))
+        .unwrap();
+    c.register(
+        "nobody",
+        Arc::new(MemTable::from_batch(customers().slice(0, 0))),
+    )
+    .unwrap();
     c
+}
+
+/// customers(name, city, rank): "bo" twice, a NULL name and a NULL rank; "cy" (an order's customer) is missing.
+fn customers() -> RecordBatch {
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::Utf8, true),
+        Field::new("city", DataType::Utf8, false),
+        Field::new("rank", DataType::Int64, true),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(vec![
+                Some("ada"),
+                Some("bo"),
+                Some("bo"),
+                Some("dee"),
+                None,
+            ])),
+            Arc::new(StringArray::from(vec![
+                "Oslo", "Lima", "Rome", "Pune", "Nowhere",
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(1),
+                Some(2),
+                Some(3),
+                None,
+                Some(4),
+            ])),
+        ],
+    )
+    .unwrap()
 }
 
 const BATCH_SIZES: [usize; 4] = [1, 2, 3, 8192];
@@ -559,8 +598,249 @@ fn errors_name_the_expression() {
     );
     let e = error("SELECT sum(n) FROM big");
     assert!(e.contains("overflow in sum(big.n)"), "{e}");
-    let e = error("SELECT * FROM orders AS a JOIN orders AS b ON a.id = b.id");
-    assert!(e.contains("not supported: running a join"), "{e}");
+}
+
+// --- joins ---
+
+#[test]
+fn inner_and_left_joins_keep_the_left_order_and_each_rows_matches_in_build_order() {
+    // "bo" has two customers rows, "cy" none, and the NULL name matches nothing.
+    assert_eq!(
+        run("SELECT o.id, c.city FROM orders o JOIN customers c ON o.customer = c.name"),
+        table(&[
+            &["1", "Oslo"],
+            &["2", "Lima"],
+            &["2", "Rome"],
+            &["3", "Oslo"],
+            &["5", "Lima"],
+            &["5", "Rome"],
+            &["6", "Oslo"],
+        ])
+    );
+    assert_eq!(
+        run("SELECT o.id, c.city FROM orders o LEFT JOIN customers c ON c.name = o.customer"),
+        table(&[
+            &["1", "Oslo"],
+            &["2", "Lima"],
+            &["2", "Rome"],
+            &["3", "Oslo"],
+            &["4", "NULL"],
+            &["5", "Lima"],
+            &["5", "Rome"],
+            &["6", "Oslo"],
+        ])
+    );
+}
+
+#[test]
+fn the_rest_of_on_decides_which_pairs_match() {
+    let on = "ON o.customer = c.name AND c.rank > 1";
+    assert_eq!(
+        run(&format!(
+            "SELECT o.id, c.city FROM orders o JOIN customers c {on}"
+        )),
+        table(&[
+            &["2", "Lima"],
+            &["2", "Rome"],
+            &["5", "Lima"],
+            &["5", "Rome"]
+        ])
+    );
+    // In a LEFT join it decides matching, not which left rows come out: every left row is there.
+    assert_eq!(
+        run(&format!(
+            "SELECT o.id, c.city FROM orders o LEFT JOIN customers c {on}"
+        )),
+        table(&[
+            &["1", "NULL"],
+            &["2", "Lima"],
+            &["2", "Rome"],
+            &["3", "NULL"],
+            &["4", "NULL"],
+            &["5", "Lima"],
+            &["5", "Rome"],
+            &["6", "NULL"],
+        ])
+    );
+    // A condition on the left alone, in a LEFT join's ON, also only decides matching.
+    assert_eq!(
+        run(
+            "SELECT o.id, c.rank FROM orders o LEFT JOIN customers c ON o.customer = c.name AND o.id > 4"
+        ),
+        table(&[
+            &["1", "NULL"],
+            &["2", "NULL"],
+            &["3", "NULL"],
+            &["4", "NULL"],
+            &["5", "2"],
+            &["5", "3"],
+            &["6", "1"],
+        ])
+    );
+}
+
+#[test]
+fn joins_without_equalities_are_nested_loops() {
+    assert_eq!(
+        run("SELECT count(*) FROM orders, customers"),
+        table(&[&["30"]])
+    );
+    assert_eq!(
+        run("SELECT count(*) FROM orders CROSS JOIN customers"),
+        table(&[&["30"]])
+    );
+    assert_eq!(
+        run("SELECT o.id, c.rank FROM orders o JOIN customers c ON o.qty > c.rank WHERE o.id < 4"),
+        table(&[
+            &["1", "1"],
+            &["3", "1"],
+            &["3", "2"],
+            &["3", "3"],
+            &["3", "4"]
+        ])
+    );
+    assert_eq!(
+        run("SELECT o.id, c.name FROM orders o, customers c WHERE o.id = c.rank"),
+        table(&[&["1", "ada"], &["2", "bo"], &["3", "bo"], &["4", "NULL"]])
+    );
+    // A condition that is constant, or reads one side only, is not a key either.
+    assert_eq!(
+        run("SELECT count(*) FROM orders o JOIN customers c ON c.rank = 2"),
+        table(&[&["6"]])
+    );
+    assert_eq!(
+        run("SELECT o.id, c.city FROM orders o LEFT JOIN customers c ON FALSE WHERE o.id < 3"),
+        table(&[&["1", "NULL"], &["2", "NULL"]])
+    );
+}
+
+#[test]
+fn join_keys_compare_as_sql_does() {
+    // NULL keys meet nothing, on either side.
+    assert_eq!(
+        run("SELECT o.id, c.name FROM orders o JOIN customers c ON o.qty = c.rank"),
+        table(&[&["1", "bo"], &["2", "ada"], &["5", "bo"], &["6", "bo"]])
+    );
+    // -0.0 meets 0.0 and NaN meets NaN, as in `=`; the values that come out are the input's.
+    assert_eq!(
+        run("SELECT a.x, b.x FROM floats a JOIN floats b ON a.x = b.x"),
+        table(&[
+            &["-0.0", "-0.0"],
+            &["-0.0", "0.0"],
+            &["0.0", "-0.0"],
+            &["0.0", "0.0"],
+            &["NaN", "NaN"],
+            &["NaN", "NaN"],
+            &["NaN", "NaN"],
+            &["NaN", "NaN"],
+            &["1.0", "1.0"],
+        ])
+    );
+    // Keys of two types meet in the type the binder casts them to: total (Float64) = rank (Int64) as Float64.
+    assert_eq!(
+        run("SELECT o.id, c.city FROM orders o JOIN customers c ON o.total = c.rank"),
+        table(&[&["2", "Rome"]])
+    );
+    // Keys can be expressions, several of them, written either way round.
+    assert_eq!(
+        run("SELECT o.id, c.city FROM orders o JOIN customers c ON c.rank = o.id + 1"),
+        table(&[&["1", "Lima"], &["2", "Rome"], &["3", "Nowhere"]])
+    );
+    assert_eq!(
+        run(
+            "SELECT o.id, c.city FROM orders o JOIN customers c ON o.customer = c.name AND c.rank = o.qty"
+        ),
+        table(&[&["5", "Rome"]])
+    );
+}
+
+#[test]
+fn the_rest_of_on_is_computed_only_for_pairs_with_equal_keys() {
+    // rank 4 is the NULL name's, which no order's key meets, so the division by zero is never computed (DuckDB 2.0
+    // too). In a nested loop every pair is a candidate, and it fails.
+    assert_eq!(
+        run(
+            "SELECT o.id FROM orders o JOIN customers c ON o.customer = c.name AND 5 % (c.rank - 4) = 1"
+        ),
+        table(&[&["2"], &["5"]])
+    );
+    let e = error("SELECT o.id FROM orders o JOIN customers c ON 5 % (c.rank - 4) = 1");
+    assert!(e.contains("division by zero"), "{e}");
+}
+
+#[test]
+fn joins_with_an_empty_side() {
+    assert_eq!(
+        run("SELECT o.id, n.city FROM orders o JOIN nobody n ON o.customer = n.name"),
+        table(&[])
+    );
+    assert_eq!(
+        run(
+            "SELECT o.id, n.name, n.city, n.rank FROM orders o LEFT JOIN nobody n ON o.customer = n.name WHERE o.id < 3"
+        ),
+        table(&[
+            &["1", "NULL", "NULL", "NULL"],
+            &["2", "NULL", "NULL", "NULL"]
+        ])
+    );
+    assert_eq!(
+        run("SELECT n.name, c.city FROM nobody n LEFT JOIN customers c ON n.name = c.name"),
+        table(&[])
+    );
+    assert_eq!(run("SELECT count(*) FROM orders, nobody"), table(&[&["0"]]));
+}
+
+#[test]
+fn an_inner_join_with_nothing_to_build_never_reads_its_left_input() {
+    let mut c = catalog();
+    c.register("t", Arc::new(FailsAfterOneBatch)).unwrap();
+    let plan = quarry::sql::plan(
+        &c,
+        "SELECT t.id FROM t JOIN nobody n ON t.customer = n.name",
+    )
+    .unwrap();
+    let rows = rows_of(&collect_with_batch_size(&plan, 8192).unwrap());
+    assert!(rows.is_empty());
+    let plan = quarry::sql::plan(
+        &c,
+        "SELECT t.id FROM t LEFT JOIN nobody n ON t.customer = n.name",
+    )
+    .unwrap();
+    let e = collect_with_batch_size(&plan, 8192).unwrap_err();
+    assert!(e.to_string().contains("read past the limit"), "{e}");
+}
+
+#[test]
+fn joins_compose_with_the_other_operators() {
+    // Three tables, an aggregate over the join, and an ORDER BY on both sides' columns.
+    assert_eq!(
+        run(
+            "SELECT c.city, count(*), sum(o.qty) FROM orders o JOIN customers c ON o.customer = c.name \
+             GROUP BY c.city ORDER BY c.city"
+        ),
+        table(&[
+            &["Lima", "2", "4"],
+            &["Oslo", "3", "9"],
+            &["Rome", "2", "4"]
+        ])
+    );
+    assert_eq!(
+        run(
+            "SELECT o.id, c.city, d.city FROM orders o JOIN customers c ON o.customer = c.name \
+             LEFT JOIN customers d ON d.rank = c.rank + 1 WHERE o.id <= 2 ORDER BY o.id, d.city DESC"
+        ),
+        table(&[
+            &["1", "Oslo", "Lima"],
+            &["2", "Lima", "Rome"],
+            &["2", "Rome", "Nowhere"]
+        ])
+    );
+    assert_eq!(
+        run(
+            "SELECT a.id, b.id FROM orders a JOIN orders b ON a.customer = b.customer AND a.id < b.id ORDER BY 1, 2"
+        ),
+        table(&[&["1", "3"], &["1", "6"], &["2", "5"], &["3", "6"]])
+    );
 }
 
 /// orders() written to a CSV file and to a Parquet file in row groups of two rows.

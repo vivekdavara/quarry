@@ -1,11 +1,12 @@
 //! Execution: a logical plan run over Arrow record batches (DESIGN.md, "Execution").
 //!
 //! Each plan node becomes an iterator of record batches that pulls from its input's (the Volcano model, a batch at a
-//! time). Scan, filter, projection and limit stream; sort and aggregate read their whole input first. This interprets
-//! the logical plan directly; day 3 puts a physical plan in between (hash join, top-k sort, row-group pruning).
+//! time). Scan, filter, projection and limit stream; sort and aggregate read their whole input first, and a join its
+//! right input (`join.rs`).
 
 mod aggregate;
 mod expr;
+mod join;
 
 use std::sync::Arc;
 
@@ -107,9 +108,7 @@ fn stream(plan: &LogicalPlan, batch_size: usize) -> Result<BatchIter> {
         }
         LogicalPlan::Sort(s) => sort(s, batch_size),
         LogicalPlan::Limit(l) => limited(&l.input, l.skip, l.fetch, batch_size),
-        LogicalPlan::Join(_) => Err(unsupported!(
-            "running a join (the plan binds; day 3 adds the join operators)"
-        )),
+        LogicalPlan::Join(j) => join::join(j, batch_size),
     }
 }
 
