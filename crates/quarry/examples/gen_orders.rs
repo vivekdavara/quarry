@@ -1,12 +1,14 @@
 //! Writes a synthetic `orders` table to a Parquet file, for measuring queries on more than a handful of rows.
 //!
 //! ```text
-//! cargo run --release -p quarry --example gen_orders -- ROWS PATH
+//! cargo run --release -p quarry --example gen_orders -- ROWS PATH [CUSTOMERS_PATH]
 //! ```
 //!
-//! Columns: `order_id` (1..=ROWS), `customer` (one of 10,000, skewed: low numbers are more frequent), `status`
-//! (shipped 70%, pending 20%, cancelled 10%), `total` (0.01 to 1,000.00, NULL 5% of the time), `qty` (1 to 10) and
-//! `placed` (a day in 2020-2023). The data come from a fixed-seed generator, so the same ROWS give the same file.
+//! Columns: `order_id` (1..=ROWS, in order, so each row group of 2^20 rows holds a range of ids), `customer` (one of
+//! 10,000, skewed: low numbers are more frequent), `status` (shipped 70%, pending 20%, cancelled 10%), `total` (0.01 to
+//! 1,000.00, NULL 5% of the time), `qty` (1 to 10) and `placed` (a day in 2020-2023). With CUSTOMERS_PATH, also a
+//! `customers` table for joins: `customer` (each of the 10,000 once), `region` (one of 5) and `tier` (1 to 3). The data
+//! come from fixed-seed generators, so the same ROWS give the same files.
 
 use std::fs::File;
 use std::sync::Arc;
@@ -40,13 +42,21 @@ const BATCH: usize = 65_536;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let (rows, path) = match args.as_slice() {
-        [_, rows, path] => (rows.parse::<usize>().expect("ROWS is a number"), path),
+    let (rows, path, customers_path) = match args.as_slice() {
+        [_, rows, path] => (rows.parse::<usize>().expect("ROWS is a number"), path, None),
+        [_, rows, path, customers] => (
+            rows.parse::<usize>().expect("ROWS is a number"),
+            path,
+            Some(customers),
+        ),
         _ => {
-            eprintln!("usage: gen_orders ROWS PATH");
+            eprintln!("usage: gen_orders ROWS PATH [CUSTOMERS_PATH]");
             std::process::exit(2);
         }
     };
+    if let Some(customers) = customers_path {
+        write_customers(customers);
+    }
     let schema = Arc::new(Schema::new(vec![
         Field::new("order_id", DataType::Int64, false),
         Field::new("customer", DataType::Utf8, false),
@@ -105,5 +115,28 @@ fn main() {
             .write(&RecordBatch::try_new(schema.clone(), columns).unwrap())
             .unwrap();
     }
+    writer.close().unwrap();
+}
+
+/// customers(customer, region, tier): each of the 10,000 customers once, in order.
+fn write_customers(path: &str) {
+    const REGIONS: &[&str] = &["north", "south", "east", "west", "central"];
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("customer", DataType::Utf8, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("tier", DataType::Int64, false),
+    ]));
+    let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+    let customer: StringArray = (0..10_000).map(|i| Some(format!("c{i:05}"))).collect();
+    let region: StringArray = (0..10_000)
+        .map(|_| Some(REGIONS[rng.below(REGIONS.len() as u64) as usize]))
+        .collect();
+    let tier: Int64Array = (0..10_000).map(|_| rng.below(3) as i64 + 1).collect();
+    let columns: Vec<ArrayRef> = vec![Arc::new(customer), Arc::new(region), Arc::new(tier)];
+    let file = File::create(path).expect("can create the customers file");
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+    writer
+        .write(&RecordBatch::try_new(schema, columns).unwrap())
+        .unwrap();
     writer.close().unwrap();
 }
