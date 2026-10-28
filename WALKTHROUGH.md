@@ -284,7 +284,8 @@ reader decodes no column and only counts rows.
 
 **How does row-group pruning work, and why is it safe?**
 `datasource/pruning.rs` rewrites each filter the scan was given into a condition on statistics (`x > 5` becomes
-`max(x) > 5`, `x = 5` becomes `min(x) <= 5 AND max(x) >= 5`, `IS NULL` a null count above 0) and evaluates it with the
+`max(x) > 5`, `x = 5` becomes `min(x) <= 5 AND max(x) >= 5`, `IS NULL` a null count above 0, `x LIKE 'ab%'` the range
+`max(x) >= 'ab' AND min(x) < 'ac'`) and evaluates it with the
 engine's own evaluator over a batch with one row per row group. A group is skipped only where the result is FALSE; a
 missing statistic is NULL and keeps it. It's safe because it's only ever an optimization: the Filter node stays above
 the scan and checks every row read, so the property test (`tests/pruning.rs`) can demand the same rows with and
