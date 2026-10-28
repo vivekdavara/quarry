@@ -310,7 +310,7 @@ property then found one more bug itself: `-(-0)` printed as `-0`, which binds ba
   reorders it and returns no rows.
 - Row-group pruning uses the footer's per-row-group min, max and null counts only (no page index, no Bloom filters,
   nothing for CSV), and trusts them: a file whose writer recorded wrong statistics can give wrong answers. For float
-  columns only `<`, `<=` and `=` with a number prune.
+  columns only the min prunes (`<`, `<=`, and `=` against a number).
 - Projection pushdown narrows scans only: a projection item nothing uses is still computed. Conditions don't move
   through aggregates (a HAVING on a group key) or projections.
 - Where Arrow's kernels and DuckDB differ in details not covered by DESIGN.md's table, Quarry follows Arrow: string to

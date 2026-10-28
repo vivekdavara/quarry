@@ -292,7 +292,7 @@ without pruning for random data and filters.
 
 **What's the catch with floats?**
 NaN. Writers leave it out of min and max, and NaN is the greatest value here, so a group with max 1.0 can still hold a
-NaN that `x > 5.0` keeps. For float columns only `<`, `<=` and `=` with a number use the statistics. The first mutant
+NaN that `x > 5.0` keeps. For float columns only the min is used: `<`, `<=`, and `=` against a number. The first mutant
 I ran (allowing `>` on floats) is exactly that bug, and the property test catches it.
 
 **What is the top-k?**

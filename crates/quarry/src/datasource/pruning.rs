@@ -10,7 +10,8 @@
 //!
 //! Floats need care: Parquet writers leave NaN out of min and max (NaN is the greatest value in SQL here, so a row
 //! group whose max is 1.0 may still hold a NaN that `x > 5.0` keeps), and a row group of only NaNs has NaN for both.
-//! So for a float column only `<`, `<=` and `=` with a number use the statistics, and NaN statistics count as missing.
+//! So for a float column only the min is used (`<` and `<=` against any constant, `=` against a DOUBLE literal that
+//! isn't NaN), and NaN statistics count as missing.
 
 use std::collections::HashMap;
 use std::sync::Arc;

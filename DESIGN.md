@@ -247,7 +247,8 @@ every expression: `10 % (id - 3)` fails there too). Day 3's top-k sort should do
 
 **Joins** (`exec/join.rs`, day 3). `ON` is split into its conjuncts (the operands of a chain of `AND`s). A conjunct
 `l = r` is a **key** when `l` reads only left columns and `r` only right columns (or the other way round), each at
-least one; every other conjunct is the **residual**, kept in its order. The right input is the build side: it is read
+least one; every other conjunct is the **residual**, kept in its order. The two sides of each key must have the same
+type, which the binder's casts guarantee; if some pair didn't, the whole `ON` would run as a nested loop. The right input is the build side: it is read
 whole, and with keys its rows are grouped by key in a hash table (the keys in Arrow's row format with floats
 normalized, as for GROUP BY, so -0.0 meets 0.0 and NaN meets NaN; a row with a NULL key goes in no group, since NULL
 equals nothing). Each left row looks up its candidates, the build rows with its key, in their input order; with no
@@ -340,6 +341,16 @@ every query bound and optimized, at every batch size, and requires the same rows
    only row counts. Projections and aggregates keep all their outputs (an unused one is still computed), so only
    scans drop columns. It runs last because it renumbers.
 
+**Errors in data a plan skips.** Besides the pushed conditions above, which can fail on more rows, the rules can also
+make a query that fails as bound succeed, by not reading or computing what failed; DuckDB 2.0 gives the same answers
+(each checked by hand), and `tests/skipped_errors.rs` pins them. A Parquet row group that pruning skips isn't read,
+so `WHERE 10 % y = 1 AND x > 5` never divides by the `y` of a group that `x > 5` rules out. A condition moved below a
+join drops rows before a later conjunct sees them: `WHERE a.x > 0 AND 10 % (b.v - a.y) = 1` computes the division
+where `a.x > 0` is NULL as bound (AND is lazy only past a FALSE), but not once `a.x > 0` filters `a`. A column no one
+reads isn't parsed, so a CSV value past the inferred rows that doesn't fit its column fails only queries that read
+that column. And a filter folded to FALSE, or an inner join with nothing to build, doesn't read its input at all.
+Apart from these and the pushed conditions, `tests/execute.rs` requires the same rows or the same error.
+
 Predicate pushdown also hands a filter's conjuncts to the scan below it, when its table can use them
 (`TableProvider::uses_filters`: Parquet files), as `Scan.filters` over the table's own column numbers. The filter
 stays: a scan's filters only let it skip data, never decide a row.
@@ -366,14 +377,15 @@ into a condition on the statistics, over a batch with one row per row group:
 The condition is evaluated by the engine's own evaluator, so it compares exactly as the filter will (strings by
 bytes, -0.0 as 0.0, a cast as the filter casts), and a row group is skipped only where it is FALSE: a missing
 statistic is NULL and keeps the group, and so does any filter the table above doesn't cover (`x + 1 > 9`, `NOT`,
-`LIKE`) and any error (a constant that fails). The casts allowed keep order: an integer to BIGINT or DOUBLE, a REAL
+`LIKE`) and any error (a constant that fails). The casts allowed keep order: an integer to BIGINT or DOUBLE, a float
 to a DOUBLE (`CAST(i AS DOUBLE) > 7.5` uses `CAST(max(i) AS DOUBLE)`).
 
 **Floats.** Parquet writers leave NaN out of min and max (parquet-rs does, once a row group has a non-NaN value), and
 NaN is the greatest value here, so a row group whose max is 1.0 may hold a NaN that `x > 5.0` keeps. For a float
-column only `<`, `<=` and `=` with a number use the statistics (NaN satisfies none of them, except `<=` against a NaN,
-which the min can't rule out). A NaN statistic (a row group of only NaNs, or a writer that does count them) is
-treated as missing.
+column only the min is used: `<` and `<=` against any constant (a NaN row satisfies neither, except `<=` against a
+NaN, which the min can't rule out either), and `=` against a DOUBLE literal that isn't NaN. A NaN statistic (a row
+group of only NaNs, or a writer that does count them) is treated as missing, and so is a missing null count (it is
+never taken as 0).
 
 Pruning is never needed for a right answer, so the test is that it changes none: `tests/pruning.rs` writes random rows
 (NULLs, -0.0, NaNs, strings, dates, an INT column) in row groups of 1-4 rows and requires random filters to give the
