@@ -168,7 +168,7 @@ it on Linux (ubuntu-24.04) and macOS (macos-15) on every push.
 | `tests/optimizer.rs` (4) | what each rule does to the printed plan: scans narrowed (`count(*)` reads no column), constants folded and failing ones kept, AND/OR simplified, conditions moved below inner and LEFT joins |
 | `tests/pruning.rs` (4) | random rows in Parquet row groups of 1-4 rows under random filters give the same rows pruned and unpruned; which row groups an ordered file skips, floats included; EXPLAIN's scan filters |
 | `tests/skipped_errors.rs` (3) | the documented cases where the optimized plan succeeds and the bound one fails, as on DuckDB 2.0: a pruned row group's bad row, a pushed-down condition that is NULL, an unread CSV column that doesn't parse |
-| unit tests (30) | the common-type rules, date parsing over every day from 1600 to 2400 and against Arrow's own cast, expression printing, the plan nodes' guards and schemas; each operator of the evaluator, with DuckDB 2.0's answers; constant folding |
+| unit tests (32) | the common-type rules, date parsing over every day from 1600 to 2400 and against Arrow's own cast, expression printing, the plan nodes' guards and schemas; each operator of the evaluator, with DuckDB 2.0's answers; constant folding; which ON conjuncts become join keys |
 | `quarry-cli/tests/cli.rs` (9) | the built binary: output, exit codes, errors on stderr, `quarry query`, and that this README's examples print what it says |
 
 The property tests bind `SELECT <expr> FROM t` for expressions from two generators (a random grammar of every

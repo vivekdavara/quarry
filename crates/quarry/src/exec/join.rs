@@ -491,3 +491,71 @@ impl Iterator for JoinStream {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::ScalarValue;
+
+    fn col(i: usize) -> Expr {
+        Expr::Column(i)
+    }
+
+    fn eq(l: Expr, r: Expr) -> Expr {
+        Expr::binary(BinaryOp::Eq, l, r)
+    }
+
+    fn and(l: Expr, r: Expr) -> Expr {
+        Expr::binary(BinaryOp::And, l, r)
+    }
+
+    #[test]
+    fn keys_are_equalities_between_one_side_and_the_other() {
+        // Left columns 0-1, right columns 2-3.
+        let plus_one = Expr::binary(BinaryOp::Plus, col(0), Expr::Literal(ScalarValue::Int64(1)));
+        let on = and(
+            and(eq(col(0), col(2)), eq(col(3), plus_one.clone())),
+            and(
+                eq(col(0), col(1)),
+                eq(col(2), Expr::Literal(ScalarValue::Int64(5))),
+            ),
+        );
+        let c = split_condition(Some(&on), 2);
+        // `r = l` is turned round, and the right side's columns are numbered from 0.
+        assert_eq!(c.left_keys, vec![col(0), plus_one]);
+        assert_eq!(c.right_keys, vec![col(0), col(1)]);
+        // Both sides of `l0 = l1` are on the left, `r0 = 5` reads one side: the residual, in order.
+        assert_eq!(
+            c.residual,
+            Some(and(
+                eq(col(0), col(1)),
+                eq(col(2), Expr::Literal(ScalarValue::Int64(5)))
+            ))
+        );
+    }
+
+    #[test]
+    fn an_equality_mixing_sides_or_a_non_equality_is_residual() {
+        // l0 + r0 = r1 reads both sides on its left: not a key. l0 < r0: not an equality.
+        let mixed = eq(Expr::binary(BinaryOp::Plus, col(0), col(2)), col(3));
+        let less = Expr::binary(BinaryOp::Lt, col(0), col(2));
+        let on = and(mixed.clone(), less.clone());
+        let c = split_condition(Some(&on), 2);
+        assert!(c.left_keys.is_empty() && c.right_keys.is_empty());
+        assert_eq!(c.residual, Some(and(mixed, less)));
+        // An OR of equalities is one conjunct, so not a key either.
+        let or = Expr::binary(BinaryOp::Or, eq(col(0), col(2)), eq(col(1), col(3)));
+        let c = split_condition(Some(&or), 2);
+        assert!(c.left_keys.is_empty());
+        assert_eq!(c.residual, Some(or));
+        // No ON: no keys, no residual (a cross join).
+        assert_eq!(
+            split_condition(None, 2),
+            JoinCondition {
+                left_keys: vec![],
+                right_keys: vec![],
+                residual: None
+            }
+        );
+    }
+}
