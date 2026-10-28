@@ -1000,6 +1000,7 @@ dependencies = [
 name = "quarry"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "arrow",
  "parquet",
  "proptest",

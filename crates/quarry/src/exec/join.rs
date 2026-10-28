@@ -10,6 +10,8 @@
 //! side's order, whatever the batch size.
 
 use std::collections::{HashMap, VecDeque};
+
+use ahash::RandomState;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, RecordBatch, UInt32Array};
@@ -150,7 +152,7 @@ struct Build {
 
 /// The build rows grouped by key: group `g`'s rows are `rows[starts[g]..starts[g + 1]]`, in input order.
 struct KeyTable {
-    groups: HashMap<Vec<u8>, u32>,
+    groups: HashMap<Vec<u8>, u32, RandomState>,
     starts: Vec<u32>,
     rows: Vec<u32>,
 }
@@ -181,7 +183,7 @@ impl Build {
             return Ok(Build { batch, table: None });
         }
         let (encoded, valid) = encode_keys(keys, schema, &batch, converter)?;
-        let mut groups: HashMap<Vec<u8>, u32> = HashMap::new();
+        let mut groups: HashMap<Vec<u8>, u32, RandomState> = HashMap::default();
         let mut group_of = Vec::with_capacity(num_rows);
         let mut sizes: Vec<u32> = Vec::new();
         for (i, row) in encoded.iter().enumerate() {

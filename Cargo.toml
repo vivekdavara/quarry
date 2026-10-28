@@ -14,6 +14,8 @@ authors = ["Vivek Davara"]
 arrow = { version = "60.0.0", default-features = false, features = ["csv", "prettyprint"] }
 parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap", "zstd", "lz4", "flate2-zlib-rs", "simdutf8"] }
 sqlparser = "0.63.0"
+# The hash the join and GROUP BY tables use; arrow already depends on it with these features.
+ahash = { version = "0.8.12", default-features = false, features = ["runtime-rng"] }
 thiserror = "2.0.21"
 clap = { version = "4.6.7", features = ["derive"] }
 tempfile = "3.27.0"

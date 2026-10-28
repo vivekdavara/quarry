@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+ahash.workspace = true
 arrow.workspace = true
 parquet.workspace = true
 sqlparser.workspace = true

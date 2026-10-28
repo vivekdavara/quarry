@@ -8,6 +8,8 @@
 //! winning value itself.
 
 use std::collections::{HashMap, HashSet};
+
+use ahash::RandomState;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -73,7 +75,7 @@ struct Groups {
     /// `None` without a GROUP BY: every row is in group 0, which exists from the start.
     converter: Option<RowConverter>,
     /// Group numbers by the row-format bytes of the normalized key.
-    numbers: HashMap<Vec<u8>, usize>,
+    numbers: HashMap<Vec<u8>, usize, RandomState>,
     /// Each group's key as its first row had it (not normalized), in row format, for the output.
     keys: Vec<Vec<u8>>,
 }
@@ -91,7 +93,7 @@ impl Groups {
         };
         Ok(Groups {
             converter,
-            numbers: HashMap::new(),
+            numbers: HashMap::default(),
             keys: Vec::new(),
         })
     }
@@ -217,7 +219,7 @@ fn accumulator(agg: &Expr, schema: &PlanSchema) -> Result<Box<dyn Accumulator>> 
         let t = arg_type.expect("DISTINCT has an argument");
         return Ok(Box::new(Distinct {
             converter: RowConverter::new(vec![SortField::new(t)])?,
-            seen: HashSet::new(),
+            seen: HashSet::default(),
             inner,
         }));
     }
@@ -464,7 +466,7 @@ impl Accumulator for MinMax {
 /// the (group, value) pairs it has seen (values in row format, floats normalized: -0.0 and 0.0 are one value).
 struct Distinct {
     converter: RowConverter,
-    seen: HashSet<(usize, Vec<u8>)>,
+    seen: HashSet<(usize, Vec<u8>), RandomState>,
     inner: Box<dyn Accumulator>,
 }
 
