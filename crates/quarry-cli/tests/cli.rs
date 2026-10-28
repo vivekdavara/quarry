@@ -249,6 +249,21 @@ fn the_readme_examples_print_what_the_readme_says() {
         "README's EXPLAIN is stale:\n{explain}"
     );
 
+    let customers = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/customers.csv");
+    let join = "SELECT c.tier, count(*) AS orders, sum(o.total) AS spent FROM orders o LEFT JOIN customers c \
+                ON o.customer = c.customer WHERE o.status <> 'cancelled' GROUP BY c.tier ORDER BY c.tier";
+    assert!(
+        readme.contains(join),
+        "README's join differs from the test's"
+    );
+    for sql in [join.to_string(), format!("EXPLAIN {join}")] {
+        let out = stdout(&quarry(&["query", "-t", orders, "-t", customers, &sql]));
+        assert!(
+            readme.contains(&out),
+            "README's join output is stale:\n{out}"
+        );
+    }
+
     let out = quarry(&[
         "plan",
         "-t",

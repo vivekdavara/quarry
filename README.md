@@ -85,6 +85,7 @@ crates/quarry/          the engine (a library)
 scripts/duckdb_times.py the same timings in DuckDB, for scale
 crates/quarry-cli/      the `quarry` binary and its tests
 examples/orders.csv     eight synthetic rows for the examples below
+examples/customers.csv  four synthetic customers, for the join example
 DESIGN.md               the specification
 ```
 
@@ -156,6 +157,36 @@ Limit: skip=0 fetch=3
           Filter: orders.status <> 'cancelled' AND orders.placed >= DATE '2024-01-01'
             Scan: orders projection=[customer, status, total, placed]
 ```
+
+Joins: `examples/customers.csv` has a tier for three of the four customers (`di` has none, so a LEFT join gives it a
+NULL tier). The WHERE goes below the join, and the join is a hash join on its key:
+
+```bash
+./target/release/quarry query -t examples/orders.csv -t examples/customers.csv "SELECT c.tier, count(*) AS orders, sum(o.total) AS spent FROM orders o LEFT JOIN customers c ON o.customer = c.customer WHERE o.status <> 'cancelled' GROUP BY c.tier ORDER BY c.tier"
+```
+
+```
++--------+--------+--------+
+| tier   | orders | spent  |
++--------+--------+--------+
+| gold   | 3      | 202.85 |
+| silver | 3      | 287.0  |
+| NULL   | 1      | 9.99   |
++--------+--------+--------+
+3 rows
+```
+
+```
+Sort: c.tier ASC NULLS LAST
+  Projection: c.tier, count(*) AS orders, sum(o.total) AS spent
+    Aggregate: group_by=[c.tier] aggregates=[count(*), sum(o.total)]
+      HashJoin: Left keys=[o.customer = c.customer]
+        Filter: o.status <> 'cancelled'
+          Scan: orders AS o projection=[customer, status, total]
+        Scan: customers AS c projection=[customer, tier]
+```
+
+(the second block is the same query under `EXPLAIN`).
 
 A query that doesn't make sense fails before anything is read, with status 1:
 
