@@ -54,7 +54,7 @@ providers exist:
 - **`ParquetTable`** reads a Parquet file with the `parquet` crate's Arrow reader. The schema comes from the file's
   footer. A projection becomes a `ProjectionMask` over the file's root columns, so unread columns are never
   decompressed. The footer's row groups (row count, and each column's min, max and null count when the writer
-  recorded them) are kept in `statistics()`; day 3's predicate pushdown skips row groups with them.
+  recorded them) are read when a scan has filters, to skip row groups ("Row-group pruning" below).
 - **`CsvTable`** reads a CSV file with `arrow-csv`. The file must have a header row. The schema is inferred from the
   first 1,000 rows by default: a column is `Int64` if every non-empty value parses as an integer, `Float64` if every
   value parses as a number, `Boolean` for `true`/`false`, `Date32` for `YYYY-MM-DD` when every one is a real
@@ -340,7 +340,47 @@ every query bound and optimized, at every batch size, and requires the same rows
    only row counts. Projections and aggregates keep all their outputs (an unused one is still computed), so only
    scans drop columns. It runs last because it renumbers.
 
+Predicate pushdown also hands a filter's conjuncts to the scan below it, when its table can use them
+(`TableProvider::uses_filters`: Parquet files), as `Scan.filters` over the table's own column numbers. The filter
+stays: a scan's filters only let it skip data, never decide a row.
+
 `EXPLAIN` (in `quarry query`) prints the optimized plan, which is what runs; `quarry plan` prints the bound plan.
+
+## Row-group pruning
+
+`ParquetTable::scan_filtered` reads only the row groups that can hold a row its filters keep, judged from the footer's
+statistics (each column's min, max and null count per row group; `datasource/pruning.rs`). Each filter is rewritten
+into a condition on the statistics, over a batch with one row per row group:
+
+| Filter on column `x` (or a widening cast of it), constant `v` | Can hold in a row group only if |
+|---|---|
+| `x < v`, `x <= v` | `min(x) < v`, `min(x) <= v` |
+| `x > v`, `x >= v` | `max(x) > v`, `max(x) >= v` |
+| `x = v` | `min(x) <= v AND max(x) >= v` |
+| `x <> v` | `NOT (min(x) = v AND max(x) = v)` |
+| `x IN (v1, v2)` | the `=` conditions, ORed |
+| `x IS NULL`, `x IS NOT NULL` | `nulls(x) > 0`, `nulls(x) < rows` |
+| `a AND b` | both conditions; one alone if the other is unknown |
+| `a OR b` | both conditions ORed; unknown if either is |
+
+The condition is evaluated by the engine's own evaluator, so it compares exactly as the filter will (strings by
+bytes, -0.0 as 0.0, a cast as the filter casts), and a row group is skipped only where it is FALSE: a missing
+statistic is NULL and keeps the group, and so does any filter the table above doesn't cover (`x + 1 > 9`, `NOT`,
+`LIKE`) and any error (a constant that fails). The casts allowed keep order: an integer to BIGINT or DOUBLE, a REAL
+to a DOUBLE (`CAST(i AS DOUBLE) > 7.5` uses `CAST(max(i) AS DOUBLE)`).
+
+**Floats.** Parquet writers leave NaN out of min and max (parquet-rs does, once a row group has a non-NaN value), and
+NaN is the greatest value here, so a row group whose max is 1.0 may hold a NaN that `x > 5.0` keeps. For a float
+column only `<`, `<=` and `=` with a number use the statistics (NaN satisfies none of them, except `<=` against a NaN,
+which the min can't rule out). A NaN statistic (a row group of only NaNs, or a writer that does count them) is
+treated as missing.
+
+Pruning is never needed for a right answer, so the test is that it changes none: `tests/pruning.rs` writes random rows
+(NULLs, -0.0, NaNs, strings, dates, an INT column) in row groups of 1-4 rows and requires random filters to give the
+same rows optimized (pruned) and bound (every row group read); six mutants of the rewrite (`>` allowed on floats, an
+operand flip lost, `=` made strict, `<>` and `OR` weakened, IS NOT NULL against the wrong column) each fail it.
+Examples pin what is skipped on an ordered file.
+
 
 ## The days
 

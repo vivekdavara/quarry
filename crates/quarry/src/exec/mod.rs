@@ -88,7 +88,13 @@ fn rows(n: usize) -> RecordBatchOptions {
 /// plan expressions refer to columns by index, and `execute` puts the plan's names on the result.
 fn stream(plan: &LogicalPlan, batch_size: usize) -> Result<BatchIter> {
     match plan {
-        LogicalPlan::Scan(s) => s.provider.scan(s.projection.as_deref(), batch_size),
+        LogicalPlan::Scan(s) if s.filters.is_empty() => {
+            s.provider.scan(s.projection.as_deref(), batch_size)
+        }
+        LogicalPlan::Scan(s) => {
+            s.provider
+                .scan_filtered(s.projection.as_deref(), &s.filters, batch_size)
+        }
         LogicalPlan::Empty(e) => {
             let batches = if e.one_row {
                 vec![Ok(RecordBatch::try_new_with_options(

@@ -33,6 +33,19 @@ pub(super) fn push_predicates(plan: &LogicalPlan) -> Result<LogicalPlan> {
                     .expect("two conjuncts");
                 push_predicates(&filter((*inner.input).clone(), Some(merged)))
             }
+            LogicalPlan::Scan(scan) if scan.provider.uses_filters() => {
+                // The scan gets the conjuncts too, over the table's columns, to skip data by (Parquet row groups by
+                // their statistics); the filter stays and checks every row.
+                let table = |i: usize| scan.projection.as_ref().map_or(i, |p| p[i]);
+                let mut scan = scan.clone();
+                scan.filters.extend(
+                    f.predicate
+                        .conjuncts()
+                        .into_iter()
+                        .map(|c| c.map_columns(&table)),
+                );
+                Ok(filter(LogicalPlan::Scan(scan), Some(f.predicate.clone())))
+            }
             _ => {
                 let input = push_predicates(&f.input)?;
                 Ok(filter(input, Some(f.predicate.clone())))

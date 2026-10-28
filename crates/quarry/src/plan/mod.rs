@@ -153,8 +153,12 @@ pub struct Scan {
     /// The name the query knows the table by: its alias, or its name.
     pub qualifier: String,
     pub provider: Arc<dyn TableProvider>,
-    /// The table's columns to read, if not all (set by day 3's projection pushdown).
+    /// The table's columns to read, if not all (set by the optimizer's projection pushdown).
     pub projection: Option<Vec<usize>>,
+    /// Conditions over the table's columns (numbered as in the table, not the projection) that the provider may use
+    /// to skip data no row of which they keep, such as Parquet row groups (set by the optimizer's predicate
+    /// pushdown). A filter above the scan still checks every row.
+    pub filters: Vec<Expr>,
     pub schema: PlanSchemaRef,
 }
 
@@ -232,6 +236,7 @@ impl LogicalPlan {
             qualifier: qualifier.to_string(),
             provider,
             projection: None,
+            filters: vec![],
             schema,
         })
     }
@@ -462,6 +467,15 @@ impl LogicalPlan {
                         .map(|&i| table.field(i).name().as_str())
                         .collect();
                     write!(f, " projection=[{}]", names.join(", "))?;
+                }
+                if !s.filters.is_empty() {
+                    let table = PlanSchema::from_arrow(&s.qualifier, &s.provider.schema());
+                    let filters: Vec<String> = s
+                        .filters
+                        .iter()
+                        .map(|e| e.display(&table).to_string())
+                        .collect();
+                    write!(f, " filters=[{}]", filters.join(", "))?;
                 }
                 Ok(())
             }

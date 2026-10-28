@@ -3,6 +3,7 @@
 mod csv_table;
 mod mem_table;
 mod parquet_table;
+mod pruning;
 
 use std::fmt::Debug;
 
@@ -10,6 +11,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
 use crate::error::{QuarryError, Result};
+use crate::plan::Expr;
 
 pub use csv_table::{CsvOptions, CsvTable};
 pub use mem_table::MemTable;
@@ -29,6 +31,26 @@ pub trait TableProvider: Send + Sync + Debug {
     /// Reads the table. With a projection, each batch holds only those columns of [`schema`](Self::schema), in the
     /// projection's order (an index may repeat); without one, every column. A batch holds at most `batch_size` rows.
     fn scan(&self, projection: Option<&[usize]>, batch_size: usize) -> Result<BatchIter>;
+
+    /// Reads the table as [`scan`](Self::scan) does, but may leave out rows for which one of `filters` (boolean
+    /// expressions over the table's columns, numbered as in [`schema`](Self::schema)) can't be TRUE. It may also
+    /// return them all: the plan still filters every row a scan returns. A Parquet file skips row groups by their
+    /// statistics; other tables ignore the filters (and say so in [`uses_filters`](Self::uses_filters)).
+    fn scan_filtered(
+        &self,
+        projection: Option<&[usize]>,
+        filters: &[Expr],
+        batch_size: usize,
+    ) -> Result<BatchIter> {
+        let _ = filters;
+        self.scan(projection, batch_size)
+    }
+
+    /// Whether [`scan_filtered`](Self::scan_filtered) can skip anything; the optimizer gives filters only to tables
+    /// that can.
+    fn uses_filters(&self) -> bool {
+        false
+    }
 
     /// What the table knows about itself without reading its data.
     fn statistics(&self) -> TableStatistics;
