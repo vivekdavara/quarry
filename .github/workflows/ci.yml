@@ -41,10 +41,10 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-
       - name: Format, Clippy with warnings as errors, tests, docs without broken links
         run: make check
-      - name: The property tests (binder, evaluator, GROUP BY and ORDER BY, joins, pruning) at 100,000 cases each (release build)
+      - name: The property tests (binder, evaluator, GROUP BY and ORDER BY, joins, pruning, whole queries optimized) at 100,000 cases each (release build)
         if: runner.os == 'Linux'
         run: >-
           cargo test --release --locked -p quarry
-          --test binder_properties --test eval_properties --test query_properties --test join_properties --test pruning
+          --test binder_properties --test eval_properties --test query_properties --test join_properties --test pruning --test optimizer_properties
         env:
           PROPTEST_CASES: "100000"

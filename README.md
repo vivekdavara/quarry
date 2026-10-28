@@ -79,7 +79,8 @@ crates/quarry/          the engine (a library)
   src/optimizer/        the rules: constant folding (fold.rs), predicate pushdown (predicates.rs), projection
                         pushdown (columns.rs)
   tests/                datasource.rs, binder.rs, binder_properties.rs, execute.rs, eval_properties.rs,
-                        query_properties.rs, join_properties.rs, optimizer.rs, pruning.rs, skipped_errors.rs
+                        query_properties.rs, join_properties.rs, optimizer.rs, optimizer_properties.rs,
+                        pruning.rs, skipped_errors.rs
   examples/             gen_orders.rs (synthetic Parquet data), time_queries.rs (the timings below)
 scripts/duckdb_times.py the same timings in DuckDB, for scale
 crates/quarry-cli/      the `quarry` binary and its tests
@@ -168,6 +169,7 @@ it on Linux (ubuntu-24.04) and macOS (macos-15) on every push.
 | `tests/optimizer.rs` (4) | what each rule does to the printed plan: scans narrowed (`count(*)` reads no column), constants folded and failing ones kept, AND/OR simplified, conditions moved below inner and LEFT joins |
 | `tests/pruning.rs` (4) | random rows in Parquet row groups of 1-4 rows under random filters give the same rows pruned and unpruned; which row groups an ordered file skips, floats included; EXPLAIN's scan filters |
 | `tests/skipped_errors.rs` (3) | the documented cases where the optimized plan succeeds and the bound one fails, as on DuckDB 2.0: a pruned row group's bad row, a pushed-down condition that is NULL, an unread CSV column that doesn't parse |
+| `tests/optimizer_properties.rs` (1) | random whole queries (comma, inner and LEFT joins; WHERE with constants, comparisons, OR, NOT, IS NULL; GROUP BY or expressions; ORDER BY; LIMIT) give the same rows in the same order bound and optimized |
 | unit tests (32) | the common-type rules, date parsing over every day from 1600 to 2400 and against Arrow's own cast, expression printing, the plan nodes' guards and schemas; each operator of the evaluator, with DuckDB 2.0's answers; constant folding; which ON conjuncts become join keys |
 | `quarry-cli/tests/cli.rs` (9) | the built binary: output, exit codes, errors on stderr, `quarry query`, and that this README's examples print what it says |
 
