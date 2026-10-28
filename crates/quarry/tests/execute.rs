@@ -372,6 +372,19 @@ fn a_limit_over_a_projection_computes_only_the_rows_it_keeps() {
 }
 
 #[test]
+fn a_top_k_whose_limit_and_offset_add_past_the_largest_count_keeps_everything_after_the_offset() {
+    // The top-k keeps skip + fetch rows, added saturating: wrapping round would keep none (the day-3 review's case).
+    assert_eq!(
+        run("SELECT id FROM orders ORDER BY id DESC LIMIT 18446744073709551615 OFFSET 4"),
+        table(&[&["2"], &["1"]])
+    );
+    assert_eq!(
+        run("SELECT id FROM orders ORDER BY id LIMIT 2 OFFSET 18446744073709551615"),
+        table(&[])
+    );
+}
+
+#[test]
 fn limit_stops_reading() {
     let mut c = Catalog::new();
     c.register("t", Arc::new(FailsAfterOneBatch)).unwrap();

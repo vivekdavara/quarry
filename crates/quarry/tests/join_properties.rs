@@ -52,6 +52,10 @@ enum Conjunct {
     ValueLess,
     LeftValueAbove(i64),
     RightValueAbove(i64),
+    /// TRUE on a LEFT join's unmatched rows, so a WHERE with it tells LEFT from INNER.
+    RightValueNull,
+    /// TRUE on an unmatched row when `a.v > n`.
+    EitherValueAbove(i64),
     Constant(bool),
 }
 
@@ -64,6 +68,8 @@ impl Conjunct {
             Conjunct::ValueLess => "a.v < b.v".into(),
             Conjunct::LeftValueAbove(n) => format!("a.v > {n}"),
             Conjunct::RightValueAbove(n) => format!("b.v > {n}"),
+            Conjunct::RightValueNull => "b.v IS NULL".into(),
+            Conjunct::EitherValueAbove(n) => format!("(a.v > {n} OR b.v > {n})"),
             Conjunct::Constant(c) => (if c { "TRUE" } else { "FALSE" }).into(),
         }
     }
@@ -77,6 +83,13 @@ impl Conjunct {
             Conjunct::ValueLess => Some(a.2? < b.2?),
             Conjunct::LeftValueAbove(n) => Some(a.2? > n),
             Conjunct::RightValueAbove(n) => Some(b.2? > n),
+            Conjunct::RightValueNull => Some(b.2.is_none()),
+            // SQL's OR: TRUE if either is TRUE, else NULL if either is NULL, else FALSE.
+            Conjunct::EitherValueAbove(n) => match (a.2.map(|v| v > n), b.2.map(|v| v > n)) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            },
             Conjunct::Constant(c) => Some(c),
         }
     }
@@ -90,6 +103,8 @@ fn conjuncts() -> impl Strategy<Value = Vec<Conjunct>> {
         2 => Just(Conjunct::ValueLess),
         1 => proptest::sample::select(VALUES).prop_map(Conjunct::LeftValueAbove),
         1 => proptest::sample::select(VALUES).prop_map(Conjunct::RightValueAbove),
+        1 => Just(Conjunct::RightValueNull),
+        1 => proptest::sample::select(VALUES).prop_map(Conjunct::EitherValueAbove),
         1 => any::<bool>().prop_map(Conjunct::Constant),
     ];
     proptest::collection::vec(one, 1..4)
