@@ -4,11 +4,11 @@ A SQL query engine over Parquet and CSV files, written in Rust on Apache Arrow (
 resolves every name and type against the files' schemas, builds a logical plan, and executes it with vectorized
 operators over Arrow record batches.
 
-**Status: day 2 of 5.** The readers, the catalog, the logical plan, the binder (SQL to a typed plan) and the
-executor (filter, projection, aggregate with GROUP BY and DISTINCT, sort, limit, and vectorized expressions) are done
-and tested; `quarry query` runs a query over files. Joins bind but don't run yet. Day 3 adds hash joins, predicate
-pushdown and optimizer rules; day 4 TPC-H-style queries checked against DuckDB, and benchmarks; day 5 a REPL and the
-release.
+**Status: day 3 of 5.** The readers, the catalog, the logical plan, the binder (SQL to a typed plan), the executor
+(filter, projection, aggregate with GROUP BY and DISTINCT, sort and top-k, limit, hash and nested-loop joins, and
+vectorized expressions) and the optimizer (constant folding, predicate pushdown through joins and into Parquet row
+groups, projection pushdown) are done and tested; `quarry query` runs a query over files. Day 4 adds TPC-H-style
+queries checked against DuckDB, and benchmarks; day 5 a REPL and the release.
 
 ## Why
 
@@ -25,8 +25,8 @@ flowchart LR
     parser --> binder["binder<br/>(names, types, aggregates)"]
     catalog[("catalog")] --> binder
     binder --> logical["LogicalPlan"]
-    logical --> opt["optimizer<br/>(day 3)"]
-    opt --> exec["vectorized operators<br/>(day 2; joins day 3)"]
+    logical --> opt["optimizer<br/>(fold, push down)"]
+    opt --> exec["vectorized operators"]
     files[("Parquet / CSV")] --> catalog
     files --> exec
     exec --> batches["Arrow RecordBatches"]
@@ -49,6 +49,18 @@ flowchart LR
   zero. Overflow, `% 0` and failed casts are errors, as in DuckDB 2.0.
 - **Aggregation** (`exec/aggregate.rs`): group keys encoded in Arrow's row format and hashed; one accumulator per
   aggregate (integer sums in i128); `DISTINCT` by remembering (group, value) pairs.
+- **Joins** (`exec/join.rs`, day 3): a hash join on `ON`'s equalities (the right input built into a table keyed by
+  Arrow's row format, floats normalized, NULL keys matching nothing; the left streaming through it), a nested loop
+  when there are none; the rest of `ON` is computed only on candidate pairs. Output in the left input's order at any
+  batch size, a LEFT join's unmatched rows in place.
+- **Optimizer** (`optimizer/`, day 3): constant folding that leaves failing constants to fail lazily; predicate
+  pushdown that moves conditions below joins to the side they read (a comma join with an equality becomes a hash
+  join) and hands them to Parquet scans; projection pushdown that narrows each scan to the columns used above it.
+- **Row-group pruning** (`datasource/pruning.rs`, day 3): a scan's filters rewritten into conditions on each row
+  group's min, max and null count, evaluated by the engine's own evaluator; a group is skipped only where that is
+  FALSE, and the filter still checks every row read.
+- **Top-k** (`exec/mod.rs`, day 3): `ORDER BY ... LIMIT k` keeps the best `k` rows by partial sorts of `2k`, never
+  sorting the whole input.
 
 DESIGN.md is the specification: the type rules, name resolution, each node, the eight binding steps, and execution
 (each rule where engines differ, checked on DuckDB 2.0).
@@ -57,14 +69,17 @@ DESIGN.md is the specification: the type rules, name resolution, each node, the 
 
 ```
 crates/quarry/          the engine (a library)
-  src/datasource/       TableProvider; Parquet, CSV and in-memory tables
+  src/datasource/       TableProvider; Parquet, CSV and in-memory tables; row-group pruning (pruning.rs)
   src/catalog.rs        table names to tables
   src/types.rs          type classes, the common-type rules, strict dates
   src/plan/             LogicalPlan, bound Expr, printing
   src/sql/              parsing and the binder
-  src/exec/             the executor: operators (mod.rs), expressions (expr.rs), aggregation (aggregate.rs)
+  src/exec/             the executor: operators and top-k (mod.rs), expressions (expr.rs), aggregation
+                        (aggregate.rs), joins (join.rs)
+  src/optimizer/        the rules: constant folding (fold.rs), predicate pushdown (predicates.rs), projection
+                        pushdown (columns.rs)
   tests/                datasource.rs, binder.rs, binder_properties.rs, execute.rs, eval_properties.rs,
-                        query_properties.rs
+                        query_properties.rs, join_properties.rs, optimizer.rs, pruning.rs
   examples/             gen_orders.rs (synthetic Parquet data), time_queries.rs (the timings below)
 scripts/duckdb_times.py the same timings in DuckDB, for scale
 crates/quarry-cli/      the `quarry` binary and its tests
@@ -146,10 +161,13 @@ it on Linux (ubuntu-24.04) and macOS (macos-15) on every push.
 | `tests/datasource.rs` (22) | Parquet and CSV files written in the test read back equal; projections in any order and with repeats; empty projections still count rows; batch sizes (0 included); inferred CSV types, NULLs, timestamps and impossible dates; the catalog's names |
 | `tests/binder.rs` (41) | each binding rule in DESIGN.md: the printed plan, or the error and its message; the review's findings; the depth limit on a 2 MiB stack |
 | `tests/binder_properties.rs` (3) | random expressions against a model of the type rules (below) |
-| `tests/execute.rs` (18) | queries end to end at batch sizes 1, 2, 3 and 8192 (which must agree): filters, projections, ORDER BY (NULLs, -0.0, ties, hidden keys), LIMIT/OFFSET, that a LIMIT stops reading and computes only its rows, every aggregate, GROUP BY expressions, HAVING, DISTINCT, aggregates over no rows, float groups, i128 sums, errors; the same queries over CSV and Parquet files |
+| `tests/execute.rs` (26) | queries end to end at batch sizes 1, 2, 3 and 8192, each run as bound and as optimized (all eight runs must agree, rows or error): filters, projections, ORDER BY (NULLs, -0.0, ties, hidden keys), LIMIT/OFFSET, that a LIMIT stops reading and computes only its rows, every aggregate, GROUP BY expressions, HAVING, DISTINCT, aggregates over no rows, float groups, i128 sums, errors; inner, LEFT and cross joins (order, NULL and float keys, casts, residuals, empty sides, three tables); the same queries over CSV and Parquet files |
 | `tests/eval_properties.rs` (3) | random well-typed expressions over random rows, evaluated by the engine and by a row-at-a-time reference interpreter in the test (below) |
 | `tests/query_properties.rs` (3) | random GROUP BY queries, and random ORDER BY with LIMIT and OFFSET, at random batch sizes against a reference grouping and a stable sort in plain Rust |
-| unit tests (29) | the common-type rules, date parsing over every day from 1600 to 2400 and against Arrow's own cast, expression printing, the plan nodes' guards and schemas; each operator of the evaluator, with DuckDB 2.0's answers |
+| `tests/join_properties.rs` (1) | random INNER and LEFT joins of two random tables on random `ON`s (key equalities, comparisons, one-sided conditions, constants) at batch sizes 1-7, row for row against a nested loop in plain Rust with SQL's three-valued `AND` |
+| `tests/optimizer.rs` (4) | what each rule does to the printed plan: scans narrowed (`count(*)` reads no column), constants folded and failing ones kept, AND/OR simplified, conditions moved below inner and LEFT joins |
+| `tests/pruning.rs` (4) | random rows in Parquet row groups of 1-4 rows under random filters give the same rows pruned and unpruned; which row groups an ordered file skips, floats included; EXPLAIN's scan filters |
+| unit tests (30) | the common-type rules, date parsing over every day from 1600 to 2400 and against Arrow's own cast, expression printing, the plan nodes' guards and schemas; each operator of the evaluator, with DuckDB 2.0's answers; constant folding |
 | `quarry-cli/tests/cli.rs` (9) | the built binary: output, exit codes, errors on stderr, `quarry query`, and that this README's examples print what it says |
 
 The property tests bind `SELECT <expr> FROM t` for expressions from two generators (a random grammar of every
@@ -270,12 +288,31 @@ property then found one more bug itself: `-(-0)` printed as `-0`, which binds ba
   silently missing values; it also keeps the plan's nullability honest.
 - **Group by bytes.** Arrow's row format turns any combination of key columns into one comparable, hashable byte
   string, so grouping, DISTINCT and MIN/MAX each have one implementation for every type, not one per type.
+- **Join keys by the same bytes**, with one row converter for both sides, so a join's equality is GROUP BY's: -0.0
+  meets 0.0, NaN meets NaN, NULL meets nothing.
+- **A defined join order.** The output follows the left input, each row's matches in build order, a LEFT join's
+  unmatched rows in place, at every batch size; it costs a little bookkeeping (`done_rows`) and lets every join test
+  compare rows in order.
+- **Optimizer rules that keep the schema**, checked by running every test query with and without them: a rule that
+  changes rows fails a hundred existing tests, not one new one.
+- **Pruning as a hint, evaluated by the engine.** Scans get the filters but the filter node stays, and the statistics
+  conditions run through the same evaluator as the query, so pruning can only be too cautious, never differently
+  typed or ordered than the filter; random data checks it can't drop a row.
 
-## Limitations (day 2)
+## Limitations (day 3)
 
-- Joins bind but don't run (day 3). Sort sorts its whole input even under a LIMIT (day 3's top-k), and sort and
-  aggregate hold their whole input or all groups in memory; there is no spilling to disk, and one thread does all
-  the work.
+- Sort and aggregate hold their whole input or all groups in memory, and a join its whole right input; there is no
+  spilling to disk, and one thread does all the work. The right input is always the build side (no join reordering,
+  no choice of the smaller side), and `RIGHT`/`FULL` joins aren't supported.
+- Predicate pushdown moves a condition onto rows its original place wouldn't have computed it for, so a condition
+  that fails on some row can fail where the unoptimized plan didn't (DESIGN.md, "The optimizer"); DuckDB 2.0 does
+  the same. Conjuncts are computed in their written order: `WHERE 1 % 0 = 0 AND id > 100` fails here, where DuckDB
+  reorders it and returns no rows.
+- Row-group pruning uses the footer's per-row-group min, max and null counts only (no page index, no Bloom filters,
+  nothing for CSV), and trusts them: a file whose writer recorded wrong statistics can give wrong answers. For float
+  columns only `<`, `<=` and `=` with a number prune.
+- Projection pushdown narrows scans only: a projection item nothing uses is still computed. Conditions don't move
+  through aggregates (a HAVING on a group key) or projections.
 - Where Arrow's kernels and DuckDB differ in details not covered by DESIGN.md's table, Quarry follows Arrow: string to
   number casts don't trim spaces (`CAST(' 12' AS INT)` fails; DuckDB gives 12), floats print as Arrow prints them.
 - `SUM` of integers is an Int64 and fails past it (DuckDB returns a 128-bit integer); dates end at Date32's range,
@@ -286,9 +323,10 @@ property then found one more bug itself: `-(-0)` printed as `-0`, which binds ba
 - The binder allows any cast Arrow can do (`CAST(d AS INT)`, `CAST(7 AS DATE)`), several of which DuckDB refuses,
   and `%` takes integers only (DuckDB computes `5.5 % 2`).
 - An error in a WHERE under a LIMIT can depend on the batch size (DESIGN.md, "Execution"); DuckDB's can too. Under
-  `ORDER BY ... LIMIT`, every select item is computed for every row, where DuckDB computes some after its top-N.
-- No subqueries, `WITH`, `UNION`, window functions, `RIGHT`/`FULL` joins, intervals, or scalar functions other
-  than `CAST`; each is a clear `Unsupported` error.
+  `ORDER BY ... LIMIT`, every select item is computed for every row before the top-k, where DuckDB computes some
+  after its top-N.
+- No subqueries, `WITH`, `UNION`, window functions, intervals, or scalar functions other than `CAST`; each is a clear
+  `Unsupported` error.
 - No decimal, timestamp or `UInt64` arithmetic: such columns can be selected but not computed on.
 - CSV schemas are inferred from the first 1,000 rows by default; a later value of another type fails the scan that
   reaches it (`CsvOptions { infer_rows: None, .. }` reads the whole file to infer).
