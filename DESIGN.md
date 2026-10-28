@@ -296,7 +296,9 @@ DuckDB by hand:
 **Aggregation.** Rows are grouped by their group keys encoded in Arrow's row format: bytes that compare and hash as
 the values do, for any types and any number of keys, so one `HashMap<bytes, group number>` is the whole grouping (the
 floats normalized first, so -0.0 and 0.0 are one group and NaNs another, as in DuckDB; NULL is a group of its own).
-The key a group outputs is its first row's, as it was.
+The key a group outputs is its first row's, as it was. The hash tables (here, in DISTINCT and in joins) hash with
+`ahash`, seeded per process, rather than std's SipHash: on the 10M-row timings it took GROUP BY status from 372 to 298
+ms and the join from 808 to 623 ms (README, "Results (day 3)").
 Each aggregate keeps an accumulator with a slot per group:
 
 | Aggregate | State per group | Result |

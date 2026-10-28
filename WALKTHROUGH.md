@@ -304,6 +304,40 @@ them, so the cost per input row stays bounded however large `k` is (a row that s
 in every cut). Without the buffering, cutting back after every batch would re-sort the `k` kept rows each time, which
 is quadratic for a large `k`.
 
+**Why ahash rather than the standard library's hasher?**
+A `sample` of the join query showed SipHash in about 18% of the stacks: std's `HashMap` defaults to SipHash, which
+is built to resist an attacker choosing keys that collide (HashDoS), at a cost per byte. GROUP BY, DISTINCT and the
+join all hash row-format keys through the same kind of map, so switching their `BuildHasher` to `ahash::RandomState`
+(already in the build through Arrow, and still randomly seeded per process) was a two-line change per table; it took
+GROUP BY status from 372 to 298 ms and the join from 808 to 623 ms on 10 million rows.
+
+**What do the numbers say is left?**
+The join is still 6x one-thread DuckDB and string-heavy queries 3-22x. Those aren't profiled beyond that one sample;
+day 4's benchmarks are where to find out (one hypothesis: Quarry decodes every string from Parquet's dictionary
+encoding before comparing, where comparing dictionary codes would be cheaper).
+
+## What went wrong on day 3
+
+- **I wrote a DuckDB claim I hadn't checked.** The first join commit's test and DESIGN.md said DuckDB, like Quarry's
+  hash join, never computes a failing residual for a customer no order names. Probing DuckDB 2.0 while designing
+  predicate pushdown showed it fails that query: it pushes the one-sided condition below the join. The test was
+  rewritten around the bound and optimized plans and the claim corrected in the optimizer commit. Lesson: check the
+  oracle before writing "as in DuckDB", every time.
+- **Several of my expected test results were wrong, not the engine.** Five expectations in the first join and
+  optimizer tests (a `qty = rank` match; `12 % (c.rank - 4) = 0`, which holds for every rank from 1 to 3 and so
+  filtered nothing; a two-key join; the name a select item gets; the binder's `__order_0`) were my arithmetic or
+  memory. Each failing case was checked by hand
+  against the data before the expectation changed.
+- **The optimizer can make a failing query succeed, and the docs only described the opposite.** The first review
+  found three cases (a skipped row group, a pushed-down condition that is NULL, an unread CSV column); DuckDB does the
+  same in each, so they're documented exceptions now, pinned by `tests/skipped_errors.rs`.
+- **A property test can't see a bug its generator never makes matter.** The join property drew only WHERE conjuncts
+  that are NULL on a LEFT join's unmatched rows, so a LEFT join rewritten as INNER passed 20,000 cases. The second
+  review found it; two conjuncts that keep unmatched rows (`b.v IS NULL`, an `OR`) fixed it.
+- **The disk filled up.** At 11:00 the linker failed with "No space left on device": 115,000 leftover `.rcgu.o`
+  object files in `target/debug/deps` plus two review worktrees whose `target/` were APFS clones of the main one.
+  Removing a worktree and the leftovers got 4 GB back; nothing in the repo changed because of it.
+
 ## What went wrong on day 2
 
 **What did the review find?**
