@@ -304,6 +304,22 @@ them, so the cost per input row stays bounded however large `k` is (a row that s
 in every cut). Without the buffering, cutting back after every batch would re-sort the `k` kept rows each time, which
 is quadratic for a large `k`.
 
+**How do you know whether a join ran as a hash join?**
+`EXPLAIN` in `quarry query` prints `exec::explain` of the optimized plan, which makes the executor's own choices: a
+join with keys is `HashJoin: Inner keys=[o.customer = c.customer] residual=...`, one without is `NestedLoopJoin`, and
+a sort a LIMIT reaches is `TopK: k=...`. There is no separate physical plan type: the executor picks each node's
+operator while building the stream, `explain` calls the same `split_condition` and `same_types`, and
+`tests/optimizer.rs` pins each case.
+
+**How do you test an optimizer?**
+By requiring that it changes nothing but speed. Every query in `execute.rs` runs bound and optimized at four batch
+sizes and must give the same rows or the same error; the evaluator, GROUP BY, ORDER BY and join properties compare
+both plans with their references; and `optimizer_properties.rs` generates whole queries (joins, WHERE with folding
+constants and OR/NOT, GROUP BY, ORDER BY, LIMIT) and requires identical rows in identical order, 100,000 cases in CI.
+The exact order holds because every rule keeps its node's input order, and a hash join's order equals the filtered
+nested loop it replaces; that's what let a reversed build order be caught. What the rules may change, which
+errors happen, is listed in DESIGN.md and pinned by `skipped_errors.rs`.
+
 **Why ahash rather than the standard library's hasher?**
 A `sample` of the join query showed SipHash in about 18% of the stacks: std's `HashMap` defaults to SipHash, which
 is built to resist an attacker choosing keys that collide (HashDoS), at a cost per byte. GROUP BY, DISTINCT and the
