@@ -79,7 +79,7 @@ crates/quarry/          the engine (a library)
   src/optimizer/        the rules: constant folding (fold.rs), predicate pushdown (predicates.rs), projection
                         pushdown (columns.rs)
   tests/                datasource.rs, binder.rs, binder_properties.rs, execute.rs, eval_properties.rs,
-                        query_properties.rs, join_properties.rs, optimizer.rs, pruning.rs
+                        query_properties.rs, join_properties.rs, optimizer.rs, pruning.rs, skipped_errors.rs
   examples/             gen_orders.rs (synthetic Parquet data), time_queries.rs (the timings below)
 scripts/duckdb_times.py the same timings in DuckDB, for scale
 crates/quarry-cli/      the `quarry` binary and its tests
@@ -167,6 +167,7 @@ it on Linux (ubuntu-24.04) and macOS (macos-15) on every push.
 | `tests/join_properties.rs` (1) | random INNER and LEFT joins of two random tables on random `ON`s (key equalities, comparisons, one-sided conditions, constants) at batch sizes 1-7, row for row against a nested loop in plain Rust with SQL's three-valued `AND` |
 | `tests/optimizer.rs` (4) | what each rule does to the printed plan: scans narrowed (`count(*)` reads no column), constants folded and failing ones kept, AND/OR simplified, conditions moved below inner and LEFT joins |
 | `tests/pruning.rs` (4) | random rows in Parquet row groups of 1-4 rows under random filters give the same rows pruned and unpruned; which row groups an ordered file skips, floats included; EXPLAIN's scan filters |
+| `tests/skipped_errors.rs` (3) | the documented cases where the optimized plan succeeds and the bound one fails, as on DuckDB 2.0: a pruned row group's bad row, a pushed-down condition that is NULL, an unread CSV column that doesn't parse |
 | unit tests (30) | the common-type rules, date parsing over every day from 1600 to 2400 and against Arrow's own cast, expression printing, the plan nodes' guards and schemas; each operator of the evaluator, with DuckDB 2.0's answers; constant folding |
 | `quarry-cli/tests/cli.rs` (9) | the built binary: output, exit codes, errors on stderr, `quarry query`, and that this README's examples print what it says |
 
@@ -187,33 +188,72 @@ the batch must give the same as the whole. The GROUP BY property does the same f
 two of four columns; one to four aggregates, each maybe DISTINCT) against a grouping in plain Rust. Twelve mutations
 of the engine (six in the evaluator, six in aggregation) each fail one of them. CI runs both at 100,000 cases.
 
-## Results (day 2)
+## Results (day 3)
 
-Seven queries over 10,000,000 synthetic orders in one Parquet file (75 MB, zstd, 10 row groups), each run in process
-once to warm up and then five times; the median, at commit `5d4ef95`. Apple M3, macOS 26.6.2, Rust 1.99.0 release
-build, on battery (Low Power Mode off), 2026-10-27; no run had the machine asleep. One thread.
+Nine queries over 10,000,000 synthetic orders in one Parquet file (75 MB, zstd, 10 row groups of 2^20 rows,
+`order_id` ascending) and, for the join, a 10,000-row customers file; each run in process once to warm up and then
+five times, the median. Three builds on the same files, one right after another (11:02 to 11:03): day 2's commit
+`205744f`, and today's `ebcb192` run with `--bound` (the plan as bound: today's top-k and join operators, no
+optimizer) and optimized (all of day 3). Apple M3, macOS 26.6.2, Rust 1.99.0 release build, on battery (Low Power
+Mode off), 2026-10-28; no run had the machine asleep. One thread. DuckDB 2.0.0 on the same files at 10:48
+(`scripts/duckdb_times.py`, median of five after a warm-up), for scale; both engines gave the same answers to all
+nine queries, the float sums to the last digit.
 
 ```bash
-cargo run --release -p quarry --example gen_orders -- 10000000 data/orders_10m.parquet
-cargo run --release -p quarry --example time_queries -- data/orders_10m.parquet 5
+cargo run --release -p quarry --example gen_orders -- 10000000 data/orders_10m.parquet data/customers.parquet
+cargo run --release -p quarry --example time_queries -- data/orders_10m.parquet 5 --customers data/customers.parquet
+cargo run --release -p quarry --example time_queries -- data/orders_10m.parquet 5 --customers data/customers.parquet --bound
+python scripts/duckdb_times.py data/orders_10m.parquet data/customers.parquet
 ```
 
-| Query | Quarry | Rows/s | DuckDB 2.0, 1 thread | DuckDB, 8 threads |
-|---|---|---|---|---|
-| `count(*)` | 217.5 ms | 46 M | 0.2 ms | 0.3 ms |
-| filter (`status = 'shipped' AND total > 500`) + count | 508.9 ms | 20 M | 84.8 ms | 22.1 ms |
-| GROUP BY status (3 groups): count, sum, avg | 481.4 ms | 21 M | 97.5 ms | 24.6 ms |
-| filter, GROUP BY customer (10,000 groups), top 5 | 314.5 ms | 32 M | 86.5 ms | 24.1 ms |
-| filter, `sum(total * qty)`, `avg(qty * 2 + 1)` | 263.1 ms | 38 M | 85.3 ms | 23.1 ms |
-| `count(DISTINCT customer)` | 682.3 ms | 15 M | 17.9 ms | 5.9 ms |
-| ORDER BY total DESC, order_id LIMIT 10 | 2,051.9 ms | 5 M | 135.7 ms | 33.4 ms |
+| Query | Day 2 | Day 3, bound | Day 3, optimized | DuckDB, 1 thread | DuckDB, 8 threads |
+|---|---|---|---|---|---|
+| `count(*)` | 216.1 ms | 221.8 ms | **12.9 ms** | 0.2 ms | 0.3 ms |
+| filter (`status = 'shipped' AND total > 500`) + count | 507.9 ms | 507.1 ms | 338.8 ms | 83.6 ms | 23.0 ms |
+| GROUP BY status (3 groups): count, sum, avg | 478.9 ms | 479.3 ms | 371.5 ms | 96.6 ms | 23.3 ms |
+| filter, GROUP BY customer (10,000 groups), top 5 | 316.5 ms | 315.9 ms | 180.1 ms | 85.5 ms | 23.6 ms |
+| filter, `sum(total * qty)`, `avg(qty * 2 + 1)` | 267.4 ms | 266.8 ms | 80.3 ms | 84.9 ms | 22.5 ms |
+| `count(DISTINCT customer)` | 694.4 ms | 667.7 ms | 517.8 ms | 17.7 ms | 5.9 ms |
+| ORDER BY total DESC, order_id LIMIT 10 | 2,069.5 ms | 243.6 ms | **120.1 ms** | 134.1 ms | 33.5 ms |
+| `order_id <= 1000000` (one row group of ten): count, sum | not timed | 216.0 ms | **11.7 ms** | 11.9 ms | 11.9 ms |
+| JOIN customers ON customer, GROUP BY region | can't run | 990.4 ms | 808.4 ms | 111.6 ms | 28.8 ms |
 
-The DuckDB columns are the same queries on the same file through its Python API (`python
-scripts/duckdb_times.py data/orders_10m.parquet`, median of five after a warm-up), for scale, not as a race: both gave the same answers (the sums differ in the last
-digits, from adding in another order). What the numbers say about day 3: every scan decodes all six columns, because
-nothing tells it which are needed (projection pushdown), so even `count(*)` reads the whole file, where DuckDB reads
-the row count from the footer; a filter copies all six columns of the rows it keeps; and `ORDER BY ... LIMIT 10`
-sorts all 10 million rows and gathers every column for them, where a top-k needs ten.
+What moved, and why:
+- **Projection pushdown** is most of it. `count(*)` now reads no column (`Scan: orders projection=[]`): the Parquet
+  reader only counts rows, 216 to 12.9 ms. Every other query decodes two or three of the six columns instead of all
+  six: the arithmetic query (total, qty, placed) went from 267 to 80 ms, now level with one-thread DuckDB.
+- **The top-k** alone (day 3 bound) took `ORDER BY ... LIMIT 10` from 2,070 to 244 ms: it never sorts the 10 million
+  rows, only cuts batches back to the best ten. With projection pushdown too it reads two columns: 120 ms.
+- **Row-group pruning** reads one row group of ten for `order_id <= 1000000` (the footer says the other nine start
+  above it): 216 to 11.7 ms, plus the two columns it needs.
+- **The join** runs (it was an error on day 2) and gives DuckDB's answer, but at 7x one-thread DuckDB's time. It
+  hasn't been profiled yet; day 4's benchmarks are the place for that.
+- What moved least: queries that compare or group a string column on every row (`status = 'shipped'`, GROUP BY
+  status, `count(DISTINCT customer)`) are still 4-30x DuckDB's one-thread times. Not profiled yet either; one
+  hypothesis for day 4 is that Quarry decodes every string out of Parquet's dictionary encoding before comparing.
+
+## Review of day 3
+
+Review agents, one at a time, each in its own worktree with DuckDB as the oracle, briefed to find wrong rows.
+
+The first (at `5d33b22`, after the joins, the optimizer and pruning; 18 minutes) found **no wrong rows** in about 70
+join queries at four batch sizes (100 compared with DuckDB), 50 pruning filters over files pyarrow wrote (INT16, REAL,
+UINT32, BOOLEAN, DATE, strings over 64 bytes, NULL-only row groups) and 367 over parquet-rs files (statistics
+truncated mid-character, ±0, NaN, ±inf, SMALLINT limits). It found three ways the optimized plan **succeeds where the
+bound one fails**, which the docs didn't list: a pruned row group's rows are never computed on, a condition moved
+below a join drops rows (those where it is NULL included) before a later conjunct sees them, and a CSV column no one
+reads isn't parsed. DuckDB 2.0 gives the optimized answer in all three (I checked each); they are now documented
+(DESIGN.md, "The optimizer") and pinned by `tests/skipped_errors.rs`. Of its mutations, six survived every test:
+two are equivalent (a NULL-typed key check `logical_nulls` already covers; a filter-merge order no plan reaches), two
+guard cases the binder already rules out (AND/OR operands are always BOOLEAN), one needs a Parquet file with
+statistics but no null counts, which parquet-rs doesn't write (`with_missing_null_counts_as_zero(false)`; DESIGN says
+a missing count is never 0), and one, the join's pair budget, panics on overflow in the debug build `make check`
+runs.
+
+Before the review I had already checked the new mechanisms by mutation: six of the join (all caught by
+`join_properties.rs`), six of pruning (all caught by `pruning.rs`'s property alone), four of the top-k (caught by the
+ORDER BY property), two of constant folding (caught by the evaluator property once it ran optimized expressions),
+and two of LEFT-join pushdown (one survived until the join property got a random WHERE).
 
 ## Review of day 2
 
