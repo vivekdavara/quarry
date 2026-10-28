@@ -178,16 +178,26 @@ fn query_prints_the_result() {
     );
     let out = quarry(&["query", "-t", &orders, "SELECT id FROM orders WHERE FALSE"]);
     assert_eq!(stdout(&out), "+----+\n| id |\n+----+\n+----+\n0 rows\n");
-    // EXPLAIN prints the plan instead of running it.
+    // EXPLAIN prints the optimized plan, the one that runs, instead of running it; `plan` prints the bound one.
     let out = quarry(&[
         "query",
         "-t",
         &orders,
-        "EXPLAIN SELECT id FROM orders LIMIT 1",
+        "EXPLAIN SELECT id FROM orders WHERE 1 < 2 LIMIT 1",
     ]);
     assert_eq!(
         stdout(&out),
-        "Limit: skip=0 fetch=1\n  Projection: orders.id\n    Scan: orders\n"
+        "Limit: skip=0 fetch=1\n  Projection: orders.id\n    Scan: orders projection=[id]\n"
+    );
+    let out = quarry(&[
+        "plan",
+        "-t",
+        &orders,
+        "SELECT id FROM orders WHERE 1 < 2 LIMIT 1",
+    ]);
+    assert_eq!(
+        stdout(&out),
+        "Limit: skip=0 fetch=1\n  Projection: orders.id\n    Filter: 1 < 2\n      Scan: orders\n"
     );
 }
 

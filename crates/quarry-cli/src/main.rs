@@ -12,6 +12,7 @@ use quarry::arrow::record_batch::RecordBatch;
 use quarry::arrow::util::pretty::pretty_format_batches;
 use quarry::datasource::TableProvider;
 use quarry::exec;
+use quarry::optimizer::optimize;
 use quarry::sql::{self, BoundStatement};
 use quarry::{Catalog, QuarryError, Result};
 
@@ -33,7 +34,8 @@ enum Command {
         #[arg(short = 'n', long, default_value_t = 10)]
         rows: usize,
     },
-    /// Bind a query against the given tables and print its logical plan (nothing is read but the files' schemas).
+    /// Bind a query against the given tables and print its logical plan as bound, before the optimizer (nothing is
+    /// read but the files' schemas).
     Plan {
         /// A table: `name=path`, or just `path` to name it after the file (`data/lineitem.parquet` is `lineitem`).
         #[arg(short, long = "table", value_name = "NAME=PATH")]
@@ -41,8 +43,8 @@ enum Command {
         /// The query (`EXPLAIN SELECT ...` works too).
         sql: String,
     },
-    /// Run a query against the given tables and print its result as a table (`EXPLAIN SELECT ...` prints the plan
-    /// instead).
+    /// Run a query against the given tables and print its result as a table (`EXPLAIN SELECT ...` prints the
+    /// optimized plan, the one that runs, instead).
     Query {
         /// A table: `name=path`, or just `path` to name it after the file.
         #[arg(short, long = "table", value_name = "NAME=PATH")]
@@ -77,9 +79,9 @@ fn run(command: Command) -> Result<String> {
             Ok(plan.to_string())
         }
         Command::Query { tables, sql } => match sql::bind(&catalog(&tables)?, &sql)? {
-            BoundStatement::Explain(plan) => Ok(plan.to_string()),
+            BoundStatement::Explain(plan) => Ok(optimize(&plan)?.to_string()),
             BoundStatement::Query(plan) => {
-                let result = exec::collect(&plan)?;
+                let result = exec::collect(&optimize(&plan)?)?;
                 let rows = result.num_rows();
                 let noun = if rows == 1 { "row" } else { "rows" };
                 Ok(format!("{}\n{rows} {noun}\n", result.to_table()?))
