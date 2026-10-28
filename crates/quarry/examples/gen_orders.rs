@@ -81,7 +81,8 @@ fn main() {
         left -= n;
         let ids: Int64Array = (0..n as i64).map(|i| next_id + i).collect();
         next_id += n as i64;
-        // The smaller of two uniform draws: customer i is about twice as likely as customer 10,000 - i.
+        // The smaller of two uniform draws: customer i has probability (2(10,000 - i) - 1) / 10,000^2, so low numbers
+        // are more frequent (customer 1,000 about 9 times as often as customer 9,000).
         let customer: StringArray = (0..n)
             .map(|_| {
                 let c = rng.below(10_000).min(rng.below(10_000));

@@ -58,7 +58,9 @@ fn main() {
     let bound = args.iter().any(|a| a == "--bound");
     args.retain(|a| a != "--bound");
     let customers = match args.iter().position(|a| a == "--customers") {
-        Some(i) if i + 1 < args.len() => {
+        Some(i)
+            if i + 1 < args.len() && args.iter().filter(|a| *a == "--customers").count() == 1 =>
+        {
             let path = args.remove(i + 1);
             args.remove(i);
             Some(path)
@@ -68,7 +70,10 @@ fn main() {
     };
     let (path, runs) = match args.as_slice() {
         [path] => (path.as_str(), 5),
-        [path, runs] => (path.as_str(), runs.parse().expect("RUNS is a number")),
+        [path, runs] => match runs.parse::<usize>() {
+            Ok(n) if n > 0 => (path.as_str(), n),
+            _ => usage(),
+        },
         _ => usage(),
     };
     let mut catalog = Catalog::new();
@@ -110,7 +115,13 @@ fn main() {
             times.push(elapsed);
         }
         times.sort();
-        let median = times[times.len() / 2];
+        // The middle run; for an even RUNS, the mean of the two middle ones (as Python's statistics.median).
+        let n = times.len();
+        let median = if n % 2 == 1 {
+            times[n / 2]
+        } else {
+            (times[n / 2 - 1] + times[n / 2]) / 2
+        };
         let per_second = rows as f64 / median.as_secs_f64();
         println!(
             "| {name} | {result_rows} | {:.1} ms | {:.1} ms | {:.0} M |",
@@ -122,6 +133,6 @@ fn main() {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: time_queries PATH [RUNS] [--customers PATH] [--bound]");
+    eprintln!("usage: time_queries PATH [RUNS (at least 1)] [--customers PATH, once] [--bound]");
     std::process::exit(2);
 }

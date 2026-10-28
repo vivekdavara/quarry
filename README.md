@@ -59,8 +59,8 @@ flowchart LR
 - **Row-group pruning** (`datasource/pruning.rs`, day 3): a scan's filters rewritten into conditions on each row
   group's min, max and null count, evaluated by the engine's own evaluator; a group is skipped only where that is
   FALSE, and the filter still checks every row read.
-- **Top-k** (`exec/mod.rs`, day 3): `ORDER BY ... LIMIT k` keeps the best `k` rows by partial sorts of `2k`, never
-  sorting the whole input.
+- **Top-k** (`exec/mod.rs`, day 3): `ORDER BY ... LIMIT k` keeps the best `k` rows by partial sorts of
+  `max(2k, k + batch_size)` rows, never sorting the whole input.
 
 DESIGN.md is the specification: the type rules, name resolution, each node, the eight binding steps, and execution
 (each rule where engines differ, checked on DuckDB 2.0).

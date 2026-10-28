@@ -296,11 +296,13 @@ NaN that `x > 5.0` keeps. For float columns only the min is used: `<`, `<=`, and
 I ran (allowing `>` on floats) is exactly that bug, and the property test catches it.
 
 **What is the top-k?**
-`ORDER BY ... LIMIT n OFFSET m` keeps only the best `k = n + m` rows (`exec::top_k`): batches are buffered to `2k` rows,
-then cut back to `k` by Arrow's `lexsort_to_indices` with a limit. Each row carries its input position as the last key,
-which makes the order total, so the result is exactly the full sort's first `k`, ties included. Buffering to `2k`
-before cutting means each row takes part in a constant number of `O(k log k)` sorts, so a large `k` doesn't go
-quadratic.
+`ORDER BY ... LIMIT n OFFSET m` keeps only the best `k = n + m` rows (`exec::top_k`): batches are buffered until there
+are `max(2k, k + batch_size)` rows, then cut back to `k` by Arrow's `lexsort_to_indices` with a limit. Each row carries
+its input position as the last key, which makes the order total, so the result is exactly the full sort's first `k`,
+ties included. Each cut sorts at most `max(2k, k + batch_size)` rows and then drops at least `max(k, batch_size)` of
+them, so the cost per input row stays bounded however large `k` is (a row that stays among the best does take part
+in every cut). Without the buffering, cutting back after every batch would re-sort the `k` kept rows each time, which
+is quadratic for a large `k`.
 
 ## What went wrong on day 2
 
