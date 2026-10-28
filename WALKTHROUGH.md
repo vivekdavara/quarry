@@ -1,7 +1,8 @@
 # Walkthrough
 
 Questions an interviewer is likely to ask about Quarry, with short answers grounded in the code. Day 1 covers the
-readers, the logical plan and the binder; day 2 execution; later days add sections.
+readers, the logical plan and the binder; day 2 execution; day 3 joins, the optimizer, row-group pruning and the top-k;
+later days add sections.
 
 ## The big picture
 
@@ -215,6 +216,91 @@ mutant, because the generator rarely paired a backslash string with a backslash 
 Because an expression is computed for rows. Row by row, a failing constant fails only if a row exists to compute it
 for; the property test's reference works that way, and the engine first disagreed on empty tables (it computed the
 scalar once and failed). Now `evaluate` returns an empty column for an empty batch without evaluating.
+
+## Joins and the optimizer (day 3)
+
+**How does a join run?**
+`exec/join.rs`. `ON` is split into its conjuncts (`Expr::conjuncts`). A conjunct `l = r` where `l` reads only the
+left input's columns and `r` only the right's (either way round) is a key; the rest is the residual. The right input
+is the build side: read whole, its keys evaluated, encoded in Arrow's row format and grouped by a `HashMap<bytes,
+group>`, then a counting sort lays each group's rows out contiguously in input order (`KeyTable { starts, rows }`).
+The left input streams: each left row's key looks up its group, those build rows are its candidates, and the residual
+is evaluated on the candidate pairs, at most `batch_size` pairs at a time (`JoinStream::step`). With no key at all
+(`CROSS JOIN`, `ON o.qty > c.rank`) every build row is a candidate: a nested loop through the same code.
+
+**How do NULLs and floats behave in join keys?**
+As `=` does. A row with a NULL in any key column goes in no group and looks nothing up (`non_null_rows`), because
+`NULL = NULL` is NULL, not TRUE. Floats are normalized before encoding (`normalize_floats`: -0.0 to 0.0, every NaN to
+one NaN), the same rule GROUP BY uses, so -0.0 meets 0.0 and NaN meets NaN; the values that come out are the input's
+own. One `RowConverter` encodes both sides, so equal keys are equal bytes.
+
+**What order do join results come in?**
+The left input's order, each left row's matches in the build side's order, and a LEFT join's unmatched left row in
+its own place, with NULLs on the right. That holds at every batch size, which is why `execute.rs` can compare joins
+row for row at batch sizes 1, 2, 3 and 8192, and `join_properties.rs` can compare with a plain nested loop in order.
+The LEFT case is the subtle one: a left row whose candidates are split across chunks isn't known to be unmatched
+until its last chunk, so `step` emits the NULL row only for rows whose candidates are all done (`done_rows`).
+
+**Why is the right side always the build side?**
+Simplicity and the order guarantee. Building the smaller side is faster, but for an inner join it would make the
+output follow the other input's order. The statistics exist (`TableStatistics::num_rows`); swapping is a day-4 option.
+
+**What does the optimizer do?**
+`optimizer::optimize` runs three rules once each: constant folding, predicate pushdown, projection pushdown (DESIGN.md,
+"The optimizer"). Each keeps the plan's output columns exactly, which is what lets `execute.rs` run every query bound
+and optimized and require the same rows or the same error.
+
+**How does constant folding avoid turning a lazy error into an eager one?**
+`fold_constant` evaluates a column-free subexpression over a one-row, zero-column batch; if that fails (`7 % 0`), the
+subexpression is left in the plan to fail only when a row reaches it, so `CASE WHEN a > 0 THEN 1 ELSE 7 % 0 END` over
+positive `a`s still works. Its operands still fold (`7 % (2 - 2)` becomes `7 % 0`). The AND/OR simplifications are
+the ones laziness makes exact: `FALSE AND x` never computed `x`, so it is FALSE; `TRUE AND x` and `x AND TRUE` computed
+`x` on every row anyway, so they are `x`; `x AND FALSE` stays, because `x` might fail.
+
+**How does predicate pushdown turn a comma join into a hash join?**
+`FROM t, u WHERE t.a = u.a AND u.y > 3` binds as a filter over a cross join. For an inner or cross join, WHERE and ON
+mean the same, so `filter_into_join` moves the whole predicate into the ON (a cross join with an ON becomes inner);
+`push_join_condition` then sends each conjunct that reads one side only down to that side as a filter. What's left
+in the ON (`t.a = u.a`) is a key, so the join is a hash join.
+
+**Why is a LEFT join treated differently?**
+Because moving a condition must not change which left rows come out. A WHERE conjunct on the left side can go below
+(a left row it drops only makes rows it drops), but one on the right must stay above: it sees the NULLs of unmatched
+rows (`WHERE u.x IS NULL` is the anti-join idiom). In the ON it's the reverse: a conjunct on the right can filter the
+build side (a build row it rejects can't match), but one on the left stays, since it decides matching, not existence.
+
+**Doesn't pushdown change which rows a failing condition sees?**
+Yes, and that's documented. `ON o.customer = c.name AND 5 % (c.rank - 4) = 1` never divides by zero in the hash join
+alone (the residual runs only on key matches), but pushed down it filters every customer and fails. I checked DuckDB
+2.0: it fails the same query, for the same reason. The test
+`the_rest_of_on_is_computed_only_for_pairs_with_equal_keys_until_it_is_pushed_down` pins both behaviours.
+
+**How does projection pushdown work with index-based columns?**
+`columns.rs` walks down with the set of output columns the parent needs; each node adds its own expressions' columns;
+a scan reads exactly the union. Every node returns a `ColumnMap` (old output position to new), and its parent rewrites
+its expressions through it (`Expr::map_columns`). Projections and aggregates keep all their outputs, so the renumbering
+stops at them and the result's columns never change. `SELECT count(*) FROM t` ends with `projection=[]`: the Parquet
+reader decodes no column and only counts rows.
+
+**How does row-group pruning work, and why is it safe?**
+`datasource/pruning.rs` rewrites each filter the scan was given into a condition on statistics (`x > 5` becomes
+`max(x) > 5`, `x = 5` becomes `min(x) <= 5 AND max(x) >= 5`, `IS NULL` a null count above 0) and evaluates it with the
+engine's own evaluator over a batch with one row per row group. A group is skipped only where the result is FALSE; a
+missing statistic is NULL and keeps it. It's safe because it's only ever an optimization: the Filter node stays above
+the scan and checks every row read, so the property test (`tests/pruning.rs`) can demand the same rows with and
+without pruning for random data and filters.
+
+**What's the catch with floats?**
+NaN. Writers leave it out of min and max, and NaN is the greatest value here, so a group with max 1.0 can still hold a
+NaN that `x > 5.0` keeps. For float columns only `<`, `<=` and `=` with a number use the statistics. The first mutant
+I ran (allowing `>` on floats) is exactly that bug, and the property test catches it.
+
+**What is the top-k?**
+`ORDER BY ... LIMIT n OFFSET m` keeps only the best `k = n + m` rows (`exec::top_k`): batches are buffered to `2k` rows,
+then cut back to `k` by Arrow's `lexsort_to_indices` with a limit. Each row carries its input position as the last key,
+which makes the order total, so the result is exactly the full sort's first `k`, ties included. Buffering to `2k`
+before cutting means each row takes part in a constant number of `O(k log k)` sorts, so a large `k` doesn't go
+quadratic.
 
 ## What went wrong on day 2
 
