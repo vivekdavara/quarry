@@ -272,7 +272,9 @@ Three operators are **lazy**, as in DuckDB: `AND` evaluates its right side only 
 `FALSE`, `OR` only where it isn't `TRUE`, and each `CASE` branch only on the rows that reach it. That is what makes
 `b <> 0 AND a % b = 1` and `CASE WHEN b = 0 THEN 0 ELSE a % b END` safe: the modulo never sees a zero. The rows still
 undecided are taken out of the batch (`take`), the operand is evaluated on them, and the results are put back in
-place (`interleave`).
+place: a boolean result (an `AND` or `OR` operand) by writing its value and validity bitmaps directly, anything else
+with Arrow's `interleave`. (Day 4: `interleave` copies a boolean array one value at a time through
+`MutableArrayData`, which `sample` showed as about three quarters of TPC-H Q6's time; README, "Results (day 4)".)
 
 **The rules where SQL engines differ** follow DuckDB 2.0.0, the oracle day 4 compares against; each was checked on
 DuckDB by hand:
@@ -313,7 +315,7 @@ rows (`SELECT count(*) FROM t WHERE FALSE` is one row, 0); with one, no rows mak
 
 ## The optimizer
 
-`optimizer::optimize` (day 3) rewrites the bound plan; `quarry::query` and the CLI run what it returns. Three rules
+`optimizer::optimize` (day 3) rewrites the bound plan; `quarry::query` and the CLI run what it returns. Four rules
 run once each, in order. Each keeps the plan's output columns (names, types, order), and `tests/execute.rs` runs
 every query bound and optimized, at every batch size, and requires the same rows (or the same error).
 
@@ -325,7 +327,20 @@ every query bound and optimized, at every batch size, and requires the same rows
    that changes nothing computed: they are lazy, so `FALSE AND x` is FALSE without computing `x`, and `TRUE AND x`
    and `x AND TRUE` are `x`; `x AND FALSE` stays, since `x` is computed on every row and may fail. A filter that is
    then TRUE goes away; one that is FALSE or NULL becomes `Empty: no rows`, and its input isn't read.
-2. **Predicate pushdown** (`optimizer/predicates.rs`). A filter over an inner or cross join joins its `ON` (for an
+2. **`OR` factoring** (`optimizer/factor.rs`, day 4). In a filter's condition and a join's `ON`, each conjunct that
+   is an `OR` whose branches (after flattening nested `OR`s) all have some conjunct in common is rewritten: `(a AND
+   b) OR (a AND c)` is `a AND (b OR c)`, and when a branch has nothing left, `a OR (a AND b)` is `a`. Both hold in
+   SQL's three-valued logic, which is distributive, so the values are the same. The common conjuncts come first, in
+   the first branch's order; repeats are factored once. The point is the next rule: a factored conjunct is a conjunct
+   of its own, which can become a join key or move to one side. TPC-H's Q19 writes `p_partkey = l_partkey` in each of
+   its three branches, and was a nested loop over every pair of rows without this (10.96 s at scale 0.01, 0.022 s
+   with it). Only conjuncts that **can't fail** are factored: comparisons, `IN`, `IS [NOT] NULL`, `NOT`, `AND` and
+   `OR` over columns and literals. `AND` and `OR` are lazy, so in `(d <> 0 AND 10 % d = 1) OR (a > 5 AND 10 % d =
+   1)` neither branch reaches the modulo where `d` is 0; factored out, it would run on every row. With that rule, a
+   factored conjunct computes values that can't fail on more rows, and everything left in the `OR` runs on fewer, so
+   the rewrite can make a plan succeed where it failed (it skips work), never the reverse. DuckDB 2.0 factors these
+   ORs too (Q19 is a hash join there).
+3. **Predicate pushdown** (`optimizer/predicates.rs`). A filter over an inner or cross join joins its `ON` (for an
    inner join they mean the same; a cross join with an `ON` is an inner join, so `FROM t, u WHERE t.a = u.a` is a
    hash join). The `ON`'s conjuncts that read one side only become a filter on that side, the `ON`'s own first, then
    the `WHERE`'s; the rest stay in the `ON`. Over a `LEFT` join, `WHERE`'s conjuncts on the left go down to the left
@@ -336,7 +351,7 @@ every query bound and optimized, at every batch size, and requires the same rows
    `JOIN customers c ON o.customer = c.name AND 5 % (c.rank - 4) = 1` divides by zero for the customer no order
    names, because the condition now filters every customer. DuckDB 2.0 moves conditions the same way and fails the
    same queries (each case checked by hand).
-3. **Projection pushdown** (`optimizer/columns.rs`). Walking down from the root with the columns each node's parent
+4. **Projection pushdown** (`optimizer/columns.rs`). Walking down from the root with the columns each node's parent
    needs, every scan gets a projection of what is used above it, and every expression above a narrowed scan is
    renumbered (bound expressions refer to columns by position). `SELECT count(*) FROM t` reads no column at all,
    only row counts. Projections and aggregates keep all their outputs (an unused one is still computed), so only
@@ -399,6 +414,47 @@ operand flip lost, `=` made strict, `<>` and `OR` weakened, IS NOT NULL against 
 Examples pin what is skipped on an ordered file.
 
 
+## TPC-H-style data and the differential test (day 4)
+
+`crates/quarry-tpch` generates seven of TPC-H's eight tables (not `partsupp`, which none of the queries here reads)
+as Parquet files at any scale factor: TPC-H's row counts (6 million lines at scale 1), its value lists (nations,
+regions, segments, priorities, ship modes, instructions, part types, brands, containers), and the rules that tie
+columns together (ship, commit and receipt dates from the order date; return flags and line statuses against
+1995-06-17; an order's status and total from its lines; a part's price from its key; only customers whose key isn't
+a multiple of 3 order). It is simpler than TPC-H's `dbgen` where that changes nothing the queries test: money and
+quantities are `DOUBLE` written from whole cents (Quarry has no decimal arithmetic), order keys are dense, a line's
+part and supplier are independent draws, and names, addresses and comments come from short vocabularies. Each table
+has its own fixed-seed xorshift generator, so a scale always gives byte-identical files (`tests/generate.rs` checks
+two runs, and every rule on every row at scale 0.005). Writing a generator rather than using `dbgen` or DuckDB's
+`tpch` extension keeps the data deterministic on every platform, free of TPC's license terms, and in the types
+Quarry computes on. Row groups are 2^17 rows, so a scale-1 `lineitem` has 46 for pruning.
+
+**The queries** are the 8 of TPC-H's 22 that need nothing Quarry lacks (subqueries, `EXTRACT`, `INTERVAL`, views):
+Q1, Q3, Q5, Q6, Q10, Q12, Q14, Q19, with the specification's validation parameters. Three changes: dates are literals
+(`DATE '1998-12-01' - 90` for `- interval '90' day`); Q6's `0.06 - 0.01` and `0.06 + 0.01` are written `0.05` and
+`0.07`, because in `DOUBLE` arithmetic `0.06 + 0.01` is `0.06999999999999999`, below the `0.07` the column holds
+(DuckDB reads such literals as `DECIMAL` and keeps 0.07); and Q3 and Q10 add their key at the end of `ORDER BY`, so
+ties come out in one order. `scripts/tpch_answers.py` wrote DuckDB's answers at scale 0.01 (one thread); the crate
+embeds them, and `tests/tpch.rs` requires Quarry's column names and rows, in order, at batch sizes 7, 1000 and 8192,
+floats within a relative 1e-9 (DuckDB adds sums in another order: six queries match exactly, Q5 and Q10 within 2.2e-16),
+and no nested-loop join in any plan.
+
+**The differential test** (`scripts/differential.py`) runs the TPC-H queries and then random ones through the
+`quarry` CLI (`quarry query --output FILE`, which writes the result as Parquet, so types, NULLs and floats come back
+exactly) and through DuckDB 2.0.0 (one thread) over the same files, and requires the same rows in the same order.
+The generator draws from what both engines define the same way (the table in "Execution"): comparisons, `BETWEEN`,
+`IN`, `LIKE`, `IS NULL`, date arithmetic, `AND`/`OR`/`NOT` and `OR`s whose branches share a conjunct; joins along the
+schema's keys, as comma joins, `JOIN ... ON` or `LEFT JOIN ... ON` with a condition on the right; `GROUP BY` with
+every aggregate and `HAVING`; select lists of arithmetic, string concatenation, date differences and `CASE`, with
+`DISTINCT`, `ORDER BY`, `LIMIT` and `OFFSET`. Every query orders its output completely (by every group key, or by
+every select item), so rows can be compared in order. It stays away from what DESIGN.md says differs: no casts, no
+division or modulo by a column, no arithmetic on literals alone, no float literal next to an integer (DuckDB's
+`DECIMAL`s), and one join style per query: in `a, b JOIN c ON <a condition on a>` the SQL standard and PostgreSQL 14
+scope the `ON` to `b JOIN c` and refuse it, as Quarry does, while DuckDB 2.0 reads `(a, b) JOIN c` (the script's
+first run found exactly 17 such queries, and nothing else). CI runs the TPC-H queries and 1,000 random queries from
+seed 1 at scale 0.01. To check that it can fail, four engine bugs were built into release binaries and run through
+it (README, "Results (day 4)"); each made queries differ.
+
 ## The days
 
 - **Day 1:** the workspace, the readers and the catalog, the logical plan, the binder, a CLI that prints
@@ -408,7 +464,7 @@ Examples pin what is skipped on an ordered file.
 - **Day 3:** physical operators (hash aggregate, hash join, sort), predicate pushdown into Parquet row groups,
   optimizer rules (constant folding, projection pushdown).
 - **Day 4:** TPC-H-style queries over generated data; differential tests against DuckDB (Python `duckdb` as the
-  oracle); criterion benchmarks.
+  oracle); criterion benchmarks. Also the `OR` factoring rule (for Q19) and the boolean scatter (for Q6 and Q12).
 - **Day 5:** a REPL, the README's results, WALKTHROUGH.md, v1.0.0.
 
 ## Testing
@@ -426,5 +482,6 @@ Examples pin what is skipped on an ordered file.
   fail, and splitting the rows into batches mustn't change them. A second one does the same for random `GROUP BY`
   queries against a reference grouping in plain Rust. Every query in `tests/execute.rs` runs at batch sizes 1, 2, 3
   and 8192, over memory, CSV and Parquet, and must give the same rows.
-- **Against DuckDB (day 4):** TPC-H-style queries over generated files, each result compared with DuckDB's. Day 2's
-  rules above were checked against DuckDB 2.0.0 by hand.
+- **Against DuckDB (day 4):** the TPC-H-style queries' answers at scale 0.01 are DuckDB 2.0.0's, compared in every
+  `cargo test` (`tests/tpch.rs`), and `scripts/differential.py` runs random queries through both engines (below).
+  Day 2's rules above were checked against DuckDB 2.0.0 by hand.
