@@ -101,6 +101,9 @@ fn an_or_with_a_cast_isnt_factored() {
     for sql in [
         "SELECT l.k FROM l, r WHERE (l.k = r.k AND CAST(r.s AS BIGINT) = 1) OR (l.k = r.k AND r.w = 1)",
         "SELECT l.k FROM l LEFT JOIN r ON (l.k = r.k AND CAST(r.s AS BIGINT) = 1) OR (l.k = r.k AND r.w = 1)",
+        // A CASE can't be factored either: its branches can hold anything (the third review's case).
+        "SELECT l.k FROM l, r WHERE (l.k = r.k AND CASE WHEN r.w = 0 THEN CAST(r.s AS BIGINT) END = 1) \
+         OR (l.k = r.k AND r.w = 1)",
     ] {
         let (bound, optimized) = bound_and_optimized(&c, sql);
         assert_eq!(bound, Ok(1), "{sql}: bound");

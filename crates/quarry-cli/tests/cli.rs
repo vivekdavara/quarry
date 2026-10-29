@@ -303,6 +303,9 @@ fn query_batch_size_sets_the_batches() {
         "{}",
         stdout(&out)
     );
+    // Two rows a batch: id 2 is in the first batch, so it fails too (every size, not just 1, is passed through).
+    let out = quarry(&["query", "--batch-size", "2", "-t", &orders, limited]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
     let out = quarry(&["query", "-t", &orders, limited]);
     assert_eq!(
         stderr(&out),
