@@ -202,6 +202,71 @@ fn query_prints_the_result() {
 }
 
 #[test]
+fn query_output_writes_the_result_as_parquet() {
+    let dir = TempDir::new().unwrap();
+    let orders = sample(dir.path());
+    let out_path = dir.path().join("out.parquet");
+    let out_file = out_path.to_str().unwrap();
+    // After `--`, a query may start with a SQL comment.
+    let out = quarry(&[
+        "query",
+        "-t",
+        &orders,
+        "--output",
+        out_file,
+        "--",
+        "-- totals\nSELECT id, total, total * 2 AS twice FROM orders ORDER BY id",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), format!("3 rows written to {out_file}\n"));
+    // The file has the result's names, types and nullability, and its NULL.
+    let out = quarry(&["schema", out_file]);
+    assert_eq!(
+        stdout(&out),
+        "id: Int64\ntotal: Float64\ntwice: Float64\nrows: 3\nrow groups: 1 (3 rows)\n"
+    );
+    let out = quarry(&[
+        "query",
+        "-t",
+        out_file,
+        "SELECT * FROM out WHERE total IS NULL",
+    ]);
+    assert_eq!(
+        stdout(&out),
+        "+----+-------+-------+\n| id | total | twice |\n+----+-------+-------+\n\
+         | 3  | NULL  | NULL  |\n+----+-------+-------+\n1 row\n"
+    );
+    // No rows: the file still has the columns.
+    let out = quarry(&[
+        "query",
+        "-t",
+        &orders,
+        "-o",
+        out_file,
+        "SELECT id FROM orders WHERE FALSE",
+    ]);
+    assert_eq!(stdout(&out), format!("0 rows written to {out_file}\n"));
+    assert_eq!(
+        stdout(&quarry(&["schema", out_file])),
+        "id: Int64\nrows: 0\n"
+    );
+    // EXPLAIN has no rows to write.
+    let out = quarry(&[
+        "query",
+        "-t",
+        &orders,
+        "-o",
+        out_file,
+        "EXPLAIN SELECT id FROM orders",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stderr(&out),
+        "error: plan error: --output takes a query's rows; EXPLAIN prints a plan\n"
+    );
+}
+
+#[test]
 fn a_query_that_fails_while_running_is_status_1() {
     let dir = TempDir::new().unwrap();
     let out = quarry(&[

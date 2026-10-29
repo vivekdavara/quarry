@@ -13,8 +13,9 @@ use quarry::arrow::util::pretty::pretty_format_batches;
 use quarry::datasource::TableProvider;
 use quarry::exec;
 use quarry::optimizer::optimize;
+use quarry::parquet::arrow::ArrowWriter;
 use quarry::sql::{self, BoundStatement};
-use quarry::{Catalog, QuarryError, Result};
+use quarry::{Catalog, QuarryError, QueryResult, Result};
 
 #[derive(Debug, Parser)]
 #[command(name = "quarry", version = quarry::VERSION, about = "A SQL query engine over Parquet and CSV")]
@@ -49,7 +50,11 @@ enum Command {
         /// A table: `name=path`, or just `path` to name it after the file.
         #[arg(short, long = "table", value_name = "NAME=PATH")]
         tables: Vec<String>,
-        /// The query.
+        /// Write the result to this Parquet file instead of printing it: its column names and types, NULLs and floats
+        /// exactly (for scripts, such as scripts/differential.py). An existing file is replaced.
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// The query (after `--` if it starts with `-`, as a SQL comment does).
         sql: String,
     },
 }
@@ -78,13 +83,26 @@ fn run(command: Command) -> Result<String> {
             };
             Ok(plan.to_string())
         }
-        Command::Query { tables, sql } => match sql::bind(&catalog(&tables)?, &sql)? {
-            BoundStatement::Explain(plan) => Ok(exec::explain(&optimize(&plan)?)),
-            BoundStatement::Query(plan) => {
+        Command::Query {
+            tables,
+            output,
+            sql,
+        } => match (sql::bind(&catalog(&tables)?, &sql)?, output) {
+            (BoundStatement::Explain(_), Some(_)) => Err(QuarryError::Plan(
+                "--output takes a query's rows; EXPLAIN prints a plan".to_string(),
+            )),
+            (BoundStatement::Explain(plan), None) => Ok(exec::explain(&optimize(&plan)?)),
+            (BoundStatement::Query(plan), output) => {
                 let result = exec::collect(&optimize(&plan)?)?;
                 let rows = result.num_rows();
                 let noun = if rows == 1 { "row" } else { "rows" };
-                Ok(format!("{}\n{rows} {noun}\n", result.to_table()?))
+                match output {
+                    Some(path) => {
+                        write_parquet(&path, &result)?;
+                        Ok(format!("{rows} {noun} written to {}\n", path.display()))
+                    }
+                    None => Ok(format!("{}\n{rows} {noun}\n", result.to_table()?)),
+                }
             }
         },
     }
@@ -121,6 +139,18 @@ fn parse_table(spec: &str) -> Result<(String, PathBuf)> {
             "--table {spec}: can't name a table after this path"
         ))),
     }
+}
+
+/// The result as one Parquet file (a single row group per batch the query made, uncompressed: these files are small
+/// and short-lived).
+fn write_parquet(path: &Path, result: &QueryResult) -> Result<()> {
+    let file = std::fs::File::create(path)?;
+    let mut writer = ArrowWriter::try_new(file, result.schema.clone(), None)?;
+    for batch in &result.batches {
+        writer.write(batch)?;
+    }
+    writer.close()?;
+    Ok(())
 }
 
 fn open(file: &Path) -> Result<Arc<dyn TableProvider>> {
