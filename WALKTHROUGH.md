@@ -399,12 +399,12 @@ later moves can only skip work.
 `sample` on a loop of Q6 at scale 1: about three quarters of the stacks were in Arrow's `interleave` on boolean arrays
 (`set_bits`, `MutableArrayData::try_extend`), called by the lazy `AND` to put its right side's results back in place
 for the rows it evaluated. `interleave` handles booleans one value at a time. `scatter_booleans` writes the value and
-validity bitmaps directly: Q6 352 to 145 ms, Q12 524 to 268 ms at scale 1. The evaluator's property test against the
+validity bitmaps directly: Q6 352 to 145 ms, Q12 524 to 271 ms at scale 1 (criterion at scale 0.1: -60% and -47%). The evaluator's property test against the
 row-at-a-time interpreter checks it at 100,000 cases, and writing FALSE as NULL fails a unit test.
 
 **How fast is it compared with DuckDB?**
-At scale 1, one thread: 1.1x (Q14) to 3.2x (Q12) one-thread DuckDB's time, and DuckDB on 8 threads is another
-2.7-4.4x faster (README, "Results (day 4)"). What I know of the gap: Quarry runs one thread; it evaluates expressions
+At scale 1, one thread: 1.2x (Q14) to 3.2x (Q12) one-thread DuckDB's time, and DuckDB on 8 threads is another
+2.7-4.6x faster (README, "Results (day 4)"). What I know of the gap: Quarry runs one thread; it evaluates expressions
 a kernel at a time into intermediate arrays, and its lazy `AND`/`OR`/`CASE` copy the undecided rows out (`take`) and
 the results back, where DuckDB passes selection vectors; and in Q6's profile zstd decoding was about an eighth of the
 time. That strings are decoded out of Parquet's dictionaries before comparing is a hypothesis from day 3, still not
@@ -432,7 +432,7 @@ change detection between runs.
 - **Several claims went into docs or commit messages before I checked them.** The answers commit says five TPC-H
   queries match DuckDB exactly; it is six (`9996a1d`, corrected in DESIGN.md). A first draft of the README named the
   wrong commit for the 10.96 s Q19 run; this file said the generator "took an hour" and DuckDB's 8 threads were "4-6x"
-  faster (the table says 2.7-4.4x); the bench's doc said planning reads footers (registration does); the price range
+  faster (the table says 2.7-4.6x); the bench's doc said planning reads footers (registration does); the price range
   was off at both ends. Each was caught by re-reading against the measurement or the code before the push that
   carried it, except the commit message, which stays.
 - **The disk filled again, more slowly.** `target/debug` went from 1.5 to 9.3 GB in 40 minutes: each change to the
