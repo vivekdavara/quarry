@@ -87,6 +87,11 @@ fn condition(joined: bool) -> BoxedStrategy<String> {
         prop_oneof![
             (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("({a}) AND ({b})")),
             (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("({a}) OR ({b})")),
+            // ORs whose branches share a conjunct, for the factoring rule: in different places, and a branch that
+            // is only the shared conjunct.
+            (inner.clone(), inner.clone(), inner.clone())
+                .prop_map(|(s, a, b)| format!("(({s}) AND ({a})) OR (({b}) AND ({s}))")),
+            (inner.clone(), inner.clone()).prop_map(|(s, a)| format!("({s}) OR (({a}) AND ({s}))")),
             inner.prop_map(|a| format!("NOT ({a})")),
         ]
     })

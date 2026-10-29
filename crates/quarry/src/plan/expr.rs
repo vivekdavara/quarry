@@ -471,6 +471,22 @@ impl Expr {
         }
     }
 
+    /// The operands of a chain of `OR`s, left to right, as [`Expr::conjuncts`] does for `AND`.
+    pub fn disjuncts(&self) -> Vec<&Expr> {
+        match self {
+            Expr::Binary {
+                op: BinaryOp::Or,
+                left,
+                right,
+            } => {
+                let mut all = left.disjuncts();
+                all.extend(right.disjuncts());
+                all
+            }
+            other => vec![other],
+        }
+    }
+
     /// The conjuncts joined by `AND`, left-deep and in order (so `AND`'s left-to-right laziness keeps their order);
     /// `None` for none.
     pub fn and_all(conjuncts: impl IntoIterator<Item = Expr>) -> Option<Expr> {

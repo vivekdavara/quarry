@@ -242,6 +242,27 @@ fn filter_and_projection() {
 }
 
 #[test]
+fn ors_with_common_conjuncts_keep_their_rows_once_factored() {
+    // Rows 3 and 4 have a NULL on each side: NULL either way.
+    assert_eq!(
+        run("SELECT id FROM orders WHERE (qty > 1 AND total > 3.0) OR (flag AND qty > 1)"),
+        table(&[&["1"], &["6"]])
+    );
+    assert_eq!(
+        run("SELECT id FROM orders WHERE qty > 1 OR (customer = 'bo' AND qty > 1)"),
+        table(&[&["1"], &["3"], &["5"], &["6"]])
+    );
+    // The modulo is common to both branches but can fail, so it stays behind each branch's guard: row 2's qty - 1 is
+    // zero, and neither branch reaches the modulo there.
+    assert_eq!(
+        run(
+            "SELECT id FROM orders WHERE (qty <> 1 AND 10 % (qty - 1) = 0) OR (id > 4 AND 10 % (qty - 1) = 0)"
+        ),
+        table(&[&["1"], &["5"], &["6"]])
+    );
+}
+
+#[test]
 fn select_without_from() {
     assert_eq!(run("SELECT 1 + 1, 'a' || 'b'"), table(&[&["2", "ab"]]));
     assert!(run("SELECT 1 WHERE FALSE").is_empty());

@@ -138,6 +138,59 @@ fn constants_are_computed_once_and_filters_that_always_or_never_hold_go_away() {
 }
 
 #[test]
+fn conjuncts_every_or_branch_has_move_out_of_the_or() {
+    // TPC-H Q19's shape: the join key in each branch. Factored out, it is a hash join key, and a one-sided conjunct
+    // common to the branches goes down to its side.
+    assert_eq!(
+        optimized(
+            "SELECT t.b FROM t, u WHERE (t.a = u.a AND t.d > 1 AND u.x = 'k') \
+             OR (u.x = 'k' AND u.y < 3 AND t.a = u.a)"
+        ),
+        lines(&[
+            "Projection: t.b",
+            "  Join: Inner on t.a = u.a AND (t.d > 1 OR u.y < 3)",
+            "    Scan: t projection=[a, b, d]",
+            "    Filter: u.x = 'k'",
+            "      Scan: u projection=[a, x, y]",
+        ])
+    );
+    // A branch with nothing left makes the OR TRUE wherever the common conjuncts hold: `a OR (a AND b)` is `a`.
+    // Conjuncts repeated in a branch are factored once. Three branches.
+    assert_eq!(
+        optimized(
+            "SELECT b FROM t WHERE (a = 1 AND a = 1 AND d > 0) OR (d > 0 AND a = 1) \
+             OR (a = 1 AND b = 'x' AND d > 0)"
+        ),
+        lines(&[
+            "Projection: t.b",
+            "  Filter: t.a = 1 AND t.d > 0",
+            "    Scan: t projection=[a, b, d]",
+        ])
+    );
+    // A conjunct that can fail stays where it is: factored out, it would run on rows its branch's earlier conjuncts
+    // kept from it (here, the zeros of d).
+    assert_eq!(
+        optimized("SELECT b FROM t WHERE (d <> 0 AND 10 % d = 1) OR (a > 5 AND 10 % d = 1)"),
+        lines(&[
+            "Projection: t.b",
+            "  Filter: t.d <> 0 AND 10 % t.d = 1 OR t.a > 5 AND 10 % t.d = 1",
+            "    Scan: t projection=[a, b, d]",
+        ])
+    );
+    // A nested OR's branches are branches too, and `b = 'x'` shares nothing with the others: unchanged.
+    assert_eq!(
+        optimized(
+            "SELECT b FROM t WHERE (a = 1 AND d > 0) OR (a = 2 AND d > 0 AND d = 1 OR b = 'x')"
+        ),
+        lines(&[
+            "Projection: t.b",
+            "  Filter: t.a = 1 AND t.d > 0 OR (t.a = 2 AND t.d > 0 AND t.d = 1 OR t.b = 'x')",
+            "    Scan: t projection=[a, b, d]",
+        ])
+    );
+}
+
+#[test]
 fn conditions_move_below_joins_to_the_side_they_read() {
     // A comma join with an equality in WHERE becomes an inner hash join; one-sided conditions go to their side.
     assert_eq!(
