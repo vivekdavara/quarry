@@ -284,7 +284,7 @@ fn query_output_writes_the_result_as_parquet() {
 }
 
 #[test]
-fn query_batch_size_changes_the_batches_not_the_answer() {
+fn query_batch_size_sets_the_batches() {
     let dir = TempDir::new().unwrap();
     let orders = sample(dir.path());
     let sql = "SELECT customer, count(*) FROM orders GROUP BY customer ORDER BY 2 DESC, 1 LIMIT 1 OFFSET 1";
@@ -294,6 +294,20 @@ fn query_batch_size_changes_the_batches_not_the_answer() {
         let out = quarry(&["query", "--batch-size", size, "-t", &orders, sql]);
         assert_eq!(stdout(&out), default, "batch size {size}");
     }
+    // The batches are really that size: an error under a LIMIT depends on them (DESIGN.md, "Execution"). One row a
+    // batch, the LIMIT is met at id 1 and id 2's division by zero never runs; in one batch it does.
+    let limited = "SELECT id FROM orders WHERE 10 % (id - 2) = 0 LIMIT 1";
+    let out = quarry(&["query", "--batch-size", "1", "-t", &orders, limited]);
+    assert!(
+        stdout(&out).ends_with("| 1  |\n+----+\n1 row\n"),
+        "{}",
+        stdout(&out)
+    );
+    let out = quarry(&["query", "-t", &orders, limited]);
+    assert_eq!(
+        stderr(&out),
+        "error: execution error: division by zero in 10 % (orders.id - 2)\n"
+    );
     let out = quarry(&["query", "--batch-size", "0", "-t", &orders, sql]);
     assert_eq!(out.status.code(), Some(2));
     assert!(
