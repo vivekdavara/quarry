@@ -74,3 +74,36 @@ fn pushdown_never_moves_a_factored_ors_failing_remainder_onto_rows_the_join_key_
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// The same with a cast instead of a modulo (found by the second day-4 review: treating every expression as unable to
+/// fail passed every other test). As bound, `CAST(r.s AS BIGINT)` runs only on pairs whose keys match; factored, the
+/// rest would read r alone, go below the join, and cast r's 'x'.
+#[test]
+fn an_or_with_a_cast_isnt_factored() {
+    use quarry::arrow::array::StringArray;
+    let mut c = Catalog::new();
+    let l = int_table(&[("k", vec![Some(1)])]);
+    let r = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("s", DataType::Utf8, true),
+            Field::new("w", DataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 5])),
+            Arc::new(StringArray::from(vec!["1", "x"])),
+            Arc::new(Int64Array::from(vec![0, 0])),
+        ],
+    )
+    .unwrap();
+    c.register("l", Arc::new(MemTable::from_batch(l))).unwrap();
+    c.register("r", Arc::new(MemTable::from_batch(r))).unwrap();
+    for sql in [
+        "SELECT l.k FROM l, r WHERE (l.k = r.k AND CAST(r.s AS BIGINT) = 1) OR (l.k = r.k AND r.w = 1)",
+        "SELECT l.k FROM l LEFT JOIN r ON (l.k = r.k AND CAST(r.s AS BIGINT) = 1) OR (l.k = r.k AND r.w = 1)",
+    ] {
+        let (bound, optimized) = bound_and_optimized(&c, sql);
+        assert_eq!(bound, Ok(1), "{sql}: bound");
+        assert_eq!(optimized, bound, "{sql}");
+    }
+}
