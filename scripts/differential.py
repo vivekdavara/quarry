@@ -9,7 +9,8 @@ seeded with S (default 1): filters (comparisons, BETWEEN, IN, LIKE, IS NULL, dat
 branches share a conjunct), joins along the schema's keys (comma joins, JOIN ... ON, LEFT JOIN ... ON with a
 condition on the right), GROUP BY with every aggregate and HAVING, and select lists of expressions with ORDER BY,
 LIMIT and OFFSET. Quarry runs through its CLI (`quarry query --output`, so types, NULLs and floats come back
-exactly); DuckDB on one thread over the same files.
+exactly), each query at a batch size drawn from 1 to 8,192 rows (from a generator of its own, so a seed's queries
+don't depend on it); DuckDB on one thread over the same files.
 
 Every query orders its output completely (by every group key, or by every select item), so rows are compared in
 order: NULL with NULL, numbers equal (floats within a relative 1e-9: sums add in other orders), the rest equal. A
@@ -357,9 +358,10 @@ class Engines:
             if isinstance(table, str):
                 (KEYS[column],) = self.duck.execute(f"SELECT count(*) FROM {table}").fetchone()
 
-    def run_quarry(self, sql: str):
+    def run_quarry(self, sql: str, batch_size: int):
         done = subprocess.run(
-            [self.quarry, "query", *self.table_args, "--output", str(self.out), "--", sql],
+            [self.quarry, "query", *self.table_args, "--batch-size", str(batch_size), "--output", str(self.out), "--",
+             sql],
             capture_output=True, text=True, timeout=120, check=False,
         )
         if done.returncode != 0:
@@ -392,10 +394,12 @@ def main() -> int:
             return 1
         gen = Generator(args.seed)  # after Engines, which reads the key ranges
         queries += [(f"random {i + 1}", gen.query()) for i in range(args.random)]
+        sizes = random.Random(args.seed + 1_000_003)
+        batch_sizes = sizes.choices([1, 3, 7, 64, 1000, 8192], weights=[5, 10, 15, 15, 15, 40], k=len(queries))
         agree = both_failed = rows = 0
         failures = []
-        for name, sql in queries:
-            got, quarry_error = engines.run_quarry(sql)
+        for (name, sql), batch_size in zip(queries, batch_sizes):
+            got, quarry_error = engines.run_quarry(sql, batch_size)
             want, duckdb_error = engines.run_duckdb(sql)
             if quarry_error and duckdb_error:
                 both_failed += 1
@@ -405,6 +409,7 @@ def main() -> int:
             else:
                 problem = differs(got, want)
             if problem:
+                problem = f"{problem} (batch size {batch_size})"
                 failures.append((name, sql, problem))
                 print(f"DIFFERS {name}: {problem}\n  {sql}")
             else:
