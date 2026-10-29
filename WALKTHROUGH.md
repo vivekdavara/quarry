@@ -429,6 +429,13 @@ change detection between runs.
   join's left-side `ON` conditions, which the generator never wrote. Each time the fix was to make the shape, and
   then to run the mutant again to see it fail. A differential test proves only what its generator reaches; counting
   constructs over many generated queries (the review's script) is how to see what it doesn't.
+- **My fix of the second review's finding broke the test it fixed.** The differential crashed when a correct but slow
+  query timed out at 3 rows a batch; I made it re-run such a query at 8,192 rows. The third review wrapped the binary
+  in a script that hangs at every other batch size, and the differential passed it: my fix had turned "hangs at small
+  batches" into a printed note. A run that needed a retry now fails unless `--slow-ok` says so. Each round's tests
+  had survivors too (a `CASE` treated as unable to fail, `--batch-size` values between 2 and 8,191, the generator
+  ignoring its batch sizes), each found by a mutant the reviewer ran, each now caught. Lesson, again: when a fix makes
+  a check more lenient, ask what else it now lets through.
 - **Several claims went into docs or commit messages before I checked them.** The answers commit says five TPC-H
   queries match DuckDB exactly; it is six (`9996a1d`, corrected in DESIGN.md). A first draft of the README named the
   wrong commit for the 10.96 s Q19 run; this file said the generator "took an hour" and DuckDB's 8 threads were "4-6x"

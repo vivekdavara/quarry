@@ -443,8 +443,7 @@ giving the bound plan's rows, and checked the batched generator at a scale one r
 8,192 rows hid hangs, so a wrapper that sleeps at every other batch size passed with "18 re-run" and exit 0. A run
 that retried now fails unless `--slow-ok` is given (`a39e4e1`). And three survivors in round 2's tests, each now
 caught: `cannot_fail` treating `CASE` as safe, a CLI sending every size below 8,192 to 1, and `generate_in_batches`
-ignoring its sizes (it now reports batch counts; `d9a8c40`, `e2966f4`). Fifth project in a row where each round
-found bugs in the last round's fixes.
+ignoring its sizes (it now reports batch counts; `d9a8c40`, `e2966f4`).
 
 ## Review of day 3
 
