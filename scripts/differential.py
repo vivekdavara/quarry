@@ -11,8 +11,9 @@ condition on the right), GROUP BY with every aggregate and HAVING, and select li
 LIMIT and OFFSET. Quarry runs through its CLI (`quarry query --output`, so types, NULLs and floats come back
 exactly), each query at a batch size drawn from 1, 3, 7, 64, 1,000 and 8,192 rows (from a generator of its own, so a
 seed's queries don't depend on it); DuckDB on one thread over the same files. A query that passes --timeout (120 s)
-at a small batch size runs again at 8,192 rows and is compared then (a join that fans out to millions of rows is
-slow, not wrong, at 3 rows a batch); one that times out at 8,192 too is a difference.
+at a small batch size runs again at 8,192 rows and is compared then, but the run still fails unless --slow-ok is
+given: a join that fans out to millions of rows is slow, not wrong, at 3 rows a batch, but a hang at small batch
+sizes looks the same. One that times out at 8,192 too is a difference.
 
 Every query orders its output completely (by every group key, or by every select item), so rows are compared in
 order, after the column names: NULL with NULL, the rest of one type (an integer isn't a float) and equal, floats
@@ -456,7 +457,11 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--failures", type=pathlib.Path)
     parser.add_argument("--timeout", type=float, default=120.0, help="seconds a Quarry run may take")
+    parser.add_argument("--slow-ok", action="store_true",
+                        help="pass a run whose only problem is queries that timed out at a small batch size")
     args = parser.parse_args()
+    if not args.timeout > 0:
+        parser.error("--timeout must be above 0")
     if args.random < 0:
         parser.error("--random must be 0 or more")
     with tempfile.TemporaryDirectory() as scratch:
@@ -499,6 +504,10 @@ def main() -> int:
             args.failures.mkdir(parents=True, exist_ok=True)
             for name, sql, problem in failures:
                 (args.failures / f"{name.replace(' ', '_')}.sql").write_text(f"-- {problem}\n{sql}\n")
+        if retried and not args.slow_ok:
+            print(f"{retried} queries timed out at a small batch size (a hang there looks the same); "
+                  "--slow-ok accepts that")
+            return 1
         return 1 if failures else 0
 
 
