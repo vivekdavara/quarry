@@ -406,8 +406,9 @@ pass a broken engine.
 
 Checked and found sound: `scatter_booleans` (offsets, no Null-typed right side reaches it), `--output` with a
 NULL-typed column, zero rows or a failed query (the old file stays), the generator's rules, and the differential's
-handling of a failed run (it never reads a stale result file). Survivors it listed: the comparisons check values, not
-types or names (README, "Limitations").
+handling of a failed run (it never reads a stale result file). Survivors it listed: the differential compared values,
+not types or names (an integer 65 equalled a float 65.0); it now compares column names and requires one type per
+value.
 
 ## Review of day 3
 
@@ -548,8 +549,7 @@ property then found one more bug itself: `-(-0)` printed as `-0`, which binds ba
 - The differential test checks what its generator writes: Parquet inputs only (CSV is covered by `tests/execute.rs`),
   no casts, no NULL literals outside `IN` lists, no division or modulo by a column, no subqueries (Quarry
   has none). Its float comparison allows a relative 1e-9, so a bug that moves a float sum by less than that passes.
-  It compares values, not column names or types (an integer 65 equals a float 65.0; `tests/tpch.rs` checks names for
-  the TPC-H queries), and a query both engines refuse is counted, not compared.
+  A query both engines refuse is counted, not compared.
 - In `a, b JOIN c ON ...` the `ON` sees only `b` and `c` (the SQL standard's and PostgreSQL's scoping); DuckDB 2.0 lets
   it see `a`, so such a query runs there and is an error here.
 

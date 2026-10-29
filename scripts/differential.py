@@ -13,7 +13,8 @@ exactly), each query at a batch size drawn from 1 to 8,192 rows (from a generato
 don't depend on it); DuckDB on one thread over the same files.
 
 Every query orders its output completely (by every group key, or by every select item), so rows are compared in
-order: NULL with NULL, numbers equal (floats within a relative 1e-9: sums add in other orders), the rest equal. A
+order, after the column names: NULL with NULL, the rest of one type (an integer isn't a float) and equal, floats
+within a relative 1e-9 (sums add in other orders). A
 query one engine fails and the other doesn't is a difference; both failing is counted, not compared. The generator
 stays inside the SQL both engines define the same way (DESIGN.md's table of rules): no casts, no division or modulo
 by a column, no arithmetic on literals alone (DuckDB's DECIMAL literals), no float literal next to an integer.
@@ -376,25 +377,34 @@ class Generator:
 
 
 def same(a, b) -> bool:
+    """Two values are the same: both NULL, or of one type (an integer isn't a float: a count computed as a DOUBLE is
+    a difference) and equal, floats within a relative 1e-9."""
     if a is None or b is None:
         return a is None and b is None
-    numbers = (int, float)
-    if isinstance(a, numbers) and isinstance(b, numbers) and not isinstance(a, bool) and not isinstance(b, bool):
-        if isinstance(a, int) and isinstance(b, int):
-            return a == b
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, float):
         if math.isnan(a) or math.isnan(b):
             return math.isnan(a) and math.isnan(b)
         return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9)
-    return type(a) is type(b) and a == b
+    return a == b
 
 
 def differs(got, want) -> str | None:
+    """Results are (column names, rows)."""
+    (got_names, got), (want_names, want) = got, want
+    if got_names != want_names:
+        return f"columns {got_names} here, {want_names} in DuckDB"
     if len(got) != len(want):
         return f"{len(got)} rows here, {len(want)} in DuckDB"
     for i, (g, w) in enumerate(zip(got, want)):
         if len(g) != len(w) or not all(same(x, y) for x, y in zip(g, w)):
             return f"row {i}: {g} here, {w} in DuckDB"
     return None
+
+
+def result(cursor) -> tuple[list[str], list[tuple]]:
+    return [d[0] for d in cursor.description], cursor.fetchall()
 
 
 class Engines:
@@ -422,11 +432,11 @@ class Engines:
         if done.returncode != 0:
             return None, done.stderr.strip()
         path = str(self.out).replace("'", "''")
-        return duckdb.execute(f"SELECT * FROM read_parquet('{path}')").fetchall(), None
+        return result(duckdb.execute(f"SELECT * FROM read_parquet('{path}')")), None
 
     def run_duckdb(self, sql: str):
         try:
-            return self.duck.execute(sql).fetchall(), None
+            return result(self.duck.execute(sql)), None
         except duckdb.Error as e:
             return None, str(e).splitlines()[0]
 
@@ -469,7 +479,7 @@ def main() -> int:
                 print(f"DIFFERS {name}: {problem}\n  {sql}")
             else:
                 agree += 1
-                rows += len(got)
+                rows += len(got[1])
         print(f"{len(queries)} queries (seed {args.seed}): {agree} agree ({rows} rows), {both_failed} failed in "
               f"both, {len(failures)} differ")
         if failures and args.failures:
