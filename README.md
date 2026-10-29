@@ -4,11 +4,12 @@ A SQL query engine over Parquet and CSV files, written in Rust on Apache Arrow (
 resolves every name and type against the files' schemas, builds a logical plan, and executes it with vectorized
 operators over Arrow record batches.
 
-**Status: day 3 of 5.** The readers, the catalog, the logical plan, the binder (SQL to a typed plan), the executor
+**Status: day 4 of 5.** The readers, the catalog, the logical plan, the binder (SQL to a typed plan), the executor
 (filter, projection, aggregate with GROUP BY and DISTINCT, sort and top-k, limit, hash and nested-loop joins, and
-vectorized expressions) and the optimizer (constant folding, predicate pushdown through joins and into Parquet row
-groups, projection pushdown) are done and tested; `quarry query` runs a query over files. Day 4 adds TPC-H-style
-queries checked against DuckDB, and benchmarks; day 5 a REPL and the release.
+vectorized expressions) and the optimizer (constant folding, `OR` factoring, predicate pushdown through joins and
+into Parquet row groups, projection pushdown) are done and tested; `quarry query` runs a query over files. Day 4 added
+a TPC-H-style data generator, eight TPC-H queries checked against DuckDB's answers, a differential test of random
+queries against DuckDB (in CI), criterion benchmarks and the timings below. Day 5 adds a REPL and the release.
 
 ## Why
 
@@ -25,7 +26,7 @@ flowchart LR
     parser --> binder["binder<br/>(names, types, aggregates)"]
     catalog[("catalog")] --> binder
     binder --> logical["LogicalPlan"]
-    logical --> opt["optimizer<br/>(fold, push down)"]
+    logical --> opt["optimizer<br/>(fold, factor ORs, push down)"]
     opt --> exec["vectorized operators"]
     files[("Parquet / CSV")] --> catalog
     files --> exec
@@ -53,7 +54,8 @@ flowchart LR
   Arrow's row format, floats normalized, NULL keys matching nothing; the left streaming through it), a nested loop
   when there are none; the rest of `ON` is computed only on candidate pairs. Output in the left input's order at any
   batch size, a LEFT join's unmatched rows in place.
-- **Optimizer** (`optimizer/`, day 3): constant folding that leaves failing constants to fail lazily; predicate
+- **Optimizer** (`optimizer/`, day 3): constant folding that leaves failing constants to fail lazily; `OR` factoring
+  (day 4) that moves conjuncts every branch shares out of the `OR`, so TPC-H Q19's join key becomes one; predicate
   pushdown that moves conditions below joins to the side they read (a comma join with an equality becomes a hash
   join) and hands them to Parquet scans; projection pushdown that narrows each scan to the columns used above it.
 - **Row-group pruning** (`datasource/pruning.rs`, day 3): a scan's filters rewritten into conditions on each row
@@ -61,6 +63,11 @@ flowchart LR
   FALSE, and the filter still checks every row read.
 - **Top-k** (`exec/mod.rs`, day 3): `ORDER BY ... LIMIT k` keeps the best `k` rows by partial sorts of
   `max(2k, k + batch_size)` rows, never sorting the whole input.
+
+- **TPC-H-style data** (`crates/quarry-tpch`, day 4): seven TPC-H tables at any scale factor, deterministic, with
+  TPC-H's value rules (simplified where the queries don't care: `DOUBLE` money, dense keys); eight TPC-H queries and
+  DuckDB's answers to them. `scripts/differential.py` runs random queries through Quarry's CLI and DuckDB and
+  compares the rows.
 
 DESIGN.md is the specification: the type rules, name resolution, each node, the eight binding steps, and execution
 (each rule where engines differ, checked on DuckDB 2.0).
@@ -76,14 +83,19 @@ crates/quarry/          the engine (a library)
   src/sql/              parsing and the binder
   src/exec/             the executor: operators and top-k (mod.rs), expressions (expr.rs), aggregation
                         (aggregate.rs), joins (join.rs)
-  src/optimizer/        the rules: constant folding (fold.rs), predicate pushdown (predicates.rs), projection
-                        pushdown (columns.rs)
+  src/optimizer/        the rules: constant folding (fold.rs), OR factoring (factor.rs), predicate pushdown
+                        (predicates.rs), projection pushdown (columns.rs)
   tests/                datasource.rs, binder.rs, binder_properties.rs, execute.rs, eval_properties.rs,
                         query_properties.rs, join_properties.rs, optimizer.rs, optimizer_properties.rs,
-                        pruning.rs, skipped_errors.rs
-  examples/             gen_orders.rs (synthetic Parquet data), time_queries.rs (the timings below)
-scripts/duckdb_times.py the same timings in DuckDB, for scale
+                        pruning.rs, skipped_errors.rs, tpch.rs (TPC-H answers vs DuckDB's)
+  benches/tpch.rs       criterion benchmarks of the TPC-H queries
+  examples/             gen_orders.rs (synthetic Parquet data), time_queries.rs and tpch_times.rs (the timings
+                        below)
+crates/quarry-tpch/     TPC-H-style tables (src/lib.rs), the `tpch-gen` binary, the queries (queries/), DuckDB's
+                        answers at scale 0.01 (answers/), the generator's tests
 crates/quarry-cli/      the `quarry` binary and its tests
+scripts/                differential.py (random queries vs DuckDB), tpch_answers.py (writes answers/),
+                        tpch_duckdb_times.py and duckdb_times.py (DuckDB's timings, for scale)
 examples/orders.csv     eight synthetic rows for the examples below
 examples/customers.csv  four synthetic customers, for the join example
 DESIGN.md               the specification
@@ -200,26 +212,47 @@ error: plan error: cannot compare Float64 with Utf8 ('big') in total > 'big'
 
 `quarry head -n 3 examples/orders.csv` prints rows; `quarry --help` lists the rest.
 
+**TPC-H.** `tpch-gen` writes the tables (scale 0.01 is about 60,000 lines and 2 MB, scale 1 about 6 million and 238
+MB); each query is a file in `crates/quarry-tpch/queries/`. A query file starts with a SQL comment, so it goes after
+`--`:
+
+```bash
+./target/release/tpch-gen 0.01 data/tpch-0.01
+./target/release/quarry query -t data/tpch-0.01/lineitem.parquet -t data/tpch-0.01/part.parquet -- "$(cat crates/quarry-tpch/queries/q19.sql)"
+```
+
+That prints Q19's revenue, the number in `crates/quarry-tpch/answers/q19.csv` (DuckDB's). `--output FILE` writes a
+result as Parquet instead of printing it (what `scripts/differential.py` reads). The differential test against
+DuckDB needs Python with `duckdb==2.0.0`:
+
+```bash
+python scripts/differential.py target/release/quarry data/tpch-0.01 --random 1000 --seed 1
+```
+
 ## Tests
 
 `make check` runs rustfmt, Clippy with warnings as errors, every test, and the docs with no broken links; CI runs
-it on Linux (ubuntu-24.04) and macOS (macos-15) on every push.
+it on Linux (ubuntu-24.04) and macOS (macos-15) on every push, and on Linux also the property tests at 100,000 cases
+and the differential test against DuckDB (the TPC-H queries and 1,000 random queries, seed 1, scale 0.01).
 
 | Suite | What it checks |
 |---|---|
 | `tests/datasource.rs` (22) | Parquet and CSV files written in the test read back equal; projections in any order and with repeats; empty projections still count rows; batch sizes (0 included); inferred CSV types, NULLs, timestamps and impossible dates; the catalog's names |
 | `tests/binder.rs` (41) | each binding rule in DESIGN.md: the printed plan, or the error and its message; the review's findings; the depth limit on a 2 MiB stack |
 | `tests/binder_properties.rs` (3) | random expressions against a model of the type rules (below) |
-| `tests/execute.rs` (27) | queries end to end at batch sizes 1, 2, 3 and 8192, each run as bound and as optimized (all eight runs must agree, rows or error): filters, projections, ORDER BY (NULLs, -0.0, ties, hidden keys), LIMIT/OFFSET, that a LIMIT stops reading and computes only its rows, every aggregate, GROUP BY expressions, HAVING, DISTINCT, aggregates over no rows, float groups, i128 sums, errors; inner, LEFT and cross joins (order, NULL and float keys, casts, residuals, empty sides, three tables); a top-k whose LIMIT and OFFSET add past u64::MAX; the same queries over CSV and Parquet files |
+| `tests/execute.rs` (28) | queries end to end at batch sizes 1, 2, 3 and 8192, each run as bound and as optimized (all eight runs must agree, rows or error): filters, projections, ORDER BY (NULLs, -0.0, ties, hidden keys), LIMIT/OFFSET, that a LIMIT stops reading and computes only its rows, every aggregate, GROUP BY expressions, HAVING, DISTINCT, aggregates over no rows, float groups, i128 sums, errors; inner, LEFT and cross joins (order, NULL and float keys, casts, residuals, empty sides, three tables); a top-k whose LIMIT and OFFSET add past u64::MAX; ORs with common conjuncts over NULLs and a guarded modulo; the same queries over CSV and Parquet files |
 | `tests/eval_properties.rs` (3) | random well-typed expressions over random rows, evaluated by the engine and by a row-at-a-time reference interpreter in the test (below) |
 | `tests/query_properties.rs` (3) | random GROUP BY queries, and random ORDER BY with LIMIT and OFFSET, at random batch sizes against a reference grouping and a stable sort in plain Rust |
 | `tests/join_properties.rs` (1) | random INNER and LEFT joins of two random tables on random `ON`s (key equalities, comparisons, one-sided conditions, constants) at batch sizes 1-7, row for row against a nested loop in plain Rust with SQL's three-valued `AND` |
-| `tests/optimizer.rs` (5) | what each rule does to the printed plan: scans narrowed (`count(*)` reads no column), constants folded and failing ones kept, AND/OR simplified, conditions moved below inner and LEFT joins; EXPLAIN's `HashJoin`, `NestedLoopJoin` and `TopK` |
+| `tests/optimizer.rs` (6) | what each rule does to the printed plan: scans narrowed (`count(*)` reads no column), constants folded and failing ones kept, AND/OR simplified, an OR's common conjuncts factored (a join key, absorption, repeats, NOT and IS NULL, three branches; a conjunct that can fail left alone), conditions moved below inner and LEFT joins; EXPLAIN's `HashJoin`, `NestedLoopJoin` and `TopK` |
 | `tests/pruning.rs` (4) | random rows in Parquet row groups of 1-4 rows under random filters (comparisons, IN, IS NULL, LIKE, AND/OR/NOT) give the same rows pruned and unpruned; which row groups an ordered file skips, floats included; EXPLAIN's scan filters |
 | `tests/skipped_errors.rs` (3) | the documented cases where the optimized plan succeeds and the bound one fails, as on DuckDB 2.0: a pruned row group's bad row, a pushed-down condition that is NULL, an unread CSV column that doesn't parse |
-| `tests/optimizer_properties.rs` (1) | random whole queries (comma, inner and LEFT joins; WHERE with constants, comparisons, OR, NOT, IS NULL; GROUP BY or expressions; ORDER BY; LIMIT) give the same rows in the same order bound and optimized |
+| `tests/optimizer_properties.rs` (1) | random whole queries (comma, inner and LEFT joins; WHERE with constants, comparisons, OR, NOT, IS NULL, ORs whose branches share a conjunct; GROUP BY or expressions; ORDER BY; LIMIT) give the same rows in the same order bound and optimized |
+| `tests/tpch.rs` (3) | the eight TPC-H queries over the scale-0.01 tables give DuckDB 2.0.0's answers (names, rows in order, floats within a relative 1e-9) at batch sizes 7, 1000 and 8192; no plan has a nested loop; every answer has rows |
+| `quarry-tpch/tests/generate.rs` (4) | the generator: row counts per scale factor, bad factors refused, TPC-H's dates, byte-identical files on two runs and a pinned checksum, and every rule of the crate's documentation on every row at scale 0.005 |
+| `scripts/differential.py` (CI) | random queries (filters, joins, GROUP BY, ORDER BY with LIMIT) through the `quarry` CLI and DuckDB 2.0.0, row for row (DESIGN.md, "TPC-H-style data and the differential test") |
 | unit tests (33) | the common-type rules, date parsing over every day from 1600 to 2400 and against Arrow's own cast, expression printing, the plan nodes' guards and schemas; each operator of the evaluator, with DuckDB 2.0's answers; constant folding; which ON conjuncts become join keys; a footer without null counts |
-| `quarry-cli/tests/cli.rs` (9) | the built binary: output, exit codes, errors on stderr, `quarry query`, and that this README's examples print what it says |
+| `quarry-cli/tests/cli.rs` (10) | the built binary: output, exit codes, errors on stderr, `quarry query` and its `--output` Parquet file, and that this README's examples print what it says |
 
 The property tests bind `SELECT <expr> FROM t` for expressions from two generators (a random grammar of every
 supported operator, mostly ill-typed, and a type-directed one that builds well-typed trees three operators deep)
@@ -237,6 +270,63 @@ time over plain Rust values. The two must agree on every value, floats bit for b
 the batch must give the same as the whole. The GROUP BY property does the same for random queries (no key, or one or
 two of four columns; one to four aggregates, each maybe DISTINCT) against a grouping in plain Rust. Twelve mutations
 of the engine (six in the evaluator, six in aggregation) each fail one of them. CI runs both at 100,000 cases.
+
+## Results (day 4)
+
+**TPC-H at scale 1** (6,004,003 lines; the seven tables 238 MB of zstd Parquet, `lineitem` in 46 row groups),
+generated by `tpch-gen`; each query run in process once to warm up, then the median of 5 or 7 runs. Apple M3, macOS
+26.6.2, Rust 1.99.0 release build, on AC power, 2026-10-29; no run had the machine asleep. Quarry runs one thread.
+"Before" is commit `86879c6` (11:17); "after" is `7b7a64a`, the boolean scatter below (11:21, 7 runs). DuckDB 2.0.0
+ran on the same files right after the "before" run (`scripts/tpch_duckdb_times.py`, median of 5). Both engines give
+the same answers (`tests/tpch.rs` at scale 0.01; the differential test agrees at scales 0.01 and 0.1).
+
+```bash
+./target/release/tpch-gen 1 data/tpch-1
+cargo run --release -p quarry --example tpch_times -- data/tpch-1 7
+python scripts/tpch_duckdb_times.py data/tpch-1 5 1 8
+```
+
+| Query | Quarry before | Quarry after | DuckDB, 1 thread | DuckDB, 8 threads |
+|---|---|---|---|---|
+| Q1 pricing summary (4 groups over 5,920,021 lines) | 337.7 ms | 354.2 ms | 190.6 ms | 43.0 ms |
+| Q3 shipping priority (3 tables, top 10) | 225.4 ms | 228.9 ms | 131.8 ms | 35.2 ms |
+| Q5 local supplier volume (6 tables) | 383.4 ms | 383.1 ms | 138.0 ms | 36.0 ms |
+| Q6 forecasting revenue change (filter + sum) | 352.3 ms | **145.0 ms** | 81.6 ms | 20.9 ms |
+| Q10 returned items (4 tables, top 20) | 293.8 ms | 305.9 ms | 157.8 ms | 58.9 ms |
+| Q12 ship modes (2 tables, CASE sums) | 524.2 ms | **268.4 ms** | 84.7 ms | 24.0 ms |
+| Q14 promotion effect (2 tables, CASE, LIKE) | 198.8 ms | 153.9 ms | 134.4 ms | 34.6 ms |
+| Q19 discounted revenue (3-way OR) | 425.3 ms | 371.5 ms | 154.7 ms | 41.6 ms |
+
+What moved, and why:
+- **The boolean scatter** (`7b7a64a`). `sample` on Q6 put about three quarters of its stacks in putting the lazy
+  `AND`'s right-side results back in place: Arrow's `interleave` copies a boolean array one value at a time through
+  `MutableArrayData` (`set_bits`, `try_extend`, `interleave_fallback`). Writing the two bitmaps directly took Q6 from
+  352 to 145-182 ms (5 and 7 runs) and Q12 from 524 to 268-279 ms. The queries with few `AND`s left on one table
+  after pushdown (Q1 has none, Q3, Q5 and Q10 a few) didn't move: Q1's 338 to 354 ms is this machine's run-to-run
+  spread on the day, about 5%.
+- **`OR` factoring** made Q19 runnable: without it, the join key sits inside three `OR` branches and the join is a
+  nested loop over every pair of rows. At scale 0.01, `time quarry query ... q19.sql`: 10.96 s at `5fd1fc8` (before
+  the rule), 0.022 s with it (`18cb68e`), the same revenue. At scale 1 the nested loop would be 10,000 times the pairs.
+- **Against DuckDB**, Quarry on one thread is 1.1-3.2x one-thread DuckDB's time after the scatter (Q14 1.1x, Q5 and
+  Q12 2.8-3.2x). What isn't profiled yet: Q1 is a hash aggregate over 5.9M rows with four `sum`s and three `avg`s of
+  expressions; Q5 builds five hash tables.
+
+**Criterion** (`cargo bench -p quarry --bench tpch`, scale 0.1, at `f987072`, before the scatter; medians of 20
+samples): Q1 33.0 ms, Q3 18.9, Q5 30.3, Q6 34.2, Q10 26.4, Q12 53.8, Q14 15.1, Q19 37.4; planning alone (parse, bind,
+optimize) 42 µs (Q6) to 176 µs (Q19).
+
+**The differential test** (`scripts/differential.py`, 8 TPC-H queries plus 300 random ones per seed). Its first run
+found 17 differences, all one thing: DuckDB accepts `a, b JOIN c ON <a condition on a>` and Quarry (like the SQL
+standard and PostgreSQL 14) refuses it; the generator now uses one join style per query. After that, seeds 1-6 at
+scale 0.01 agreed on all 1,848 queries, CI's 1,008 (seed 1) agree, and at scale 0.1 seeds 1 and 7 agree on 616. Four
+deliberate engine bugs, each built into a release binary and run with seed 1:
+
+| Bug | Queries that differ (of 308) |
+|---|---|
+| LEFT joins run as inner joins | 18 |
+| `DISTINCT` in aggregates ignored | 15 |
+| pruning `x > v` by the row group's minimum instead of its maximum | 15 (18 at scale 0.1) |
+| `a OR (a AND b)` factored as `a AND b` | 7 (0 before the generator made that shape) |
 
 ## Results (day 3)
 
@@ -403,11 +493,29 @@ property then found one more bug itself: `-(-0)` printed as `-0`, which binds ba
   when `ON` has a key, a top-k when a LIMIT reaches a sort), and `exec::explain` makes the same calls for EXPLAIN. With
   one choice per node that is simpler than a second plan tree to keep in step; a cost-based choice (which side to
   build, join order) would be the point to add one.
+- **A TPC-H-style generator of our own**, not `dbgen` or DuckDB's `tpch` extension: byte-identical files on every
+  platform from fixed seeds, no TPC license terms, and the types Quarry computes on (`DOUBLE`, not `DECIMAL`). The
+  queries only need TPC-H's value rules, which the crate states and its tests check on every row.
+- **DuckDB's answers both committed and live.** `tests/tpch.rs` compares with answers DuckDB wrote once, so `cargo
+  test` checks the TPC-H queries without Python; `scripts/differential.py` asks DuckDB live, for random queries and
+  any scale. Every number in the comparison is DuckDB's, none written by hand.
+- **Factor only what can't fail.** `OR` factoring moves a conjunct to rows its branch's earlier conjuncts kept from it;
+  limited to comparisons and boolean operators over columns and literals, that can only skip work, never add a
+  failure, and it is all Q19 needs.
 - **Pruning as a hint, evaluated by the engine.** Scans get the filters but the filter node stays, and the statistics
   conditions run through the same evaluator as the query, so pruning can only be too cautious, never differently
   typed or ordered than the filter; random data checks it can't drop a row.
 
-## Limitations (day 3)
+## Limitations (day 4)
+
+- Eight of TPC-H's 22 queries run; the rest need subqueries, `EXTRACT`, `INTERVAL` or views (and `partsupp`, which
+  the generator doesn't write). The data is TPC-H-style, not `dbgen`'s: `DOUBLE` money, dense keys, simpler text, so
+  the timings aren't comparable with published TPC-H results, only with DuckDB on the same files.
+- The differential test checks what its generator writes: Parquet inputs only (CSV is covered by `tests/execute.rs`),
+  the CLI's default batch size, no casts, no NULL literals, no division or modulo by a column, no subqueries (Quarry
+  has none). Its float comparison allows a relative 1e-9, so a bug that moves a float sum by less than that passes.
+- In `a, b JOIN c ON ...` the `ON` sees only `b` and `c` (the SQL standard's and PostgreSQL's scoping); DuckDB 2.0 lets
+  it see `a`, so such a query runs there and is an error here.
 
 - Sort and aggregate hold their whole input or all groups in memory, and a join its whole right input; there is no
   spilling to disk, and one thread does all the work. The right input is always the build side (no join reordering,
