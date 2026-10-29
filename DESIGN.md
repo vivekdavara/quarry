@@ -334,12 +334,15 @@ every query bound and optimized, at every batch size, and requires the same rows
    the first branch's order; repeats are factored once. The point is the next rule: a factored conjunct is a conjunct
    of its own, which can become a join key or move to one side. TPC-H's Q19 writes `p_partkey = l_partkey` in each of
    its three branches, and was a nested loop over every pair of rows without this (10.96 s at scale 0.01, 0.022 s
-   with it). Only conjuncts that **can't fail** are factored: comparisons, `IN`, `IS [NOT] NULL`, `NOT`, `AND` and
-   `OR` over columns and literals. `AND` and `OR` are lazy, so in `(d <> 0 AND 10 % d = 1) OR (a > 5 AND 10 % d =
-   1)` neither branch reaches the modulo where `d` is 0; factored out, it would run on every row. With that rule, a
-   factored conjunct computes values that can't fail on more rows, and everything left in the `OR` runs on fewer, so
-   the rewrite can make a plan succeed where it failed (it skips work), never the reverse. DuckDB 2.0 factors these
-   ORs too (Q19 is a hash join there).
+   with it). Only an `OR` in which nothing **can fail** is factored: every conjunct of every branch a comparison,
+   `IN`, `IS [NOT] NULL`, `NOT`, `AND` or `OR` over columns and literals. Two things go wrong otherwise, both from
+   laziness. A factored conjunct runs on every row: in `(d <> 0 AND 10 % d = 1) OR (a > 5 AND 10 % d = 1)` neither
+   branch reaches the modulo where `d` is 0, but factored out it would. And what is left can move: in `(l.k = r.k AND
+   10 % r.v = 0) OR (l.k = r.k AND r.w = 1)` the modulo runs only on pairs whose keys match, but once `l.k = r.k` is
+   factored out the rest reads `r` alone, and predicate pushdown moves it onto every `r` row, including one no key
+   matches (the day-4 review found this; first the rule checked only the common conjuncts). With nothing in the `OR`
+   able to fail, neither the rewrite nor pushdown's moves of its pieces can add a failure; Q19's `OR` qualifies.
+   DuckDB 2.0 factors such ORs too (Q19 is a hash join there).
 3. **Predicate pushdown** (`optimizer/predicates.rs`). A filter over an inner or cross join joins its `ON` (for an
    inner join they mean the same; a cross join with an `ON` is an inner join, so `FROM t, u WHERE t.a = u.a` is a
    hash join). The `ON`'s conjuncts that read one side only become a filter on that side, the `ON`'s own first, then

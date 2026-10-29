@@ -4,11 +4,13 @@
 //! make a join key. TPC-H's Q19 writes its join key inside each of three `OR` branches; without this rule it is a
 //! nested loop over every pair of rows.
 //!
-//! Only conjuncts that can't fail are factored: comparisons, `IN`, `IS [NOT] NULL`, `NOT`, `AND` and `OR` over columns
-//! and literals. `AND` and `OR` are lazy, so in `(x <> 0 AND 10 % x = 1) OR (y AND 10 % x = 1)` the modulo never sees
-//! a zero `x`; factored out, it would be computed on every row. A factored conjunct that can't fail computes the same
-//! values on more rows, and everything left in the `OR` is computed on fewer, so the rewritten condition can fail only
-//! where the original did.
+//! Only an `OR` in which nothing can fail is factored: comparisons, `IN`, `IS [NOT] NULL`, `NOT`, `AND` and `OR` over
+//! columns and literals, in every branch. `AND` and `OR` are lazy, so in `(x <> 0 AND 10 % x = 1) OR (y AND 10 % x =
+//! 1)` the modulo never sees a zero `x`; factored out, it would be computed on every row. Nor may what is left of the
+//! branches fail: in `(l.k = r.k AND 10 % r.v = 0) OR (l.k = r.k AND r.w = 1)` the modulo runs only on pairs whose keys
+//! match, but once `l.k = r.k` is factored out, the rest reads `r` alone and predicate pushdown moves it below the
+//! join, onto every `r` row (the day-4 review found this; `tests/factoring_and_pushdown.rs`). With nothing in the `OR`
+//! able to fail, neither this rewrite nor where pushdown then moves its pieces can add a failure.
 
 use crate::plan::{BinaryOp, Expr, Filter, Join, LogicalPlan};
 
@@ -34,9 +36,12 @@ fn factor(condition: &Expr) -> Expr {
     Expr::and_all(conjuncts).expect("a condition has a conjunct")
 }
 
-/// An `OR` whose branches all have conjuncts in common that can't fail, as those conjuncts followed by the `OR` of
+/// An `OR` that can't fail and whose branches all have conjuncts in common, as those conjuncts followed by the `OR` of
 /// what is left of each branch (or by nothing, when some branch has nothing left); anything else as it is.
 fn factor_or(conjunct: &Expr) -> Vec<Expr> {
+    if !cannot_fail(conjunct) {
+        return vec![conjunct.clone()];
+    }
     let branches: Vec<Vec<&Expr>> = conjunct
         .disjuncts()
         .into_iter()
@@ -45,10 +50,7 @@ fn factor_or(conjunct: &Expr) -> Vec<Expr> {
     let mut common: Vec<&Expr> = Vec::new();
     if branches.len() > 1 {
         for &c in &branches[0] {
-            if cannot_fail(c)
-                && !common.contains(&c)
-                && branches[1..].iter().all(|b| b.contains(&c))
-            {
+            if !common.contains(&c) && branches[1..].iter().all(|b| b.contains(&c)) {
                 common.push(c);
             }
         }

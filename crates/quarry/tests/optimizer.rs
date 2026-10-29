@@ -188,6 +188,19 @@ fn conjuncts_every_or_branch_has_move_out_of_the_or() {
             "    Scan: t projection=[a, b, d]",
         ])
     );
+    // Nor when what is left can fail: factored out, `t.a = u.a` would leave `10 % u.y = 0 OR u.x = 'k'`, which reads u
+    // alone and would go below the join, onto u rows no key matches (tests/factoring_and_pushdown.rs).
+    assert_eq!(
+        optimized(
+            "SELECT t.b FROM t, u WHERE (t.a = u.a AND 10 % u.y = 0) OR (t.a = u.a AND u.x = 'k')"
+        ),
+        lines(&[
+            "Projection: t.b",
+            "  Join: Inner on t.a = u.a AND 10 % u.y = 0 OR t.a = u.a AND u.x = 'k'",
+            "    Scan: t projection=[a, b]",
+            "    Scan: u projection=[a, x, y]",
+        ])
+    );
     // A nested OR's branches are branches too, and `b = 'x'` shares nothing with the others: unchanged.
     assert_eq!(
         optimized(

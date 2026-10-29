@@ -499,9 +499,9 @@ property then found one more bug itself: `-(-0)` printed as `-0`, which binds ba
 - **DuckDB's answers both committed and live.** `tests/tpch.rs` compares with answers DuckDB wrote once, so `cargo
   test` checks the TPC-H queries without Python; `scripts/differential.py` asks DuckDB live, for random queries and
   any scale. Every number in the comparison is DuckDB's, none written by hand.
-- **Factor only what can't fail.** `OR` factoring moves a conjunct to rows its branch's earlier conjuncts kept from it;
-  limited to comparisons and boolean operators over columns and literals, that can only skip work, never add a
-  failure, and it is all Q19 needs.
+- **Factor only ORs that can't fail.** `OR` factoring moves a conjunct onto rows its branch's earlier conjuncts kept
+  from it, and lets pushdown move what is left; limited to ORs made of comparisons and boolean operators over columns
+  and literals, that can only skip work, never add a failure, and it is all Q19 needs.
 - **Pruning as a hint, evaluated by the engine.** Scans get the filters but the filter node stays, and the statistics
   conditions run through the same evaluator as the query, so pruning can only be too cautious, never differently
   typed or ordered than the filter; random data checks it can't drop a row.

@@ -152,8 +152,8 @@ batch.
 **How does `WHERE b <> 0 AND a % b = 1` avoid dividing by zero, if both sides are computed a column at a time?**
 It wouldn't, if both were. `AND` evaluates its left side first; the rows where that is `FALSE` are decided. Only the
 other rows are taken out of the batch (`take_rows`), the right side is evaluated on them, and the results are put
-back in place with NULLs at the decided rows (`scatter`, via Arrow's `interleave`), which three-valued `AND` then
-ignores. `OR` does the same with `TRUE`, and `CASE` evaluates each `THEN` only on the rows whose `WHEN` took them.
+back in place with NULLs at the decided rows (`scatter`: for booleans, `scatter_booleans` writes the bitmaps directly
+since day 4; other types go through Arrow's `interleave`), which three-valued `AND` then ignores. `OR` does the same with `TRUE`, and `CASE` evaluates each `THEN` only on the rows whose `WHEN` took them.
 DuckDB behaves the same way, which I checked; PostgreSQL documents the same guarantee for `CASE`.
 
 **Why does `%` by zero fail but `/` by zero return infinity?**
@@ -246,8 +246,8 @@ Simplicity and the order guarantee. Building the smaller side is faster, but for
 output follow the other input's order. The statistics exist (`TableStatistics::num_rows`); swapping is a day-4 option.
 
 **What does the optimizer do?**
-`optimizer::optimize` runs three rules once each: constant folding, predicate pushdown, projection pushdown (DESIGN.md,
-"The optimizer"). Each keeps the plan's output columns exactly, which is what lets `execute.rs` run every query bound
+`optimizer::optimize` runs four rules once each: constant folding, `OR` factoring (day 4), predicate pushdown,
+projection pushdown (DESIGN.md, "The optimizer"). Each keeps the plan's output columns exactly, which is what lets `execute.rs` run every query bound
 and optimized and require the same rows or the same error.
 
 **How does constant folding avoid turning a lazy error into an eager one?**
@@ -388,8 +388,12 @@ exact in three-valued logic. Q19 needs it: its join key `p_partkey = l_partkey` 
 branches, so without the rule there is no key and the join is a nested loop (10.96 s at scale 0.01; 0.022 s with the
 rule). The restriction is about laziness: in `(d <> 0 AND 10 % d = 1) OR (a > 5 AND 10 % d = 1)` the modulo never runs
 where `d` is 0, because each branch's guard comes first. Factored out, it would run on every row and fail. So
-`cannot_fail` accepts only comparisons and boolean operators over columns and literals; then the rewrite can only
-skip work (`ors_with_common_conjuncts_keep_their_rows_once_factored`).
+So the whole `OR` must pass `cannot_fail` (comparisons and boolean operators over columns and literals), not just the
+common conjuncts: my first version checked only those, and the review showed why that isn't enough. In `(l.k = r.k AND
+10 % r.v = 0) OR (l.k = r.k AND r.w = 1)`, factoring out the key leaves an `OR` that reads `r` alone, and predicate
+pushdown moved it below the join onto an `r` row no key matched: the optimized plan divided by zero where the bound
+plan returned a row (`tests/factoring_and_pushdown.rs`). With nothing in the `OR` able to fail, the rewrite and the
+later moves can only skip work.
 
 **Why was Q6 slow, and what fixed it?**
 `sample` on a loop of Q6 at scale 1: about three quarters of the stacks were in Arrow's `interleave` on boolean arrays
