@@ -10,7 +10,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use quarry::arrow::record_batch::RecordBatch;
 use quarry::arrow::util::pretty::pretty_format_batches;
-use quarry::datasource::TableProvider;
+use quarry::datasource::{DEFAULT_BATCH_SIZE, TableProvider};
 use quarry::exec;
 use quarry::optimizer::optimize;
 use quarry::parquet::arrow::ArrowWriter;
@@ -54,6 +54,11 @@ enum Command {
         /// exactly (for scripts, such as scripts/differential.py). An existing file is replaced.
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
+        /// The most rows a batch holds, from the scans up. The answer doesn't depend on it; scripts/differential.py
+        /// varies it to check that against DuckDB.
+        #[arg(long, value_name = "ROWS", default_value_t = DEFAULT_BATCH_SIZE as u32,
+              value_parser = clap::value_parser!(u32).range(1..))]
+        batch_size: u32,
         /// The query (after `--` if it starts with `-`, as a SQL comment does).
         sql: String,
     },
@@ -86,6 +91,7 @@ fn run(command: Command) -> Result<String> {
         Command::Query {
             tables,
             output,
+            batch_size,
             sql,
         } => match (sql::bind(&catalog(&tables)?, &sql)?, output) {
             (BoundStatement::Explain(_), Some(_)) => Err(QuarryError::Plan(
@@ -93,7 +99,7 @@ fn run(command: Command) -> Result<String> {
             )),
             (BoundStatement::Explain(plan), None) => Ok(exec::explain(&optimize(&plan)?)),
             (BoundStatement::Query(plan), output) => {
-                let result = exec::collect(&optimize(&plan)?)?;
+                let result = exec::collect_with_batch_size(&optimize(&plan)?, batch_size as usize)?;
                 let rows = result.num_rows();
                 let noun = if rows == 1 { "row" } else { "rows" };
                 match output {

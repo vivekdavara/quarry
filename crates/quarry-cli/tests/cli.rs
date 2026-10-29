@@ -267,6 +267,26 @@ fn query_output_writes_the_result_as_parquet() {
 }
 
 #[test]
+fn query_batch_size_changes_the_batches_not_the_answer() {
+    let dir = TempDir::new().unwrap();
+    let orders = sample(dir.path());
+    let sql = "SELECT customer, count(*) FROM orders GROUP BY customer ORDER BY 2 DESC, 1 LIMIT 1 OFFSET 1";
+    let default = stdout(&quarry(&["query", "-t", &orders, sql]));
+    assert!(default.ends_with("1 row\n"), "{default}");
+    for size in ["1", "2", "8192"] {
+        let out = quarry(&["query", "--batch-size", size, "-t", &orders, sql]);
+        assert_eq!(stdout(&out), default, "batch size {size}");
+    }
+    let out = quarry(&["query", "--batch-size", "0", "-t", &orders, sql]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).contains("invalid value '0'"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
 fn a_query_that_fails_while_running_is_status_1() {
     let dir = TempDir::new().unwrap();
     let out = quarry(&[
