@@ -450,7 +450,10 @@ The generator draws from what both engines define the same way (the table in "Ex
 schema's keys, as comma joins, `JOIN ... ON` or `LEFT JOIN ... ON` with a condition on the right; `GROUP BY` with
 every aggregate and `HAVING`; select lists of arithmetic, string concatenation, date differences and `CASE`, with
 `DISTINCT`, `ORDER BY`, `LIMIT` and `OFFSET`. Every query orders its output completely (by every group key, or by
-every select item), so rows can be compared in order. It stays away from what DESIGN.md says differs: no casts, no
+every select item), so rows can be compared in order, after the column names, each value of DuckDB's type. Each query
+runs at a random batch size from 1 to 8,192 rows; one that times out at a small size is compared at 8,192 rows and
+fails the run unless `--slow-ok` says slowness is expected (a hang would look the same). It stays away from what
+DESIGN.md says differs: no casts, no
 division or modulo by a column, no arithmetic on literals alone, no float literal next to an integer (DuckDB's
 `DECIMAL`s), and one join style per query: in `a, b JOIN c ON <a condition on a>` the SQL standard and PostgreSQL 14
 scope the `ON` to `b JOIN c` and refuse it, as Quarry does, while DuckDB 2.0 reads `(a, b) JOIN c` (the script's

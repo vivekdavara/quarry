@@ -229,6 +229,10 @@ DuckDB needs Python with `duckdb==2.0.0`:
 python scripts/differential.py target/release/quarry data/tpch-0.01 --random 1000 --seed 1
 ```
 
+Each query runs at a random batch size; one that passes `--timeout` (120 s) at a small one is re-run at 8,192 rows
+and compared, and then the run fails unless `--slow-ok` is given (big fan-outs at scale 0.1 can be that slow at 3
+rows a batch, and so would a hang).
+
 ## Tests
 
 `make check` runs rustfmt, Clippy with warnings as errors, every test, and the docs with no broken links; CI runs
@@ -334,7 +338,8 @@ Planning alone (parse, bind, optimize): 42 µs (Q6) to 177 µs (Q19), unchanged 
 found 17 differences, all one thing: DuckDB accepts `a, b JOIN c ON <a condition on a>` and Quarry (like the SQL
 standard and PostgreSQL 14) refuses it; the generator now uses one join style per query. The generator grew three
 times during the day (an `OR` shape, random batch sizes, then the review's blind spots, below); with each version
-the engine agreed on every query run: with the last, seeds 1-3 at scale 0.01 (3,024 queries). Six deliberate engine
+the engine agreed on every query run: with the last, at the day's last commit, seeds 1-3 at scale 0.01 (3,024
+queries, none timed out) and seed 1 at scale 0.1 (308). Six deliberate engine
 bugs, each built into a release binary and run with seed 1, at scale 0.01 unless noted:
 
 | Bug | Queries that differ | Generator |
@@ -433,6 +438,13 @@ giving the bound plan's rows, and checked the batched generator at a scale one r
 - Three mechanisms no test pinned, each now tested: `cannot_fail` accepting everything (its `CAST` case, `5ce3da9`);
   a CLI ignoring `--batch-size` (an error under a LIMIT that depends on it, `defa4ca`); an off-by-one at the
   generator's batch boundaries (batches of 7 rows and 3 orders must give the same tables, `6dbd0d8`).
+
+**Round 3** (one agent on `2a34860..6dbd0d8`, round 2's fixes, 6 minutes): again **a bug in my fix**: the retry at
+8,192 rows hid hangs, so a wrapper that sleeps at every other batch size passed with "18 re-run" and exit 0. A run
+that retried now fails unless `--slow-ok` is given (`a39e4e1`). And three survivors in round 2's tests, each now
+caught: `cannot_fail` treating `CASE` as safe, a CLI sending every size below 8,192 to 1, and `generate_in_batches`
+ignoring its sizes (it now reports batch counts; `d9a8c40`, `e2966f4`). Fifth project in a row where each round
+found bugs in the last round's fixes.
 
 ## Review of day 3
 
