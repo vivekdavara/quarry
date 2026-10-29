@@ -167,6 +167,17 @@ fn conjuncts_every_or_branch_has_move_out_of_the_or() {
             "    Scan: t projection=[a, b, d]",
         ])
     );
+    // NOT and IS NULL can't fail either; once `a = 1` is absorbed, `a` isn't read.
+    assert_eq!(
+        optimized(
+            "SELECT b FROM t WHERE (b IS NULL AND NOT d > 0 AND a = 1) OR (NOT d > 0 AND b IS NULL)"
+        ),
+        lines(&[
+            "Projection: t.b",
+            "  Filter: t.b IS NULL AND NOT t.d > 0",
+            "    Scan: t projection=[b, d]",
+        ])
+    );
     // A conjunct that can fail stays where it is: factored out, it would run on rows its branch's earlier conjuncts
     // kept from it (here, the zeros of d).
     assert_eq!(
