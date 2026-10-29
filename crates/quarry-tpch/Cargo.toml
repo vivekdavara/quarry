@@ -1,0 +1,25 @@
+[package]
+name = "quarry-tpch"
+description = "TPC-H-style tables and queries for testing and measuring Quarry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "tpch-gen"
+path = "src/main.rs"
+# The library is called quarry_tpch; documenting the binary too would write the same target/doc/ folder.
+doc = false
+
+[dependencies]
+arrow.workspace = true
+parquet.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
