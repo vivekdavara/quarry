@@ -356,7 +356,7 @@ class Engines:
     def run_quarry(self, sql: str):
         done = subprocess.run(
             [self.quarry, "query", *self.table_args, "--output", str(self.out), "--", sql],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=120, check=False,
         )
         if done.returncode != 0:
             return None, done.stderr.strip()

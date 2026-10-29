@@ -41,6 +41,17 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-
       - name: Format, Clippy with warnings as errors, tests, docs without broken links
         run: make check
+      - uses: actions/setup-python@v6
+        if: runner.os == 'Linux'
+        with:
+          python-version: "3.11"
+      - name: Differential test against DuckDB 2.0.0 (the TPC-H queries and 1,000 random ones, at scale 0.01)
+        if: runner.os == 'Linux'
+        run: |
+          pip install duckdb==2.0.0
+          cargo build --release --locked -p quarry-cli -p quarry-tpch
+          ./target/release/tpch-gen 0.01 data/tpch-0.01
+          python -I scripts/differential.py target/release/quarry data/tpch-0.01 --random 1000 --seed 1
       - name: The property tests (binder, evaluator, GROUP BY and ORDER BY, joins, pruning, whole queries optimized) at 100,000 cases each (release build)
         if: runner.os == 'Linux'
         run: >-
