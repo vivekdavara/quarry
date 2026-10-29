@@ -200,9 +200,13 @@ class Generator:
             return f"({a}) AND ({b})"
         if choice < 0.7:
             return f"({a}) OR ({b})"
-        if choice < 0.85:
+        if choice < 0.8:
             s = self.leaf(columns, nullable)
             return f"(({s}) AND ({a})) OR (({b}) AND ({s}))"
+        if choice < 0.9:
+            # A branch that is only the shared conjunct: the OR is that conjunct.
+            s = self.leaf(columns, nullable)
+            return f"({s}) OR (({a}) AND ({s}))"
         return f"NOT ({a})"
 
     def from_clause(self):
