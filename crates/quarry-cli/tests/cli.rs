@@ -250,6 +250,23 @@ fn query_output_writes_the_result_as_parquet() {
         stdout(&quarry(&["schema", out_file])),
         "id: Int64\nrows: 0\n"
     );
+    // A file that can't be created is named in the error.
+    let missing = dir.path().join("no-such-dir").join("out.parquet");
+    let missing = missing.to_str().unwrap();
+    let out = quarry(&[
+        "query",
+        "-t",
+        &orders,
+        "-o",
+        missing,
+        "SELECT id FROM orders",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).starts_with(&format!("error: table error: --output {missing}: ")),
+        "{}",
+        stderr(&out)
+    );
     // EXPLAIN has no rows to write.
     let out = quarry(&[
         "query",

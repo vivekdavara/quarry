@@ -176,7 +176,8 @@ pub fn schema(table: &str) -> Option<SchemaRef> {
     Some(Arc::new(Schema::new(fields)))
 }
 
-/// A part's retail price in cents, from its key alone (TPC-H 4.2.3): 900.00 to 2,098.99.
+/// A part's retail price in cents, from its key alone (TPC-H 4.2.3): within 900.00 to 2,099.00 at any scale. At scale 1
+/// (keys up to 200,000) the prices run from 901.00 to 2,098.99; the bounds themselves need keys past scale 100.
 pub fn retail_price_cents(partkey: i64) -> i64 {
     90_000 + (partkey / 10) % 20_001 + 100 * (partkey % 1_000)
 }

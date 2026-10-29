@@ -150,7 +150,8 @@ fn parse_table(spec: &str) -> Result<(String, PathBuf)> {
 /// The result as one Parquet file (a single row group per batch the query made, uncompressed: these files are small
 /// and short-lived).
 fn write_parquet(path: &Path, result: &QueryResult) -> Result<()> {
-    let file = std::fs::File::create(path)?;
+    let file = std::fs::File::create(path)
+        .map_err(|e| QuarryError::Table(format!("--output {}: {e}", path.display())))?;
     let mut writer = ArrowWriter::try_new(file, result.schema.clone(), None)?;
     for batch in &result.batches {
         writer.write(batch)?;
