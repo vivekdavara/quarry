@@ -333,6 +333,85 @@ The join is still 6x one-thread DuckDB and string-heavy queries 3-22x. Those are
 day 4's benchmarks are where to find out (one hypothesis: Quarry decodes every string from Parquet's dictionary
 encoding before comparing, where comparing dictionary codes would be cheaper).
 
+## TPC-H, DuckDB and benchmarks (day 4)
+
+**What is the TPC-H data, and why not use `dbgen`?**
+`crates/quarry-tpch/src/lib.rs`. Seven of TPC-H's eight tables (no `partsupp`: no query here reads it), generated at
+any scale factor by the specification's row counts and value rules: ship, commit and receipt dates from the order
+date, return flags and line statuses against 1995-06-17, an order's status and total from its lines
+(`line_total_cents`, in integer cents), a part's price from its key (`retail_price_cents`). Simplified where the
+queries don't care: money is `DOUBLE` (Quarry has no decimal arithmetic), keys are dense, text comes from short word
+lists. Writing it rather than using `dbgen` buys three things: byte-identical files on every platform (one xorshift per table,
+fixed seeds; `files_are_the_same_on_every_run`), no TPC license terms, and the types Quarry computes on.
+`every_row_follows_the_rules` checks each rule the crate's doc comment states on every row.
+
+**Which TPC-H queries run, and what did you change?**
+Q1, Q3, Q5, Q6, Q10, Q12, Q14 and Q19: the 8 of 22 that need no subquery, `EXTRACT`, `INTERVAL` or view. Dates are
+literals; Q3 and Q10 add their key to `ORDER BY` so ties come out in one order; and Q6's discount bounds `0.06 - 0.01`
+and `0.06 + 0.01` are written `0.05` and `0.07`, because in `DOUBLE` arithmetic `0.06 + 0.01` is
+`0.06999999999999999`, below the `0.07` the column holds. DuckDB reads such literals as `DECIMAL`, so the
+specification's text would give different answers in the two engines; that is the "literals are Float64" limitation
+from day 2, met in a real query.
+
+**How do you know the answers are right?**
+Two ways, both against DuckDB 2.0.0. `tests/tpch.rs` compares every query at scale 0.01 with DuckDB's answers
+(written once by `scripts/tpch_answers.py`, embedded by the crate): names, rows in order, integers, strings and dates
+equal, floats within a relative 1e-9. Six match exactly; Q5 and Q10 differ by 2.2e-16 at most, because DuckDB adds a
+sum's terms in another order. It runs at batch sizes 7, 1000 and 8192, and changing one answer by 1e-8 fails it. And
+`scripts/differential.py` runs random queries through both engines live.
+
+**How does the differential test work?**
+A Python generator (`Generator`) builds a query over the TPC-H tables: a FROM along the schema's keys (comma joins,
+`JOIN ... ON`, or `LEFT JOIN ... ON` with an extra condition on the right, so some rows don't match), a WHERE from
+comparisons, `BETWEEN`, `IN`, `LIKE`, `IS NULL`, date arithmetic and `AND`/`OR`/`NOT`, then either `GROUP BY` with
+aggregates or a select list with `ORDER BY` and `LIMIT`. Quarry runs through its CLI with `--output`, which writes the
+result as Parquet, so types, NULLs and float bits survive; DuckDB runs on one thread over the same files. Every query
+orders its output by all its columns, so rows are compared in order. It stays inside the SQL both engines define the
+same way (no casts, no division by a column, no arithmetic on literals alone).
+
+**What did it find?**
+On its first run, 17 differences, all the same: `FROM a, b JOIN c ON <condition on a>`. JOIN binds tighter than the
+comma, so the `ON` belongs to `b JOIN c` and can't see `a`; Quarry refuses it, and so does PostgreSQL 14 ("invalid
+reference to FROM-clause entry"); DuckDB accepts it as `(a, b) JOIN c`. Not a Quarry bug, so the generator now uses
+one join style per query, and README's limitations record the difference. Since then no difference in a few thousand
+queries.
+
+**How do you know it would catch a bug?**
+I built four bugs into release binaries and ran it: LEFT joins as inner (18 of 308 queries differ), DISTINCT ignored
+(15), pruning `x > v` by the row group's minimum (15), `a OR (a AND b)` factored as `a AND b` (7). The last one first
+passed: the generator never made an `OR` where one branch is only the shared conjunct. Same lesson as day 3's
+property test: a generator only finds bugs in shapes it makes.
+
+**What is `OR` factoring, and why only for conjuncts that can't fail?**
+`optimizer/factor.rs`. `(a AND b) OR (a AND c)` becomes `a AND (b OR c)`, and `a OR (a AND b)` becomes `a`; both are
+exact in three-valued logic. Q19 needs it: its join key `p_partkey = l_partkey` is written inside each of three `OR`
+branches, so without the rule there is no key and the join is a nested loop (10.96 s at scale 0.01; 0.022 s with the
+rule). The restriction is about laziness: in `(d <> 0 AND 10 % d = 1) OR (a > 5 AND 10 % d = 1)` the modulo never runs
+where `d` is 0, because each branch's guard comes first. Factored out, it would run on every row and fail. So
+`cannot_fail` accepts only comparisons and boolean operators over columns and literals; then the rewrite can only
+skip work (`ors_with_common_conjuncts_keep_their_rows_once_factored`).
+
+**Why was Q6 slow, and what fixed it?**
+`sample` on a loop of Q6 at scale 1: about three quarters of the stacks were in Arrow's `interleave` on boolean arrays
+(`set_bits`, `MutableArrayData::try_extend`), called by the lazy `AND` to put its right side's results back in place
+for the rows it evaluated. `interleave` handles booleans one value at a time. `scatter_booleans` writes the value and
+validity bitmaps directly: Q6 352 to 145 ms, Q12 524 to 268 ms at scale 1. The evaluator's property test against the
+row-at-a-time interpreter checks it at 100,000 cases, and writing FALSE as NULL fails a unit test.
+
+**How fast is it compared with DuckDB?**
+At scale 1, one thread: 1.1x (Q14) to 3.2x (Q12) one-thread DuckDB's time, and DuckDB on 8 threads is another
+2.7-4.4x faster (README, "Results (day 4)"). What I know of the gap: Quarry runs one thread; it evaluates expressions
+a kernel at a time into intermediate arrays, and its lazy `AND`/`OR`/`CASE` copy the undecided rows out (`take`) and
+the results back, where DuckDB passes selection vectors; and in Q6's profile zstd decoding was about an eighth of the
+time. That strings are decoded out of Parquet's dictionaries before comparing is a hypothesis from day 3, still not
+profiled.
+
+**What do the criterion benchmarks measure?**
+`benches/tpch.rs`: each query from SQL text to rows at scale 0.1 (generated into a temp dir first, files in the OS
+cache after the first run), and planning alone (parse, bind, optimize: 42-176 µs). `tpch_times` is the same idea at
+scale 1 with a warm-up run and a median, printed as the README's table; criterion adds confidence intervals and
+change detection between runs.
+
 ## What went wrong on day 3
 
 - **I wrote a DuckDB claim I hadn't checked.** The first join commit's test and DESIGN.md said DuckDB, like Quarry's
@@ -427,7 +506,7 @@ than `CAST`. Each is a `QuarryError::Unsupported` naming what it was, never a pa
 (`unsupported_sql_is_named`).
 
 **What comes next?**
-Day 3 adds a physical plan between the logical plan and the operators: the hash join (joins bind today but don't run),
+(Written on day 1; days 3 and 4 did this.) Day 3 adds a physical plan between the logical plan and the operators: the hash join (joins bind today but don't run),
 a top-k sort for `ORDER BY ... LIMIT` (today's sort sorts everything), predicate pushdown into Parquet row groups
 (the footer is already read once per table; day 3 reads its per-column min and max) and optimizer rules (constant
 folding must keep a failing constant lazy, see above). Day 4 compares every result with DuckDB's on TPC-H-style data.
