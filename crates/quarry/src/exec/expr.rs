@@ -10,10 +10,11 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Date32Array, Datum, Float64Array, Int64Array,
-    NullArray, RecordBatch, RecordBatchOptions, StringArray, UInt32Array, new_empty_array,
-    new_null_array,
+    Array, ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder, Date32Array, Datum, Float64Array,
+    Int64Array, NullArray, RecordBatch, RecordBatchOptions, StringArray, UInt32Array,
+    new_empty_array, new_null_array,
 };
+use arrow::buffer::NullBuffer;
 use arrow::compute::kernels::{arity, boolean, cmp, comparison, concat_elements, numeric};
 use arrow::compute::{CastOptions, cast_with_options, interleave, take};
 use arrow::datatypes::{DataType, Float32Type, Float64Type};
@@ -155,12 +156,31 @@ pub(crate) fn take_rows(batch: &RecordBatch, rows: &[u32]) -> Result<RecordBatch
 
 /// A column of `rows` values: `values[j]` at row `at[j]`, NULL elsewhere.
 fn scatter(rows: usize, at: &[u32], values: &ArrayRef) -> Result<ArrayRef, ArrowError> {
+    if let Some(values) = values.as_boolean_opt() {
+        return Ok(Arc::new(scatter_booleans(rows, at, values)));
+    }
     let nulls = new_null_array(values.data_type(), 1);
     let mut picks = vec![(1, 0); rows];
     for (j, &row) in at.iter().enumerate() {
         picks[row as usize] = (0, j);
     }
     interleave(&[values.as_ref(), nulls.as_ref()], &picks)
+}
+
+/// [`scatter`] for booleans (what AND and OR put back), writing the two bitmaps directly: Arrow's `interleave` copies
+/// a boolean array one value at a time through `MutableArrayData`, which was three quarters of TPC-H Q6's time.
+fn scatter_booleans(rows: usize, at: &[u32], values: &BooleanArray) -> BooleanArray {
+    let mut bits = BooleanBufferBuilder::new(rows);
+    bits.append_n(rows, false);
+    let mut valid = BooleanBufferBuilder::new(rows);
+    valid.append_n(rows, false);
+    for (j, &row) in at.iter().enumerate() {
+        if values.is_valid(j) {
+            valid.set_bit(row as usize, true);
+            bits.set_bit(row as usize, values.value(j));
+        }
+    }
+    BooleanArray::new(bits.finish(), Some(NullBuffer::new(valid.finish())))
 }
 
 /// The rows of a boolean column that are TRUE (not FALSE, not NULL), and the rest.
