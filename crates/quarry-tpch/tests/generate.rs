@@ -118,12 +118,24 @@ fn files_are_the_same_on_every_run() {
 fn the_batch_size_does_not_change_the_data() {
     // Batches of 7 rows and 3 orders cross hundreds of batch boundaries at this scale; every table must read back the
     // same, row for row, as with the default batches (65,536 rows and 16,384 orders, one batch here).
-    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b, c) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
     generate(0.002, a.path()).unwrap();
-    quarry_tpch::generate_in_batches(0.002, b.path(), 7, 3).unwrap();
+    let small = quarry_tpch::generate_in_batches(0.002, b.path(), 7, 3).unwrap();
+    // Sizes below 1 count as 1: one row (and one order) a batch.
+    let ones = quarry_tpch::generate_in_batches(0.002, c.path(), 0, -5).unwrap();
     for table in TABLES {
         assert_eq!(read(a.path(), table), read(b.path(), table), "{table}");
+        assert_eq!(read(a.path(), table), read(c.path(), table), "{table}");
     }
+    // The sizes are used: 20 suppliers in batches of 7 is 3 batches, 3,000 orders in batches of 3 is 1,000.
+    let counts: Vec<usize> = small.iter().map(|(_, n)| *n).collect();
+    assert_eq!(counts, [1, 1, 3, 43, 58, 1000, 1000]);
+    let counts: Vec<usize> = ones.iter().map(|(_, n)| *n).collect();
+    assert_eq!(counts, [1, 1, 20, 300, 400, 3000, 3000]);
 }
 
 #[test]

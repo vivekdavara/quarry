@@ -88,13 +88,20 @@ impl Counts {
 /// Writes every table in [`TABLES`] to `<dir>/<table>.parquet` (creating `dir` if needed) and returns the paths in
 /// that order. Existing files of those names are replaced.
 pub fn generate(scale: f64, dir: &Path) -> Result<Vec<PathBuf>> {
-    generate_in_batches(scale, dir, ROWS_PER_BATCH, ORDERS_PER_BATCH)
+    let tables = generate_in_batches(scale, dir, ROWS_PER_BATCH, ORDERS_PER_BATCH)?;
+    Ok(tables.into_iter().map(|(path, _)| path).collect())
 }
 
 /// [`generate`] with other batch sizes (rows of `supplier`, `customer` and `part`; orders, with their lines), for the
-/// tests that check the batch size doesn't change the data. Sizes below 1 count as 1.
+/// tests that check the batch size doesn't change the data. Sizes below 1 count as 1. Returns each table's path and
+/// the number of batches it was written in.
 #[doc(hidden)]
-pub fn generate_in_batches(scale: f64, dir: &Path, rows: i64, orders: i64) -> Result<Vec<PathBuf>> {
+pub fn generate_in_batches(
+    scale: f64,
+    dir: &Path,
+    rows: i64,
+    orders: i64,
+) -> Result<Vec<(PathBuf, usize)>> {
     let counts = Counts::at(scale)?;
     let (rows_per_batch, orders_per_batch) = (rows.max(1), orders.max(1));
     std::fs::create_dir_all(dir)?;
@@ -104,16 +111,28 @@ pub fn generate_in_batches(scale: f64, dir: &Path, rows: i64, orders: i64) -> Re
     let rows = |table: &str, n, seed, make: Make| {
         write_rows(&path(table), table, n, rows_per_batch, seed, make)
     };
-    rows("supplier", counts.supplier, 0x5EED_0003_9E37_79B9, supplier)?;
-    rows("customer", counts.customer, 0x5EED_0004_9E37_79B9, customer)?;
-    rows("part", counts.part, 0x5EED_0005_9E37_79B9, part)?;
-    write_orders_and_lines(
+    let mut batches = vec![1, 1];
+    batches.push(rows(
+        "supplier",
+        counts.supplier,
+        0x5EED_0003_9E37_79B9,
+        supplier,
+    )?);
+    batches.push(rows(
+        "customer",
+        counts.customer,
+        0x5EED_0004_9E37_79B9,
+        customer,
+    )?);
+    batches.push(rows("part", counts.part, 0x5EED_0005_9E37_79B9, part)?);
+    let order_batches = write_orders_and_lines(
         &counts,
         orders_per_batch,
         &path("orders"),
         &path("lineitem"),
     )?;
-    Ok(TABLES.iter().map(|t| path(t)).collect())
+    batches.extend([order_batches, order_batches]);
+    Ok(TABLES.iter().map(|t| path(t)).zip(batches).collect())
 }
 
 /// A table's schema. Every column is non-nullable; keys and counts are BIGINT, money and quantities DOUBLE, dates
@@ -437,17 +456,18 @@ fn write_rows(
     per_batch: i64,
     seed: u64,
     make: Make,
-) -> Result<()> {
+) -> Result<usize> {
     let mut rng = Rng(seed);
     let mut writer = writer(path, table)?;
-    let mut first = 1;
+    let (mut first, mut batches) = (1, 0);
     while first <= n {
         let last = (first + per_batch - 1).min(n);
         writer.write(&make(&mut rng, first, last)?)?;
+        batches += 1;
         first = last + 1;
     }
     writer.close()?;
-    Ok(())
+    Ok(batches)
 }
 
 fn region() -> Result<RecordBatch> {
@@ -610,11 +630,11 @@ fn write_orders_and_lines(
     per_batch: i64,
     orders_path: &Path,
     lines_path: &Path,
-) -> Result<()> {
+) -> Result<usize> {
     let mut rng = Rng(0x5EED_0006_9E37_79B9);
     let mut orders_writer = writer(orders_path, "orders")?;
     let mut lines_writer = writer(lines_path, "lineitem")?;
-    let mut first = 1;
+    let (mut first, mut batches) = (1, 0);
     while first <= counts.orders {
         let last = (first + per_batch - 1).min(counts.orders);
         let mut o = Orders::default();
@@ -657,11 +677,12 @@ fn write_orders_and_lines(
                 text(l.comment),
             ],
         )?)?;
+        batches += 1;
         first = last + 1;
     }
     orders_writer.close()?;
     lines_writer.close()?;
-    Ok(())
+    Ok(batches)
 }
 
 /// Appends one order and its lines.
