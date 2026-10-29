@@ -248,11 +248,12 @@ and the differential test against DuckDB (the TPC-H queries and 1,000 random que
 | `tests/pruning.rs` (4) | random rows in Parquet row groups of 1-4 rows under random filters (comparisons, IN, IS NULL, LIKE, AND/OR/NOT) give the same rows pruned and unpruned; which row groups an ordered file skips, floats included; EXPLAIN's scan filters |
 | `tests/skipped_errors.rs` (3) | the documented cases where the optimized plan succeeds and the bound one fails, as on DuckDB 2.0: a pruned row group's bad row, a pushed-down condition that is NULL, an unread CSV column that doesn't parse |
 | `tests/optimizer_properties.rs` (1) | random whole queries (comma, inner and LEFT joins; WHERE with constants, comparisons, OR, NOT, IS NULL, ORs whose branches share a conjunct; GROUP BY or expressions; ORDER BY; LIMIT) give the same rows in the same order bound and optimized |
+| `tests/factoring_and_pushdown.rs` (1) | the day-4 review's case: an `OR` whose remainder can fail, in a comma join, an inner join's `ON` and a LEFT join's `ON`, gives the bound plan's row optimized (it isn't factored) |
 | `tests/tpch.rs` (3) | the eight TPC-H queries over the scale-0.01 tables give DuckDB 2.0.0's answers (names, rows in order, floats within a relative 1e-9) at batch sizes 7, 1000 and 8192; no plan has a nested loop; every answer has rows |
 | `quarry-tpch/tests/generate.rs` (4) | the generator: row counts per scale factor, bad factors refused, TPC-H's dates, byte-identical files on two runs and a pinned checksum, and every rule of the crate's documentation on every row at scale 0.005 |
 | `scripts/differential.py` (CI) | random queries (filters, joins, GROUP BY, ORDER BY with LIMIT) through the `quarry` CLI and DuckDB 2.0.0, row for row (DESIGN.md, "TPC-H-style data and the differential test") |
 | unit tests (33) | the common-type rules, date parsing over every day from 1600 to 2400 and against Arrow's own cast, expression printing, the plan nodes' guards and schemas; each operator of the evaluator, with DuckDB 2.0's answers; constant folding; which ON conjuncts become join keys; a footer without null counts |
-| `quarry-cli/tests/cli.rs` (10) | the built binary: output, exit codes, errors on stderr, `quarry query` and its `--output` Parquet file, and that this README's examples print what it says |
+| `quarry-cli/tests/cli.rs` (11) | the built binary: output, exit codes, errors on stderr, `quarry query`, its `--output` Parquet file (and the path in its error) and `--batch-size`, and that this README's examples print what it says |
 
 The property tests bind `SELECT <expr> FROM t` for expressions from two generators (a random grammar of every
 supported operator, mostly ill-typed, and a type-directed one that builds well-typed trees three operators deep)
@@ -315,18 +316,21 @@ What moved, and why:
 samples): Q1 33.0 ms, Q3 18.9, Q5 30.3, Q6 34.2, Q10 26.4, Q12 53.8, Q14 15.1, Q19 37.4; planning alone (parse, bind,
 optimize) 42 µs (Q6) to 176 µs (Q19).
 
-**The differential test** (`scripts/differential.py`, 8 TPC-H queries plus 300 random ones per seed). Its first run
+**The differential test** (`scripts/differential.py`: the 8 TPC-H queries plus N random ones per seed). Its first run
 found 17 differences, all one thing: DuckDB accepts `a, b JOIN c ON <a condition on a>` and Quarry (like the SQL
-standard and PostgreSQL 14) refuses it; the generator now uses one join style per query. After that, seeds 1-6 at
-scale 0.01 agreed on all 1,848 queries, CI's 1,008 (seed 1) agree, and at scale 0.1 seeds 1 and 7 agree on 616. Four
-deliberate engine bugs, each built into a release binary and run with seed 1:
+standard and PostgreSQL 14) refuses it; the generator now uses one join style per query. The generator grew three
+times during the day (an `OR` shape, random batch sizes, then the review's blind spots, below); with each version
+the engine agreed on every query run: with the last, seeds 1-3 at scale 0.01 (3,024 queries). Six deliberate engine
+bugs, each built into a release binary and run with seed 1, at scale 0.01 unless noted:
 
-| Bug | Queries that differ (of 308) |
-|---|---|
-| LEFT joins run as inner joins | 18 |
-| `DISTINCT` in aggregates ignored | 15 |
-| pruning `x > v` by the row group's minimum instead of its maximum | 15 (18 at scale 0.1) |
-| `a OR (a AND b)` factored as `a AND b` | 7 (0 before the generator made that shape) |
+| Bug | Queries that differ | Generator |
+|---|---|---|
+| LEFT joins run as inner joins | 18 of 308 | first |
+| `DISTINCT` in aggregates ignored | 15 of 308 | first |
+| pruning `x > v` by the row group's minimum instead of its maximum | 15 of 308 (18 at scale 0.1) | first |
+| `a OR (a AND b)` factored as `a AND b` | 7 of 308 (0 with the first) | with the `OR` shape |
+| `LIMIT`/`OFFSET` resetting the offset when it skips a whole batch | 7 of 308 (0 at 8,192 rows a batch) | with batch sizes |
+| a LEFT join's `ON` conditions on its left side pushed below the join | 33 of 1,008 (0 before) | the last |
 
 ## Results (day 3)
 
@@ -374,6 +378,36 @@ What moved, and why:
 - What moved least: queries that compare or group a string column on every row (`status = 'shipped'`, GROUP BY
   status, `count(DISTINCT customer)`) are still 3-22x DuckDB's one-thread times. Not profiled further yet; one
   hypothesis for day 4 is that Quarry decodes every string out of Parquet's dictionary encoding before comparing.
+
+## Review of day 4
+
+Review agents, one at a time, each in its own worktree with release-only builds (the disk had 8-11 GB free) and
+DuckDB as the oracle, briefed on correctness: wrong rows, errors the bound plan doesn't make, and tests that would
+pass a broken engine.
+
+**Round 1** (one agent at `7b7a64a`, 9 minutes). Four findings, all fixed:
+- **`OR` factoring plus predicate pushdown made the optimized plan fail where the bound one succeeds.** In `(l.k = r.k
+  AND 10 % r.v = 0) OR (l.k = r.k AND r.w = 1)` the rule checked only the common `l.k = r.k`; what it left, `10 % r.v
+  = 0 OR r.w = 1`, reads `r` alone, so pushdown moved it below the join onto an `r` row no key matched: division by
+  zero, in a comma join, an inner join's `ON` and a LEFT join's `ON` (DuckDB 2.0 returns the row for the LEFT join
+  and fails the other two). The rule now factors only an `OR` in which nothing can fail (`2831e44`; the review's test
+  is `tests/factoring_and_pushdown.rs`). Q19 is still factored.
+- **The differential test couldn't see a broken LEFT join pushdown**: moving a LEFT join's left-side `ON` conditions
+  below the join (live: `count(*)` 5 where DuckDB says 25) agreed on all 3,024 queries of seeds 1-3, because the
+  generator put extra `ON` conditions only on the right. Its script counted constructs in 20,000 generated queries and
+  listed ten that never appear; the generator now makes nine of them (all but `CAST`, `78a4370`), and that mutant
+  differs on 33 of 1,008. `tests/execute.rs` already caught it.
+- The docs (as of `7b7a64a`) still said three optimizer rules and `interleave` for every scatter (DESIGN.md and README
+  were updated in the next commits; the walkthrough's two stale lines in `2831e44`); `retail_price_cents`'s range was
+  wrong past scale 100 (`fad34f8`).
+- Hypothesis, confirmed by arithmetic and fixed: `supplier`, `customer` and `part` were each one batch, so past about
+  scale 400 a string column would pass Arrow's 2 GiB of `i32` offsets (`0066edb`, a batch at a time, same values).
+  Also: `--output` to a missing directory didn't name the path (`fad34f8`).
+
+Checked and found sound: `scatter_booleans` (offsets, no Null-typed right side reaches it), `--output` with a
+NULL-typed column, zero rows or a failed query (the old file stays), the generator's rules, and the differential's
+handling of a failed run (it never reads a stale result file). Survivors it listed: the comparisons check values, not
+types or names (README, "Limitations").
 
 ## Review of day 3
 
@@ -512,8 +546,10 @@ property then found one more bug itself: `-(-0)` printed as `-0`, which binds ba
   the generator doesn't write). The data is TPC-H-style, not `dbgen`'s: `DOUBLE` money, dense keys, simpler text, so
   the timings aren't comparable with published TPC-H results, only with DuckDB on the same files.
 - The differential test checks what its generator writes: Parquet inputs only (CSV is covered by `tests/execute.rs`),
-  the CLI's default batch size, no casts, no NULL literals, no division or modulo by a column, no subqueries (Quarry
+  no casts, no NULL literals outside `IN` lists, no division or modulo by a column, no subqueries (Quarry
   has none). Its float comparison allows a relative 1e-9, so a bug that moves a float sum by less than that passes.
+  It compares values, not column names or types (an integer 65 equals a float 65.0; `tests/tpch.rs` checks names for
+  the TPC-H queries), and a query both engines refuse is counted, not compared.
 - In `a, b JOIN c ON ...` the `ON` sees only `b` and `c` (the SQL standard's and PostgreSQL's scoping); DuckDB 2.0 lets
   it see `a`, so such a query runs there and is an error here.
 

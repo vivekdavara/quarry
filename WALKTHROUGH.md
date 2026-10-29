@@ -416,6 +416,30 @@ cache after the first run), and planning alone (parse, bind, optimize: 42-176 µ
 scale 1 with a warm-up run and a median, printed as the README's table; criterion adds confidence intervals and
 change detection between runs.
 
+## What went wrong on day 4
+
+- **My first `OR` factoring rule was unsafe, and I had argued it was safe.** I checked that the factored conjuncts
+  couldn't fail and reasoned about the rewritten condition where it stood. But the next rule moves things: the
+  remainder of `(l.k = r.k AND 10 % r.v = 0) OR (l.k = r.k AND r.w = 1)` reads `r` alone, and pushdown put it under
+  the join, onto rows the key had kept it from. The review found it in nine minutes. Lesson: a rule's safety argument
+  has to cover what the later rules do with its output, not just its own rewrite.
+- **The differential test passed broken engines three times, each in a shape its generator never made.** First
+  `a OR (a AND b)`: my own mutant of the absorption rule agreed on every query. Then batch boundaries: every query ran
+  at 8,192 rows a batch, so an `OFFSET` bug that needs a smaller batch was invisible. Then the review's mutant: a LEFT
+  join's left-side `ON` conditions, which the generator never wrote. Each time the fix was to make the shape, and
+  then to run the mutant again to see it fail. A differential test proves only what its generator reaches; counting
+  constructs over many generated queries (the review's script) is how to see what it doesn't.
+- **Several claims went into docs or commit messages before I checked them.** The answers commit says five TPC-H
+  queries match DuckDB exactly; it is six (`9996a1d`, corrected in DESIGN.md). A first draft of the README named the
+  wrong commit for the 10.96 s Q19 run; this file said the generator "took an hour" and DuckDB's 8 threads were "4-6x"
+  faster (the table says 2.7-4.4x); the bench's doc said planning reads footers (registration does); the price range
+  was off at both ends. Each was caught by re-reading against the measurement or the code before the push that
+  carried it, except the commit message, which stays.
+- **The disk filled again, more slowly.** `target/debug` went from 1.5 to 9.3 GB in 40 minutes: each change to the
+  test crates' dev-dependencies (`quarry-tpch`, then `criterion`) gave every test binary a new hash, and the old
+  ~100 MB binaries stayed. `cargo clean -p quarry -p quarry-cli -p quarry-tpch` (dependencies stay built) twice; the
+  review agents built release only.
+
 ## What went wrong on day 3
 
 - **I wrote a DuckDB claim I hadn't checked.** The first join commit's test and DESIGN.md said DuckDB, like Quarry's
