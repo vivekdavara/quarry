@@ -19,6 +19,11 @@ thiserror.workspace = true
 tempfile.workspace = true
 proptest.workspace = true
 quarry-tpch = { path = "../quarry-tpch" }
+criterion.workspace = true
+
+[[bench]]
+name = "tpch"
+harness = false
 
 [lints]
 workspace = true
