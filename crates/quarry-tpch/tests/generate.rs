@@ -115,6 +115,18 @@ fn files_are_the_same_on_every_run() {
 }
 
 #[test]
+fn the_batch_size_does_not_change_the_data() {
+    // Batches of 7 rows and 3 orders cross hundreds of batch boundaries at this scale; every table must read back the
+    // same, row for row, as with the default batches (65,536 rows and 16,384 orders, one batch here).
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    generate(0.002, a.path()).unwrap();
+    quarry_tpch::generate_in_batches(0.002, b.path(), 7, 3).unwrap();
+    for table in TABLES {
+        assert_eq!(read(a.path(), table), read(b.path(), table), "{table}");
+    }
+}
+
+#[test]
 fn every_row_follows_the_rules() {
     let dir = tempfile::tempdir().unwrap();
     let paths = generate(0.005, dir.path()).unwrap();
