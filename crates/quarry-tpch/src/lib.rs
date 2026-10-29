@@ -43,6 +43,10 @@ pub const ROW_GROUP_ROWS: usize = 1 << 17;
 /// Orders generated per batch (with their 1-7 lines each).
 const ORDERS_PER_BATCH: i64 = 16_384;
 
+/// Rows of `supplier`, `customer` and `part` generated per batch: a whole table in one batch would pass a string
+/// array's 2 GiB of `i32` offsets past about scale 400.
+const ROWS_PER_BATCH: i64 = 65_536;
+
 /// Days since 1970-01-01 of TPC-H's dates: the first and last order date's bounds (1992-01-01, 1998-12-31) and the
 /// "current date" (1995-06-17) that decides return flags and line statuses.
 pub const START_DATE: i32 = 8_035;
@@ -89,9 +93,10 @@ pub fn generate(scale: f64, dir: &Path) -> Result<Vec<PathBuf>> {
     let path = |table: &str| dir.join(format!("{table}.parquet"));
     write_table(&path("region"), region())?;
     write_table(&path("nation"), nation())?;
-    write_table(&path("supplier"), supplier(&counts))?;
-    write_table(&path("customer"), customer(&counts))?;
-    write_table(&path("part"), part(&counts))?;
+    let rows = |table: &str, n, seed, make: Make| write_rows(&path(table), table, n, seed, make);
+    rows("supplier", counts.supplier, 0x5EED_0003_9E37_79B9, supplier)?;
+    rows("customer", counts.customer, 0x5EED_0004_9E37_79B9, customer)?;
+    rows("part", counts.part, 0x5EED_0005_9E37_79B9, part)?;
     write_orders_and_lines(&counts, &path("orders"), &path("lineitem"))?;
     Ok(TABLES.iter().map(|t| path(t)).collect())
 }
@@ -405,6 +410,24 @@ fn write_table(path: &Path, batch: Result<RecordBatch>) -> Result<()> {
     Ok(())
 }
 
+/// Builds the batch of rows `first..=last` of a table from its generator.
+type Make = fn(&mut Rng, i64, i64) -> Result<RecordBatch>;
+
+/// Writes a table of `n` rows a batch at a time; one generator runs through every row in key order, so the batch size
+/// doesn't change the data.
+fn write_rows(path: &Path, table: &str, n: i64, seed: u64, make: Make) -> Result<()> {
+    let mut rng = Rng(seed);
+    let mut writer = writer(path, table)?;
+    let mut first = 1;
+    while first <= n {
+        let last = (first + ROWS_PER_BATCH - 1).min(n);
+        writer.write(&make(&mut rng, first, last)?)?;
+        first = last + 1;
+    }
+    writer.close()?;
+    Ok(())
+}
+
 fn region() -> Result<RecordBatch> {
     let mut rng = Rng(0x5EED_0001_9E37_79B9);
     batch(
@@ -430,12 +453,10 @@ fn nation() -> Result<RecordBatch> {
     )
 }
 
-fn supplier(counts: &Counts) -> Result<RecordBatch> {
-    let mut rng = Rng(0x5EED_0003_9E37_79B9);
-    let n = counts.supplier;
+fn supplier(rng: &mut Rng, first: i64, last: i64) -> Result<RecordBatch> {
     let (mut address, mut nation, mut phone, mut balance, mut comment) =
         (vec![], vec![], vec![], vec![], vec![]);
-    for _ in 0..n {
+    for _ in first..=last {
         address.push(rng.address());
         let k = rng.range(0, 24);
         nation.push(k);
@@ -446,8 +467,8 @@ fn supplier(counts: &Counts) -> Result<RecordBatch> {
     batch(
         "supplier",
         vec![
-            int((1..=n).collect()),
-            text((1..=n).map(|k| format!("Supplier#{k:09}")).collect()),
+            int((first..=last).collect()),
+            text((first..=last).map(|k| format!("Supplier#{k:09}")).collect()),
             text(address),
             int(nation),
             text(phone),
@@ -457,12 +478,10 @@ fn supplier(counts: &Counts) -> Result<RecordBatch> {
     )
 }
 
-fn customer(counts: &Counts) -> Result<RecordBatch> {
-    let mut rng = Rng(0x5EED_0004_9E37_79B9);
-    let n = counts.customer;
+fn customer(rng: &mut Rng, first: i64, last: i64) -> Result<RecordBatch> {
     let (mut address, mut nation, mut phone, mut balance, mut segment, mut comment) =
         (vec![], vec![], vec![], vec![], vec![], vec![]);
-    for _ in 0..n {
+    for _ in first..=last {
         address.push(rng.address());
         let k = rng.range(0, 24);
         nation.push(k);
@@ -474,8 +493,8 @@ fn customer(counts: &Counts) -> Result<RecordBatch> {
     batch(
         "customer",
         vec![
-            int((1..=n).collect()),
-            text((1..=n).map(|k| format!("Customer#{k:09}")).collect()),
+            int((first..=last).collect()),
+            text((first..=last).map(|k| format!("Customer#{k:09}")).collect()),
             text(address),
             int(nation),
             text(phone),
@@ -486,12 +505,10 @@ fn customer(counts: &Counts) -> Result<RecordBatch> {
     )
 }
 
-fn part(counts: &Counts) -> Result<RecordBatch> {
-    let mut rng = Rng(0x5EED_0005_9E37_79B9);
-    let n = counts.part;
+fn part(rng: &mut Rng, first: i64, last: i64) -> Result<RecordBatch> {
     let (mut name, mut mfgr, mut brand, mut ty, mut size, mut container, mut comment) =
         (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
-    for _ in 0..n {
+    for _ in first..=last {
         name.push(rng.words(&COLOURS, 5, 5));
         let m = rng.range(1, 5);
         mfgr.push(format!("Manufacturer#{m}"));
@@ -513,14 +530,18 @@ fn part(counts: &Counts) -> Result<RecordBatch> {
     batch(
         "part",
         vec![
-            int((1..=n).collect()),
+            int((first..=last).collect()),
             text(name),
             text(mfgr),
             text(brand),
             text(ty),
             int(size),
             text(container),
-            float((1..=n).map(|k| cents(retail_price_cents(k))).collect()),
+            float(
+                (first..=last)
+                    .map(|k| cents(retail_price_cents(k)))
+                    .collect(),
+            ),
             text(comment),
         ],
     )
