@@ -101,6 +101,15 @@ EDGES = [
 ]
 
 
+# Joins with no equality (nested loops), between tables small enough for every pair, used instead of the key a quarter
+# of the time; each keeps a few of the pairs.
+NO_KEY = {
+    frozenset(["nation", "region"]): "n_regionkey < r_regionkey",
+    frozenset(["supplier", "nation"]): "s_nationkey > n_nationkey + 20",
+    frozenset(["customer", "nation"]): "c_nationkey > n_nationkey + 20",
+}
+
+
 def kind(column: str) -> str:
     if column in FLOATS:
         return "float"
@@ -157,16 +166,25 @@ class Generator:
         op = r.choice(["=", "<>", "<", "<=", ">", ">="])
         if k == "text":
             word = r.choice(WORDS)
-            pattern = r.choice([f"%{word}%", f"{word}%", f"%{word}", f"%{word}%{r.choice(WORDS)}%"])
+            blank = word[0] + "_" + word[2:]
+            pattern = r.choice([f"%{word}%", f"{word}%", f"%{word}", f"%{word}%{r.choice(WORDS)}%", f"%{blank}%",
+                                f"{blank[:3]}%"])
+            if r.random() < 0.2:
+                return f"{c} {r.choice(['', 'NOT '])}ILIKE '{pattern.upper()}'"
             return f"{c} {r.choice(['', 'NOT '])}LIKE '{pattern}'"
         if k == "cat":
             values = CATEGORIES[c]
             choice = r.random()
             if choice < 0.3:
-                picked = r.sample(values, min(len(values), r.randint(1, 3)))
-                return f"{c} {r.choice(['', 'NOT '])}IN ({', '.join(repr(v) for v in picked)})"
+                picked = [repr(v) for v in r.sample(values, min(len(values), r.randint(1, 3)))]
+                if r.random() < 0.2:
+                    picked.insert(r.randrange(len(picked) + 1), "NULL")
+                return f"{c} {r.choice(['', 'NOT '])}IN ({', '.join(picked)})"
             if choice < 0.45:
-                return f"{c} LIKE '{r.choice(values)[:r.randint(1, 3)]}%'"
+                prefix = r.choice(values)[:r.randint(1, 3)]
+                if r.random() < 0.3:
+                    return f"{c} ILIKE '{prefix.lower()}%'"
+                return f"{c} LIKE '{prefix}%'"
             return f"{c} {op} '{r.choice(values)}'"
         if k == "date":
             choice = r.random()
@@ -184,10 +202,16 @@ class Generator:
         if choice < 0.2:
             a, b = self.constant(c), self.constant(c)
             return f"{c} BETWEEN {a} AND {b}"
-        if choice < 0.3 and k in ("int", "key"):
+        if choice < 0.25 and k in ("int", "key"):
             return f"{c} % {r.randint(2, 7)} = {r.randint(0, 1)}"
+        if choice < 0.3 and k in ("int", "key"):
+            # A dividend that can be negative: % takes the dividend's sign in both engines.
+            return f"({c} - {self.constant(c)}) % {r.randint(2, 7)} {op} {r.randint(-3, 3)}"
         if choice < 0.4:
-            return f"{c} IN ({', '.join(self.constant(c) for _ in range(3))})"
+            items = [self.constant(c) for _ in range(3)]
+            if r.random() < 0.2:
+                items[r.randrange(3)] = "NULL"
+            return f"{c} {r.choice(['', 'NOT '])}IN ({', '.join(items)})"
         return f"{c} {op} {self.constant(c)}"
 
     def condition(self, columns: list[str], nullable: set[str], depth: int = 2) -> str:
@@ -228,24 +252,33 @@ class Generator:
             ]
             if not options:
                 break
-            _, new, on = r.choice(options)
+            old, new, on = r.choice(options)
+            if frozenset([old, new]) in NO_KEY and r.random() < 0.25:
+                on = NO_KEY[frozenset([old, new])]
+            before = columns_of(tables)
             tables.append(new)
+            # Extra ON conditions on the new table, the tables before it, or both. In a LEFT join the first kind
+            # leaves left rows unmatched and goes down to the right; the second decides matching and stays.
+            extra = ""
+            for side in r.choice([[], [], ["new"], ["new"], ["old"], ["new", "old"]]):
+                cols = columns_of([new]) if side == "new" else before
+                extra += " AND " + self.leaf(cols, nullable if side == "old" else set())
             if commas:
                 joins.append(f", {new}")
                 where.append(on)
             elif r.random() < 0.5:
-                joins.append(f" JOIN {new} ON {on}")
+                joins.append(f" JOIN {new} ON {on}{extra}")
             else:
-                # A LEFT join, sometimes with a condition on the right that leaves left rows unmatched.
-                extra = ""
-                if r.random() < 0.6:
-                    extra = " AND " + self.leaf(columns_of([new]), set())
                 joins.append(f" LEFT JOIN {new} ON {on}{extra}")
                 nullable.update(columns_of([new]))
         return tables, tables[0] + "".join(joins), where, nullable
 
-    def expression(self, columns: list[str]) -> str:
+    def expression(self, columns: list[str], nullable: set[str] | None = None) -> str:
+        """A select item over `columns`; with `nullable` (a select list, not an aggregate's argument), sometimes a
+        condition, so booleans come out too."""
         r = self.r
+        if nullable is not None and r.random() < 0.1:
+            return f"({self.leaf(columns, nullable)})"
         c = r.choice(columns)
         k = kind(c)
         floats = [x for x in columns if kind(x) == "float"]
@@ -291,6 +324,23 @@ class Generator:
             return f"avg({n})"
         return f"sum(DISTINCT {n})" if kind(n) != "float" else f"avg({n})"
 
+    def having(self, columns: list[str]) -> str:
+        """A HAVING condition: on count(*), count(DISTINCT), an integer sum (exact in both engines, so no group sits on
+        the threshold in one and not the other), or a MIN/MAX against a constant of the column's type."""
+        r = self.r
+        ints = [c for c in columns if kind(c) in ("int", "key")]
+        compared = [c for c in columns if kind(c) != "text"]
+        choice = r.random()
+        if choice < 0.3 or not compared:
+            return f"count(*) > {r.randint(0, 50)}"
+        c = r.choice(compared)
+        if choice < 0.45:
+            return f"count(DISTINCT {c}) > {r.randint(0, 5)}"
+        if choice < 0.65 and ints:
+            n = r.choice(ints)
+            return f"sum({n}) {r.choice(['>', '<'])} {self.constant(n)}"
+        return f"{r.choice(['min', 'max'])}({c}) {r.choice(['<', '>=', '<>'])} {self.constant(c)}"
+
     def query(self) -> str:
         r = self.r
         tables, from_, where, nullable = self.from_clause()
@@ -299,7 +349,10 @@ class Generator:
             where.append(self.condition(columns, nullable))
         where_sql = f" WHERE {' AND '.join(f'({w})' for w in where)}" if where else ""
         if r.random() < 0.5:
-            groupable = [c for c in columns if kind(c) in ("cat", "int")]
+            # Mostly few-valued keys; sometimes keys, dates and floats, with many groups (then a LIMIT).
+            few = [c for c in columns if kind(c) in ("cat", "int")]
+            many = [c for c in columns if kind(c) in ("key", "date", "float")]
+            groupable = many if (r.random() < 0.25 and many) or not few else few
             keys = r.sample(groupable, min(len(groupable), r.choice([0, 1, 1, 2])))
             aggregates = [self.aggregate(columns) for _ in range(r.randint(1, 4))]
             select = keys + [f"{a} AS a{i}" for i, a in enumerate(aggregates)]
@@ -307,14 +360,16 @@ class Generator:
             if keys:
                 sql += f" GROUP BY {', '.join(keys)}"
                 if r.random() < 0.3:
-                    sql += f" HAVING count(*) > {r.randint(0, 50)}"
+                    sql += f" HAVING {self.having(columns)}"
                 sql += " ORDER BY " + ", ".join(f"{i + 1} {r.choice(['ASC', 'DESC'])}" for i in range(len(keys)))
+                if groupable is many or r.random() < 0.1:
+                    sql += f" LIMIT {r.randint(0, 60)}"
             return sql
-        items = [self.expression(columns) for _ in range(r.randint(1, 4))]
+        items = [self.expression(columns, nullable) for _ in range(r.randint(1, 4))]
         select = ", ".join(f"{e} AS c{i}" for i, e in enumerate(items))
         order = ", ".join(f"{i + 1} {r.choice(['ASC', 'DESC'])}" for i in range(len(items)))
         distinct = "DISTINCT " if r.random() < 0.1 else ""
-        sql = f"SELECT {distinct}{select} FROM {from_}{where_sql} ORDER BY {order} LIMIT {r.randint(1, 60)}"
+        sql = f"SELECT {distinct}{select} FROM {from_}{where_sql} ORDER BY {order} LIMIT {r.randint(0, 60)}"
         if r.random() < 0.3:
             sql += f" OFFSET {r.randint(0, 40)}"
         return sql
