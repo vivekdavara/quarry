@@ -18,6 +18,7 @@ thiserror.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true
+quarry-tpch = { path = "../quarry-tpch" }
 
 [lints]
 workspace = true

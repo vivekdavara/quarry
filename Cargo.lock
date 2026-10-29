@@ -1004,6 +1004,7 @@ dependencies = [
  "arrow",
  "parquet",
  "proptest",
+ "quarry-tpch",
  "sqlparser",
  "tempfile",
  "thiserror",

@@ -676,3 +676,43 @@ fn order(rng: &mut Rng, counts: &Counts, key: i64, o: &mut Orders, l: &mut Lines
         .push(format!("Clerk#{:09}", rng.range(1, counts.clerks)));
     o.comment.push(rng.comment());
 }
+
+/// One of the TPC-H queries Quarry runs, with DuckDB 2.0.0's answer over the scale-[`ANSWER_SCALE`] tables.
+#[derive(Debug, Clone, Copy)]
+pub struct Query {
+    /// `q01` and so on, after TPC-H's numbers.
+    pub name: &'static str,
+    pub title: &'static str,
+    pub sql: &'static str,
+    /// CSV with a header: `scripts/tpch_answers.py` wrote it from DuckDB's result (floats as Python's `repr`).
+    pub answer: &'static str,
+}
+
+/// The scale factor of the tables [`Query::answer`] was computed over.
+pub const ANSWER_SCALE: f64 = 0.01;
+
+macro_rules! query {
+    ($name:literal, $title:literal) => {
+        Query {
+            name: $name,
+            title: $title,
+            sql: include_str!(concat!("../queries/", $name, ".sql")),
+            answer: include_str!(concat!("../answers/", $name, ".csv")),
+        }
+    };
+}
+
+/// The TPC-H queries that need nothing Quarry lacks (subqueries, `EXTRACT`, `INTERVAL`, views): 8 of the 22, written
+/// as the specification writes them with its validation parameters, except that dates are literals (`DATE
+/// '1998-12-01' - 90` for `- interval '90' day`), Q6's discount bounds are written out (see its file), and Q3 and Q10
+/// order by their keys after the specification's order, so that ties come out in one order.
+pub const QUERIES: [Query; 8] = [
+    query!("q01", "pricing summary report"),
+    query!("q03", "shipping priority"),
+    query!("q05", "local supplier volume"),
+    query!("q06", "forecasting revenue change"),
+    query!("q10", "returned item reporting"),
+    query!("q12", "shipping modes and order priority"),
+    query!("q14", "promotion effect"),
+    query!("q19", "discounted revenue"),
+];
