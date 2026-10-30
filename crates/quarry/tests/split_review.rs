@@ -1,5 +1,8 @@
 //! The day-5 review's second round on the splitter (README, "Review of day 5"): open strings its closers missed, a
-//! comment ending in `/`, and whitespace the tokenizer knows and `skip_blank` didn't. Each failed at a491dde^.
+//! comment ending in `/`, and whitespace the tokenizer knows and `skip_blank` didn't (each failed at a491dde^); and
+//! round 3's tests for mutants its suite let through.
+
+use std::time::Instant;
 
 use quarry::sql::{Rest, first_token_offset, split_statements};
 
@@ -61,4 +64,37 @@ fn first_token_offset_skips_the_tokenizers_whitespace() {
             "{prefix:?}"
         );
     }
+}
+
+// Round 3 (on a491dde, c1e63cb and 88b69a7): tests for the mutants of its run that weren't equivalent.
+
+/// S14 / S15: quote_delimited_ends without its `(` -> `)` or `<` -> `>` mirror passes the whole suite (only `[` and
+/// `{` are tested), and then a q-string with that delimiter open across lines is Invalid: a script stops on valid
+/// text. (review3_line_prefixes.rs kills both too.)
+#[test]
+fn quote_delimited_strings_with_every_bracket_are_open() {
+    for text in [
+        "SELECT q'(a;\n",
+        "SELECT q'<a;\n",
+        "SELECT Q'(a\n",
+        "SELECT nq'<a\n",
+    ] {
+        assert_eq!(split_statements(text).rest, Rest::Open, "{text:?}");
+    }
+}
+
+/// S10: dollar_tags without its sort + dedup passes the suite (c1e63cb measured 7.6 s for 400 lines but kept no
+/// test). An open `$z$` string whose text repeats an earlier tag: with the dedupe each line tries one copy.
+#[test]
+fn open_text_with_a_repeated_dollar_tag_is_quick() {
+    // The tag copies come before the opener, so every copy is tried before `$z$` is.
+    let mut text = format!("SELECT {} $z$\n", "$a$ x $a$ AS c, ".repeat(200));
+    let started = Instant::now();
+    for _ in 0..100 {
+        text.push_str("line;\n");
+        assert_eq!(split_statements(&text).rest, Rest::Open);
+    }
+    let elapsed = started.elapsed();
+    // Debug build: 3.5 s with the dedupe, 26.7 s without it (measured in round 3).
+    assert!(elapsed.as_secs_f64() < 10.0, "{elapsed:?}");
 }

@@ -545,7 +545,19 @@ re-running round 1's exhaustive search, and `c1e63cb`); open text with many doll
 deduplicated) and so was nesting comments deep (one candidate per depth); `skip_blank` knew four whitespace bytes
 where the tokenizer takes any `char::is_whitespace`. Of its mutants, the non-equivalent survivors (bad-line ranges
 across a drain, the skip rule after a closed comment) got tests. The failing cases are in `repl_review.rs` and
-`crates/quarry/tests/split_review.rs`. No third round: the session's time was up.
+`crates/quarry/tests/split_review.rs`.
+
+**Round 3** (one agent on round 2's three fix commits, 20 minutes) found **no valid script the REPL stops on**:
+about 130,000 generated texts that tokenize in full, with every string, name and comment form split across lines,
+never hit "invalid" when fed a line at a time, and 556 three-statement scripts through the binary matched `quarry
+query`. Its reading of the tokenizer: every REPL text ends in a newline inside the open token, so the candidates
+always close it. It found: at a terminal, a pasted statement with a rejected escape still runs its later lines as
+new statements (the first guess, at a terminal only; a script stops), now a limitation, and the terminal now says
+what it dropped; `q'` ends weren't deduplicated and dollar tags were tried in sorted order, so open text could
+still be cubic (both now deduplicated in the order they appear, `$z$` before the `$aN$` inside it); "reported at
+once" was untrue after an unended line (the skip rule waits for a line with a `;`), now said as it is; and three
+non-equivalent survivors (`(` and `<` mirrored in q-strings, a dedupe nothing timed, resetting all of the pending
+state), each now tested.
 
 ## Review of day 4
 
@@ -770,7 +782,9 @@ property then found one more bug itself: `-(-0)` printed as `-0`, which binds ba
 - The REPL has no history or line editing beyond the terminal's own (`rlwrap quarry repl ...` adds both), and
   Ctrl-C ends it rather than cancelling a query. Text the tokenizer rejects whatever follows (an invalid escape such
   as `U&'\zz'` or `E'\x80'`) stops a script there, since where that statement ends can't be told; the statements
-  after it don't run (the REPL says so). At a terminal it is an error at once and the session goes on. Text inside
+  after it don't run (the REPL says so). At a terminal it is an error and the session goes on, so the later lines
+  of a pasted multi-line statement with such an escape run as statements of their own (Quarry only reads files, so
+  that prints wrong results; it changes nothing). Text inside
   an open comment or string is re-tokenized on every line, so thousands of lines of it are slow to read (DESIGN.md,
   "The REPL"). A path containing `=` needs a `NAME=` in front (`-t part=year=2024/part.csv`).
 

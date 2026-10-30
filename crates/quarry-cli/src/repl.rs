@@ -256,6 +256,10 @@ pub fn run(
                     )?;
                     return Ok(false);
                 }
+                writeln!(
+                    err,
+                    "dropped: where that statement ends can't be told; anything after it on its line didn't run"
+                )?;
                 pending = Pending::default();
             }
         }
@@ -487,11 +491,24 @@ mod tests {
             lines[1],
             "stopping: where that statement ends can't be told, so the rest of the input isn't run"
         );
-        // At a terminal it's an error at once, and the next line starts afresh.
-        let (ok, out, err) = session("SELECT U&'\\zz'\nSELECT 4 AS d;\n", true);
+        // At a terminal it's an error at once, the next line starts afresh, and a note says what was dropped.
+        let (ok, out, err) = session("SELECT U&'\\zz'; SELECT 5 AS e;\nSELECT 4 AS d;\n", true);
         assert!(!ok);
-        assert!(out.contains("| 4 |"), "{out}");
-        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(out.contains("| 4 |") && !out.contains("| 5 |"), "{out}");
+        assert_eq!(err.lines().count(), 2, "{err}");
+        assert!(
+            err.lines().nth(1).unwrap().starts_with("dropped: "),
+            "{err}"
+        );
+    }
+
+    /// Review round 3 (survivor R5): at a terminal, rejected text resets everything pending, not only its text; with
+    /// `unended` left over from the line before, a comment line wasn't split, stayed pending, and `.tables` was SQL.
+    #[test]
+    fn after_rejected_text_at_a_terminal_nothing_is_left_pending() {
+        let (_, out, err) = session("SELECT 1 AS a,\nE'\\x80';\n-- note\n.tables\n", true);
+        assert!(out.contains("orders"), "{out}\n{err}");
+        assert_eq!(err.lines().count(), 2, "{err}");
     }
 
     #[test]

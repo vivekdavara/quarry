@@ -194,7 +194,7 @@ fn quote_delimited_ends(text: &str) -> Vec<String> {
             ends.push(format!("{close}'"));
         }
     }
-    ends
+    dedup_in_order(ends)
 }
 
 /// The `$tag$` openers of dollar-quoted strings in `text` (a tag is letters, digits and `_`).
@@ -209,9 +209,17 @@ fn dollar_tags(text: &str) -> Vec<String> {
             tags.push(format!("${tag}$"));
         }
     }
-    tags.sort();
-    tags.dedup();
-    tags
+    dedup_in_order(tags)
+}
+
+/// The candidates once each, in the order they appear in the text: each try tokenizes the whole text, so a
+/// repeated `$a$` or `Iraq'` must cost one try, and the opener of what is open, often the first, comes early.
+fn dedup_in_order(candidates: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|c| seen.insert(c.clone()))
+        .collect()
 }
 
 #[cfg(test)]

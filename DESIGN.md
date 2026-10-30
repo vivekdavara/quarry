@@ -488,29 +488,31 @@ table and their count, or `EXPLAIN`'s optimized plan).
   re-tokenizes everything pending (6,400 lines of `x;` inside one `/* */` take 6.4 s in a debug build, 1,600 take
   0.40 s), and so does a statement with a `;` on every line inside comments or strings; `n` semicolons inside one
   string on one line cost `O(n * length)`.
-- **What follows the last `;`** is blank (whitespace and comments: forgotten), unended (it tokenizes but has no
-  `;` yet), open (a string, name or comment the next line may close), or invalid: text the tokenizer rejects
-  whatever follows it, such as the invalid escapes in `U&'\zz'` and `E'\x80'`. The REPL waits on unended and open
-  text, prompting `   ...>`. Open and invalid can't be told apart by the tokenizer's messages (sqlparser 0.63 says
-  "Unterminated encoded string literal" for both `E'abc` and `E'\x80'`), so text that doesn't tokenize is open
-  exactly when a closing suffix makes it tokenize: a quote, `''` (after a trailing backslash in `E'...'`), `'''` or
-  `"""` (raw triple-quoted strings), the end of a quote-delimited string (`q'[...]'`, `q'#...#'`), `$$`, a `$tag$`
-  it holds, or ` */` once for each `/*` it holds (spare ones tokenize as `*` and `/`; the space keeps a trailing `/`
-  from opening a comment); only one thing can be open at the end, since the tokenizer stops there. There is no
-  knowing where an invalid statement ends: a `;` after it may be inside its string or a comment. So it is reported
-  at once (the parser's message), and a script stops there, with "stopping: where that statement ends can't be
-  told, so the rest of the input isn't run" and status 1; at a terminal the pending text is dropped and the session
-  goes on. (Two guesses at its end, the end of its line and then the first line ending in `;`, each ran the inside
-  of a string in review.)
+- **What follows the last `;`** is blank (whitespace and comments: forgotten), unended (it tokenizes but has no `;`
+  yet), open (a string, name or comment the next line may close), or invalid: text the tokenizer rejects whatever
+  follows it, such as the invalid escapes in `U&'\zz'` and `E'\x80'`. The REPL waits on unended and open text,
+  prompting `   ...>`. Open and invalid can't be told apart by the tokenizer's messages (sqlparser 0.63 says
+  "Unterminated encoded string literal" for both `E'abc` and `E'\x80'`), so text that doesn't tokenize is open exactly
+  when a closing suffix makes it tokenize: a quote, `''` (after a trailing backslash in `E'...'`), `'''` or `"""` (raw
+  triple-quoted strings), the end of a quote-delimited string (`q'[...]'`, `q'#...#'`), `$$`, a `$tag$` it holds (each
+  candidate once, in the order it appears: every try tokenizes the whole text), or ` */` once for each `/*` it holds
+  (spare ones tokenize as `*` and `/`; the space keeps a trailing `/` from opening a comment); only one thing can be
+  open at the end, since the tokenizer stops there. There is no knowing where an invalid statement ends: a `;` after
+  it may be inside its string or a comment. So it is reported when the REPL next splits (on its own line, or, after a
+  line that left a statement unended, the next line holding a `;`), with the parser's message, and a script stops
+  there, with "stopping: where that statement ends can't be told, so the rest of the input isn't run" and status 1; at
+  a terminal the pending text is dropped ("dropped: ...") and the session goes on, so the later lines of a pasted
+  multi-line statement run as statements of their own. (Two guesses at its end, the end of its line and then the first
+  line ending in `;`, each ran the inside of a string in review.)
 - **The end of the input** ends an open statement: one with no `;` runs, and an open string or comment is the
   parser's error ("Unterminated string literal"), not silently dropped.
 - **Errors** go to standard error and the session goes on, except after text the tokenizer rejects (above), which
-  stops a script. From a script, each names the input line its statement
-  starts on (`error: line 12: plan error: ...`); at a terminal it doesn't. A line that isn't UTF-8 is kept, with
-  U+FFFD for its bad bytes, so the statement it is part of still ends at its `;`, but that statement doesn't run
-  ("line 3 isn't valid UTF-8, so its statement doesn't run"); such a command line is skipped. A byte order mark
-  before the first line is dropped. The exit status is 0 if every statement and command succeeded and 1 otherwise, so a script's failures are
-  visible to a shell; a `-t` table that can't be loaded exits 1 before reading anything.
+  stops a script. From a script, each names the input line its statement starts on (`error: line 12: plan error:
+  ...`); at a terminal it doesn't. A line that isn't UTF-8 is kept, with U+FFFD for its bad bytes, so the statement it
+  is part of still ends at its `;`, but that statement doesn't run ("line 3 isn't valid UTF-8, so its statement
+  doesn't run"); such a command line is skipped. A byte order mark before the first line is dropped. The exit status
+  is 0 if every statement and command succeeded and 1 otherwise, so a script's failures are visible to a shell; a `-t`
+  table that can't be loaded exits 1 before reading anything.
 - **The terminal.** Prompts (`quarry>`, `   ...>`) and a one-line banner appear only when standard input is a
   terminal (`IsTerminal`), so piped output is exactly the results. There is no line editing or history beyond what
   the terminal's own line discipline gives (`rlwrap quarry repl ...` adds both), and Ctrl-C ends the process rather
