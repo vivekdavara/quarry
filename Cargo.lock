@@ -1110,7 +1110,7 @@ dependencies = [
 
 [[package]]
 name = "quarry"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ahash",
  "arrow",
@@ -1125,7 +1125,7 @@ dependencies = [
 
 [[package]]
 name = "quarry-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "quarry",
@@ -1134,7 +1134,7 @@ dependencies = [
 
 [[package]]
 name = "quarry-tpch"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arrow",
  "parquet",
