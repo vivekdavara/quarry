@@ -162,11 +162,12 @@ const CLOSERS: &[&str] = &["'", "\"", "`", "''", "'''", "\"\"\"", "$$"];
 /// `/*`), a `$tag$` it contains, or the end of a quote-delimited string it opens. Only one thing can be open at the
 /// end (the tokenizer stops at it), so one suffix is enough.
 fn can_close(text: &str) -> bool {
-    let comments = std::iter::once(" */".repeat(text.matches("/*").count()));
-    let closers = CLOSERS
-        .iter()
-        .map(|c| c.to_string())
-        .chain(comments)
+    // A comment first: each try tokenizes the whole text, and a long open comment is the common case.
+    let opens = text.matches("/*").count();
+    let comments = (opens > 0).then(|| " */".repeat(opens));
+    let closers = comments
+        .into_iter()
+        .chain(CLOSERS.iter().map(|c| c.to_string()))
         .chain(dollar_tags(text))
         .chain(quote_delimited_ends(text));
     closers

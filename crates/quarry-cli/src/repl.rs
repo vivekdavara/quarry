@@ -229,13 +229,6 @@ pub fn run(
         // The semicolons pending before this line have been tokenized and end nothing.
         let checked = pending.text.len();
         pending.push(line, line_no, utf8);
-        if pending.invalid {
-            if ends_with_semicolon(line) {
-                run_rest(session, &pending, out, err, &mut errors)?;
-                pending = Pending::default();
-            }
-            continue;
-        }
         if pending.unended && !line.contains(';') {
             continue;
         }
@@ -249,14 +242,20 @@ pub fn run(
                 pending.drain(split.rest_start);
                 pending.unended = split.rest == Rest::Unended;
             }
+            // Text the tokenizer rejects: there's no telling where its statement ends (a `;` after it may be inside
+            // its string or a comment), so it fails at once. A script stops there, rather than guess and run what
+            // may be the inside of a string; at a terminal, whoever typed it sees the error and goes on.
             Rest::Invalid => {
                 pending.drain(split.rest_start);
-                if ends_with_semicolon(line) {
-                    run_rest(session, &pending, out, err, &mut errors)?;
-                    pending = Pending::default();
-                } else {
-                    pending.invalid = true;
+                run_rest(session, &pending, out, err, &mut errors)?;
+                if !interactive {
+                    writeln!(
+                        err,
+                        "stopping: where that statement ends can't be told, so the rest of the input isn't run"
+                    )?;
+                    return Ok(false);
                 }
+                pending = Pending::default();
             }
         }
     }
@@ -271,12 +270,6 @@ pub fn run(
     Ok(errors.count == 0)
 }
 
-/// Where an invalid statement ends: no one can tell from its tokens, so at the end of the first line (its own or a
-/// later one) whose last character is `;`, as a statement typed or written in a script ends.
-fn ends_with_semicolon(line: &str) -> bool {
-    line.trim_end().ends_with(';')
-}
-
 /// The SQL read but not yet run.
 #[derive(Debug, Default)]
 struct Pending {
@@ -287,8 +280,6 @@ struct Pending {
     bad: Vec<(Range<usize>, usize)>,
     /// The last split left a statement that tokenizes and has no `;` yet: a line without one can't end it.
     unended: bool,
-    /// The last split left text the tokenizer rejects: it runs (and fails) at the end of a line ending in `;`.
-    invalid: bool,
 }
 
 impl Pending {
@@ -352,7 +343,7 @@ fn run_statement(
     }
 }
 
-/// Runs everything pending as one statement: one the end of the input ended, or an invalid one.
+/// Runs everything pending as one statement: one the end of the input ended, or text the tokenizer rejects.
 fn run_rest(
     session: &mut Session,
     pending: &Pending,
@@ -480,11 +471,26 @@ mod tests {
     }
 
     #[test]
-    fn text_the_tokenizer_rejects_is_reported_at_once() {
-        let (ok, out, err) = session("SELECT U&'\\zz';\nSELECT 4 AS d;\n", false);
+    fn text_the_tokenizer_rejects_stops_a_script() {
+        let script = "SELECT 3 AS c;\nSELECT U&'\\zz', 'it;\nSELECT 4 AS d; '\n;\n";
+        let (ok, out, err) = session(script, false);
         assert!(!ok);
-        assert!(err.starts_with("error: line 1: "), "{err}");
+        assert!(out.contains("| 3 |") && !out.contains("| 4 |"), "{out}");
+        let lines: Vec<&str> = err.lines().collect();
+        assert_eq!(lines.len(), 2, "{err}");
+        assert!(
+            lines[0].starts_with("error: line 2: ") && lines[0].contains("Invalid hex digit"),
+            "{err}"
+        );
+        assert_eq!(
+            lines[1],
+            "stopping: where that statement ends can't be told, so the rest of the input isn't run"
+        );
+        // At a terminal it's an error at once, and the next line starts afresh.
+        let (ok, out, err) = session("SELECT U&'\\zz'\nSELECT 4 AS d;\n", true);
+        assert!(!ok);
         assert!(out.contains("| 4 |"), "{out}");
+        assert_eq!(err.lines().count(), 1, "{err}");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! The day-5 review's cases for `quarry repl` (README, "Review of day 5"): the six that failed at 4e3fc75, each with
+//! The day-5 review's cases for `quarry repl` (README, "Review of day 5"): round 1's six that failed at 4e3fc75, each with
 //! the behaviour now expected, and the tests that kill the mutants its suite let through.
 
 use std::io::Write;
@@ -43,23 +43,18 @@ fn a_non_utf8_line_inside_a_statement_does_not_run_what_is_left() {
     );
 }
 
-/// An E'' string with an escape the tokenizer rejects (`\x80`, `\0`, ...) fails with "Unterminated encoded string
-/// literal", which `is_unterminated` takes for an open string: every later line, `.quit` included, joins the
-/// statement, and nothing runs until the end of the input. Expected: the statement is reported when its line
-/// ends (Rest::Invalid), and the session goes on.
+/// An E'' string with an escape the tokenizer rejects (`\x80`, `\0`, ...) failed with "Unterminated encoded string
+/// literal", which the splitter took for an open string: every later line, `.quit` included, joined the statement,
+/// and nothing ran until the end of the input. It is reported on its line now, and (round 2) a script stops there
+/// and says so, since where that statement ends can't be told.
 #[test]
 fn an_invalid_escape_in_an_e_string_does_not_swallow_the_rest_of_the_script() {
     let out = repl(b"SELECT E'\\x80' AS a;\nSELECT 1 AS b;\n.quit\nSELECT 2 AS c;\n");
-    let stdout = text(&out.stdout);
-    assert!(
-        stdout.contains("| b |"),
-        "SELECT 1 AS b never ran:\nstdout: {stdout}\nstderr: {}",
-        text(&out.stderr)
-    );
-    assert!(
-        !stdout.contains("| c |"),
-        ".quit didn't stop the session: {stdout}"
-    );
+    let stderr = text(&out.stderr);
+    assert!(stderr.starts_with("error: line 1: "), "{stderr}");
+    assert!(stderr.contains("\nstopping: "), "{stderr}");
+    assert!(text(&out.stdout).is_empty(), "{}", text(&out.stdout));
+    assert_eq!(out.status.code(), Some(1));
 }
 
 /// After a line the tokenizer rejects, the next line starts a new statement, so text inside the rejected
@@ -100,6 +95,8 @@ fn errors_in_untokenizable_statements_name_the_line_they_start_on() {
 #[test]
 fn a_block_comment_of_lines_with_semicolons_is_quick() {
     let script = format!("/*\n{}*/ SELECT 1 AS one;\n", "x;\n".repeat(1000));
+    // macOS checks a new binary on its first launch (about 2 s here): launch it once before timing.
+    repl(b"");
     let started = Instant::now();
     let out = repl(script.as_bytes());
     assert!(out.status.success(), "{}", text(&out.stderr));
@@ -113,6 +110,8 @@ fn a_block_comment_of_lines_with_semicolons_is_quick() {
 #[test]
 fn a_statement_of_many_lines_is_quick() {
     let script = format!("SELECT 1 AS one\n{};\n", "-- more\n".repeat(10_000));
+    // macOS checks a new binary on its first launch (about 2 s here): launch it once before timing.
+    repl(b"");
     let started = Instant::now();
     let out = repl(script.as_bytes());
     assert!(out.status.success(), "{}", text(&out.stderr));
@@ -210,4 +209,97 @@ fn help_and_exit() {
     assert!(out(&repl2(".help\n")).contains(".load [NAME=]PATH"));
     let o = repl2(".exit\nSELECT 1 AS one;\n");
     assert!(o.status.success() && out(&o).is_empty(), "{}", out(&o));
+}
+
+// Round 2 (on f430384 and 17a497a): its five failing cases.
+
+fn both(out: &Output) -> String {
+    format!(
+        "stdout:\n{}stderr:\n{}",
+        text(&out.stdout),
+        text(&out.stderr)
+    )
+}
+
+/// F3 residue: the review's own case, with the rejected statement's first line ending in `;` (inside its open
+/// string). That line ends the invalid statement, and the string's content runs as SQL.
+#[test]
+fn string_content_of_a_rejected_statement_does_not_run_when_its_first_line_ends_in_a_semicolon() {
+    for script in [
+        &b"SELECT U&'\\zz' AS a, 'it;\nSELECT 42 AS boom; '\n;\n"[..],
+        &b"SELECT E'\\x80 -- note;\nSELECT 42 AS boom;\n' AS a;\n"[..],
+    ] {
+        let out = repl(script);
+        assert!(
+            !text(&out.stdout).contains("boom"),
+            "{:?}\n{}",
+            text(script),
+            both(&out)
+        );
+    }
+}
+
+/// A `;` at the end of a `--` comment ends a rejected statement, and its next line runs on its own: here a CTE's
+/// body. (Whole, the text is one statement: `quarry query` fails on it.)
+#[test]
+fn a_semicolon_in_a_trailing_comment_does_not_end_a_rejected_statement() {
+    let out = repl(b"WITH x AS (SELECT E'\\x80' AS a) -- the CTE;\nSELECT 42 AS boom;\n");
+    assert!(!text(&out.stdout).contains("boom"), "{}", both(&out));
+}
+
+/// A rejected statement whose `;` is followed by a comment on its line didn't end there: it took every line up to
+/// the next one ending in `;`, so the next statement never ran and nothing said so. Now the script stops at the
+/// rejected statement and says that the rest isn't run.
+#[test]
+fn a_comment_after_a_rejected_statements_semicolon_does_not_swallow_the_next_statement() {
+    let out = repl(b"SELECT E'\\x80' AS a; -- bad escape\nSELECT 2 AS b;\n");
+    assert!(text(&out.stderr).contains("\nstopping: "), "{}", both(&out));
+}
+
+/// Valid SQL the splitter calls invalid (a raw triple-quoted string, which GenericDialect tokenizes) runs as one
+/// statement with everything up to the end of its `;` line: "2 statements at once".
+#[test]
+fn a_raw_triple_quoted_string_splits_like_any_string() {
+    let out = repl(b"SELECT R'''a\nb''' AS x; SELECT 2 AS b;\n");
+    assert!(text(&out.stdout).contains("| b |"), "{}", both(&out));
+    assert!(
+        !text(&out.stderr).contains("2 statements at once"),
+        "{}",
+        both(&out)
+    );
+}
+
+/// A q-string with a `#` delimiter is called invalid; its first line ends in `;`, so its content runs as SQL.
+#[test]
+fn a_quote_delimited_string_does_not_run_its_content() {
+    let out = repl(b"SELECT q'#a;\nSELECT 42 AS boom;\n#' AS x;\n");
+    assert!(!text(&out.stdout).contains("boom"), "{}", both(&out));
+}
+
+// Round 2's surviving mutants that weren't equivalent: the bad-line ranges across a drain, and the skip rule after
+// an open comment.
+
+/// A statement on a bad line that a `;` on the same line separates from another is refused, and so is the other
+/// (both touch the line); a statement on the next line, after a comment that the bad line opened, isn't.
+#[test]
+fn bad_line_ranges_follow_the_text_across_a_drain() {
+    let out = repl(b"SELECT 1 AS a; SELECT 'caf\xe9' AS b\n;\n");
+    assert!(!text(&out.stdout).contains("caf"), "{}", both(&out));
+    assert_eq!(
+        text(&out.stderr).matches("isn't valid UTF-8").count(),
+        2,
+        "{}",
+        both(&out)
+    );
+    let out = repl(b"SELECT 'caf\xe9' AS b; /* c\n*/ SELECT 2 AS c;\n");
+    assert!(text(&out.stdout).contains("| c |"), "{}", both(&out));
+    assert!(!text(&out.stdout).contains("caf"), "{}", both(&out));
+}
+
+/// A comment that closes on a line without `;` leaves nothing pending, so the next `.` line is a command.
+#[test]
+fn a_closed_comment_leaves_nothing_pending() {
+    let out = repl(b"/* a\nb */\n.tables\n");
+    assert!(out.status.success(), "{}", both(&out));
+    assert!(text(&out.stdout).starts_with("orders "), "{}", both(&out));
 }
