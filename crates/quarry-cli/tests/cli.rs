@@ -518,3 +518,41 @@ fn repl_exit_status_says_whether_anything_failed() {
     assert_eq!(small.status.code(), Some(0), "{}", stderr(&small));
     assert_eq!(large.status.code(), Some(1), "{}", stdout(&large));
 }
+
+#[test]
+fn the_readme_repl_session_prints_what_the_readme_says() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let readme = fs::read_to_string(format!("{root}/README.md")).unwrap();
+    let script = fs::read_to_string(format!("{root}/examples/session.sql")).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_quarry"))
+        .current_dir(root)
+        .args([
+            "repl",
+            "-t",
+            "examples/orders.csv",
+            "-t",
+            "examples/customers.csv",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), script.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        readme.contains("./target/release/quarry repl -t examples/orders.csv -t examples/customers.csv < examples/session.sql"),
+        "README's REPL command differs from the test's"
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        readme.contains(&format!("```\n{}```", stdout(&out))),
+        "README's REPL output is stale:\n{}",
+        stdout(&out)
+    );
+    assert!(
+        readme.contains(&format!("```\n{}```", stderr(&out))),
+        "README's REPL error is stale:\n{}",
+        stderr(&out)
+    );
+}

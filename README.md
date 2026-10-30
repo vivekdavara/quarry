@@ -80,24 +80,26 @@ crates/quarry/          the engine (a library)
   src/catalog.rs        table names to tables
   src/types.rs          type classes, the common-type rules, strict dates
   src/plan/             LogicalPlan, bound Expr, printing
-  src/sql/              parsing and the binder
+  src/sql/              parsing, the binder, and the REPL's statement splitter (split.rs)
   src/exec/             the executor: operators and top-k (mod.rs), expressions (expr.rs), aggregation
                         (aggregate.rs), joins (join.rs)
   src/optimizer/        the rules: constant folding (fold.rs), OR factoring (factor.rs), predicate pushdown
                         (predicates.rs), projection pushdown (columns.rs)
   tests/                datasource.rs, binder.rs, binder_properties.rs, execute.rs, eval_properties.rs,
                         query_properties.rs, join_properties.rs, optimizer.rs, optimizer_properties.rs,
-                        pruning.rs, skipped_errors.rs, tpch.rs (TPC-H answers vs DuckDB's)
+                        pruning.rs, skipped_errors.rs, tpch.rs (TPC-H answers vs DuckDB's),
+                        split_properties.rs (the splitter vs the tokenizer)
   benches/tpch.rs       criterion benchmarks of the TPC-H queries
   examples/             gen_orders.rs (synthetic Parquet data), time_queries.rs and tpch_times.rs (the timings
                         below)
 crates/quarry-tpch/     TPC-H-style tables (src/lib.rs), the `tpch-gen` binary, the queries (queries/), DuckDB's
                         answers at scale 0.01 (answers/), the generator's tests
-crates/quarry-cli/      the `quarry` binary and its tests
+crates/quarry-cli/      the `quarry` binary: subcommands (src/main.rs), the REPL (src/repl.rs), tests
 scripts/                differential.py (random queries vs DuckDB), tpch_answers.py (writes answers/),
                         tpch_duckdb_times.py and duckdb_times.py (DuckDB's timings, for scale)
 examples/orders.csv     eight synthetic rows for the examples below
 examples/customers.csv  four synthetic customers, for the join example
+examples/session.sql    a script for the REPL example
 DESIGN.md               the specification
 ```
 
@@ -212,6 +214,49 @@ error: plan error: cannot compare Float64 with Utf8 ('big') in total > 'big'
 
 `quarry head -n 3 examples/orders.csv` prints rows; `quarry --help` lists the rest.
 
+**The REPL.** `quarry repl` reads statements (ending in `;`, over as many lines as they like) and `.` commands, from
+the terminal with a `quarry>` prompt, or from a script on standard input. `examples/session.sql` is such a script:
+
+```bash
+./target/release/quarry repl -t examples/orders.csv -t examples/customers.csv < examples/session.sql
+```
+
+```
+customers  examples/customers.csv
+orders     examples/orders.csv
++--------+--------+--------+
+| tier   | orders | spent  |
++--------+--------+--------+
+| silver | 3      | 287.0  |
+| gold   | 3      | 202.85 |
++--------+--------+--------+
+2 rows
++---------------------+
+| s                   |
++---------------------+
+| a ; inside a string |
++---------------------+
+1 row
+dropped customers
+loaded people
++--------+
+| people |
++--------+
+| 4      |
++--------+
+1 row
+```
+
+and on standard error, for its one bad statement (the session goes on, and exits with status 1):
+
+```
+error: line 9: plan error: column nope not found; the columns are: orders.order_id, orders.customer, orders.status, orders.total, orders.placed
+```
+
+The `;` inside the string and the one in the comment end nothing: statements are cut where the parser's own
+tokenizer sees a semicolon. `.help` lists the commands (`.tables`, `.schema`, `.load`, `.drop`, `.timer on`,
+`.quit`); DESIGN.md, "The REPL", has the rules.
+
 **TPC-H.** `tpch-gen` writes the tables (scale 0.01 is about 60,000 lines and 2 MB, scale 1 about 6 million and 238
 MB); each query is a file in `crates/quarry-tpch/queries/`. A query file starts with a SQL comment, so it goes after
 `--`:
@@ -256,8 +301,10 @@ and the differential test against DuckDB (the TPC-H queries and 1,000 random que
 | `tests/tpch.rs` (3) | the eight TPC-H queries over the scale-0.01 tables give DuckDB 2.0.0's answers (names, rows in order, floats within a relative 1e-9) at batch sizes 7, 1000 and 8192; no plan has a nested loop; every answer has rows |
 | `quarry-tpch/tests/generate.rs` (5) | the generator: row counts per scale factor, bad factors refused, TPC-H's dates, byte-identical files on two runs and a pinned checksum, the same tables in batches of 7 rows and 3 orders, and every rule of the crate's documentation on every row at scale 0.005 |
 | `scripts/differential.py` (CI) | random queries (filters, joins, GROUP BY, ORDER BY with LIMIT) through the `quarry` CLI and DuckDB 2.0.0, row for row (DESIGN.md, "TPC-H-style data and the differential test") |
-| unit tests (33) | the common-type rules, date parsing over every day from 1600 to 2400 and against Arrow's own cast, expression printing, the plan nodes' guards and schemas; each operator of the evaluator, with DuckDB 2.0's answers; constant folding; which ON conjuncts become join keys; a footer without null counts |
-| `quarry-cli/tests/cli.rs` (11) | the built binary: output, exit codes, errors on stderr, `quarry query`, its `--output` Parquet file (and the path in its error) and `--batch-size`, and that this README's examples print what it says |
+| `tests/split_properties.rs` (2) | the REPL's statement splitter on random text of quotes, comment markers, dollar quotes, backslashes, CRLFs and semicolons: statements end exactly at the parser's tokenizer's semicolon tokens, a text a closing suffix cures is never "invalid", and feeding it a line at a time finds the same statements |
+| unit tests (41) | the statement splitter (strings, names, comments and dollar quotes holding semicolons; each "unterminated" tokenizer message recognized); the common-type rules, date parsing over every day from 1600 to 2400 and against Arrow's own cast, expression printing, the plan nodes' guards and schemas; each operator of the evaluator, with DuckDB 2.0's answers; constant folding; which ON conjuncts become join keys; a footer without null counts |
+| `quarry-cli/src/repl.rs` (12) | REPL sessions over in-memory input: statements across lines and several on a line, strings and comments spanning lines, errors and the line they name, the end of the input, every command and its mistakes, a `.` line inside a statement, `.quit`, `.timer`, prompts, a line that isn't UTF-8 |
+| `quarry-cli/tests/cli.rs` (14) | the built binary: output, exit codes, errors on stderr, `quarry query`, its `--output` Parquet file (and the path in its error) and `--batch-size`; `quarry repl` over piped scripts (output, exit status, a table that won't load, `--batch-size`); and that this README's examples, the REPL session included, print what it says |
 
 The property tests bind `SELECT <expr> FROM t` for expressions from two generators (a random grammar of every
 supported operator, mostly ill-typed, and a type-directed one that builds well-typed trees three operators deep)
