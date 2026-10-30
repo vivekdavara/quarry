@@ -92,14 +92,14 @@ pub fn first_token_offset(text: &str) -> Option<usize> {
     }
 }
 
-/// The offset after the whitespace (space, tab, CR, LF), `--` comments and nested `/* */` comments `text` starts
-/// with; at an open `/*`, its offset.
+/// The offset after the whitespace (what the tokenizer takes for it: `char::is_whitespace`), `--` comments and
+/// nested `/* */` comments `text` starts with; at an open `/*`, its offset.
 fn skip_blank(text: &str) -> usize {
     let b = text.as_bytes();
     let mut i = 0;
     loop {
-        if i < b.len() && matches!(b[i], b' ' | b'\t' | b'\r' | b'\n') {
-            i += 1;
+        if let Some(c) = text[i..].chars().next().filter(|c| c.is_whitespace()) {
+            i += c.len_utf8();
         } else if b[i..].starts_with(b"--") {
             i = b[i..]
                 .iter()
@@ -154,14 +154,15 @@ fn is_blank(token: &Token) -> bool {
 }
 
 /// Suffixes that end what a text left open: a string (`''` after a trailing backslash in `E'...'`), a quoted name,
-/// a `$$` string.
-const CLOSERS: &[&str] = &["'", "\"", "`", "''", "$$"];
+/// a raw triple-quoted string (`R'''...'''`), a `$$` string.
+const CLOSERS: &[&str] = &["'", "\"", "`", "''", "'''", "\"\"\"", "$$"];
 
-/// Whether some suffix makes `text`, which doesn't tokenize, tokenize: one of `CLOSERS`, one `*/` to as many as it
-/// has `/*`, a `$tag$` it contains, or the end of a quote-delimited string it opens. Only one thing can be open at
-/// the end (the tokenizer stops at it), so one suffix is enough.
+/// Whether some suffix makes `text`, which doesn't tokenize, tokenize: one of `CLOSERS`, a ` */` for each `/*` it
+/// has (the spare ones close nothing and tokenize as `*` and `/`; the space keeps a trailing `/` from making a new
+/// `/*`), a `$tag$` it contains, or the end of a quote-delimited string it opens. Only one thing can be open at the
+/// end (the tokenizer stops at it), so one suffix is enough.
 fn can_close(text: &str) -> bool {
-    let comments = (1..=text.matches("/*").count()).map(|n| "*/".repeat(n));
+    let comments = std::iter::once(" */".repeat(text.matches("/*").count()));
     let closers = CLOSERS
         .iter()
         .map(|c| c.to_string())
@@ -207,6 +208,8 @@ fn dollar_tags(text: &str) -> Vec<String> {
             tags.push(format!("${tag}$"));
         }
     }
+    tags.sort();
+    tags.dedup();
     tags
 }
 
