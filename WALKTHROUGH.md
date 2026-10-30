@@ -438,26 +438,34 @@ escapes, `U&'...'`, `$tag$...$tag$` dollar quotes, nested `/* */`, backquoted na
 handles it, for free.
 
 **Isn't tokenizing every prefix slow?**
-Each candidate `;` costs one tokenization of the text since the last statement's end, so ordinary input is linear:
-each statement is tokenized about once. The bad case is many `;` inside one open string: `n` of them cost `O(n *
-length)`. For a REPL fed by a person or a script that's fine; DESIGN.md says so.
+It was, the first review showed: every line re-split everything pending, and every `;` inside an open comment
+re-tokenized from the statement's start, so a 1,600-line comment of `x;` lines took 33.5 s and a 20,000-line
+statement over a minute (debug build). Two facts fixed most of it. A prefix's tokens don't change when text is added
+after it, so only the new line's semicolons need testing (`split_statements_after`). And after a statement that
+tokenizes with no `;` yet, a line without `;` can't change anything, so it isn't split at all. Those cases are now
+0.76 s and 0.03 s. Text inside an open comment or string is still re-tokenized each line (quadratic), which
+DESIGN.md says.
 
 **What if the text after the last `;` doesn't tokenize?**
-Two cases. An unterminated string, name or comment could be finished by the next line, so the REPL waits (`...>`).
-But some text is wrong whatever follows (an invalid escape such as `U&'\zz'`); waiting would hang the session, so it
-runs at once and the parser reports it. Telling them apart uses the tokenizer's error messages (`Unterminated ...`,
-`... before EOF.`, `Unexpected EOF ...`), which is brittle across sqlparser versions, so
-`each_unterminated_error_is_recognized` produces every one of them and fails if a message changes. At the end of the
-input, an open statement runs anyway: one without a `;` succeeds, an open string is the parser's error, so nothing a
-script contains is silently dropped.
+Two cases. An open string, name or comment could be finished by the next line, so the REPL waits (`...>`). But some
+text is wrong whatever follows (an invalid escape such as `U&'\zz'` or `E'\x80'`); waiting would hang the session.
+My first version told them apart by the tokenizer's error messages, with a test pinning each message, and that was
+the review's worst finding: sqlparser says "Unterminated encoded string literal" both for `E'abc` and for
+`E'\x80'`, so an invalid escape swallowed every later line, `.quit` included. Now `can_close` decides it by trying
+closing suffixes (a quote, `''`, `$$`, a `*/` per `/*`, a `$tag$` in the text): open if one makes the text tokenize,
+invalid if none does. An invalid statement can't tell you where it ends either, so it lasts until a line ending in
+`;` and then fails with the parser's message; nothing inside it runs. At the end of the input an open statement
+runs anyway, so nothing a script holds is silently dropped.
 
 **How did you test the splitter?**
 Differentially, against the tokenizer itself (`tests/split_properties.rs`): random text built from quotes, comment
-markers, dollar quotes, backslashes, CRLFs, emoji and semicolons. Where the whole text tokenizes, the split must end
-statements exactly at its semicolon tokens; where it doesn't, a rest that some closing suffix (a quote, `*/`, `$$`
-repeated) makes tokenize must be "incomplete", never "invalid"; and feeding the text a line at a time, as the REPL
-does, must find the same statements as splitting it whole. Five mutants of the splitter, each fails it; one (treating
-every unterminated error as invalid) passed until I added the closing-suffix check.
+markers, dollar quotes, backslashes, invalid escapes, CRLFs, emoji and semicolons. Where the whole text tokenizes,
+the split must end statements exactly at its semicolon tokens; where it doesn't, the rest must be open exactly when
+a closing suffix from the test's own list (plus the text's dollar tags, found by pairs of `$`) makes it tokenize; and
+feeding the text a line at a time, as the REPL does, must find the same statements as splitting it whole. My first
+version of the property checked only one direction ("curable means not invalid"), which is why the `E''` bug passed
+it; checking both directions is what would have caught it. Mutants of the classification (every error open, none
+open, no dollar tags, one `*/` only) each fail it.
 
 **Why are commands recognized only when nothing is pending?**
 Because a line starting with `.` can be SQL: `SELECT o` then `.customer FROM orders o;` is a qualified name split
@@ -474,6 +482,39 @@ DuckDB's shells do by default.
 That needs a line-editing library (rustyline, linenoise) and a terminal to test it in. The terminal's own line
 discipline already gives backspace; `rlwrap quarry repl` adds history and editing without any code here. Ctrl-C
 ends the process rather than cancelling a query, since queries don't check for cancellation.
+
+## Q1 and the float sums (day 5)
+
+**Why did Q1 get faster on day 5?**
+`sample` on Q1 run 25 times in one `quarry repl` session showed 29.9% of samples in `FloatSum::update`. Q1 has
+seven float aggregates over 5.9 million rows, and each `sums[g] += v` had to wait for the previous row's store
+whenever that row was in the same group, which is most rows: in file order Q1's rows are 2,132,083 runs of one
+group, 2.8 rows on average. `add_in_runs` (`exec/aggregate.rs`) keeps a run's sum in a register. Q1 went from 338 to
+279 ms (and 353 to 289 in a second pair), and `FloatSum::update` to 16.4% of samples.
+
+**Doesn't changing how you sum floats change the answers?**
+It would if it changed the order of the additions, which is what vectorizing a sum (several partial sums) does.
+This doesn't: each group's values are still added one at a time in row order; only where the running sum lives
+changes. `float_sums_add_in_row_order` checks it with values where order matters (1e16 and 1.0, 0.1, NaN, -0.0),
+bit for bit against a left fold. The older GROUP BY property couldn't have: it draws multiples of 1/4, which add up
+exactly in any order.
+
+## What went wrong on day 5
+
+- **I trusted an error message to mean what it said.** The splitter decided "open string or invalid text?" from
+  sqlparser's wording, and I wrote a test that produced each "unterminated" message, which felt thorough. But one
+  message covers two situations, and a test that checks the messages I knew about can't find the case where one of
+  them is ambiguous. The review found it by trying invalid escapes. Deciding by behaviour (does a closing suffix cure it?)
+  needs no message at all.
+- **My property checked one direction of an "if and only if".** It required curable text to be open, never that
+  open text be curable, so "always open" passed it. Both directions now.
+- **A mutant survived my own new test of the review's finding.** The review's case for bad UTF-8 asserted that the
+  statement didn't count every row; a version that ran the statement with the bad bytes replaced passed it, since
+  the count was 0 instead. The test that kills it asserts the statement doesn't run.
+- **Claims went into a commit message before they were measured.** `de5c2a2` says Q1's groups "come in long runs";
+  measured afterwards with DuckDB, they average 2.8 rows. The README says what was measured; the commit message
+  stays. Twice I wrote a test's expected output from memory (an EXPLAIN line, the error text for an unknown column)
+  instead of running the command first; the tests caught both.
 
 ## What went wrong on day 4
 
