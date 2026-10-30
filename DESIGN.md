@@ -458,8 +458,49 @@ division or modulo by a column, no arithmetic on literals alone, no float litera
 `DECIMAL`s), and one join style per query: in `a, b JOIN c ON <a condition on a>` the SQL standard and PostgreSQL 14
 scope the `ON` to `b JOIN c` and refuse it, as Quarry does, while DuckDB 2.0 reads `(a, b) JOIN c` (the script's
 first run found exactly 17 such queries, and nothing else). CI runs the TPC-H queries and 1,000 random queries from
-seed 1 at scale 0.01. To check that it can fail, four engine bugs were built into release binaries and run through
+seed 1 at scale 0.01. To check that it can fail, six engine bugs were built into release binaries and run through
 it (README, "Results (day 4)"); each made queries differ.
+
+## The REPL (day 5)
+
+`quarry repl -t PATH ...` is a shell over the same engine: it reads standard input a line at a time, from a terminal
+or from a script (`quarry repl -t ... < script.sql`), and runs each statement as `quarry query` runs one (rows as a
+table and their count, or `EXPLAIN`'s optimized plan).
+
+- **Commands and SQL.** A line whose first non-blank character is `.` is a command when no SQL is pending:
+  `.help`, `.tables` (names and files), `.schema [TABLE]`, `.load [NAME=]PATH` (as `-t`), `.drop TABLE`, `.timer
+  on|off`, `.quit` / `.exit`. Anything else is SQL, and so is a `.` line while a statement is open (`SELECT o` then
+  `.customer FROM orders o;` is one statement, and a `.quit` inside an open comment is part of the comment).
+- **Where a statement ends.** SQL collects until a `;` ends a statement, and only a `;` the parser would read as
+  one: not inside a string, a quoted name, a dollar-quoted string or a comment, all of which may span lines. Rather
+  than a second lexer for those rules (sqlite's shell has one, `sqlite3_complete`), `sql::split_statements` asks the
+  parser's tokenizer: the `;` at byte `q` ends the statement that starts at `s` exactly when `text[s..=q]` tokenizes
+  and its last token is that semicolon. The tokenizer reads left to right and a `;` is a token by itself, so the
+  tokens before it don't depend on what follows; a `;` inside a string or block comment leaves the prefix
+  unterminated (an error), and one inside a `--` comment makes the last token the comment. So the REPL's split and
+  the parser's semicolons can't disagree, whatever sqlparser's GenericDialect accepts (`E'\''`, `U&'...'`,
+  `$tag$...$tag$`, nested `/* */`, backquoted names). Each found statement is parsed on its own; empty ones (`;;`,
+  or only comments) are skipped. Splitting costs one tokenization of each candidate stretch, so `n` semicolons
+  inside one open string cost `O(n * length)`; statements that end normally cost `O(length)` in all.
+- **What follows the last `;`** is blank (whitespace and comments: forgotten), incomplete (no `;` yet, or an open
+  string, name or comment: the REPL waits for the next line, prompting `   ...>`), or invalid: text the tokenizer
+  rejects whatever follows it, such as an invalid escape in `U&'\zz'`. An invalid stretch runs at once, so the
+  parser reports it, and takes the rest of its line with it (statements after it on that line don't run; there is
+  no way to know where the bad statement ends). Which tokenizer errors mean "more text could fix this" is decided by
+  their messages (`Unterminated ...`, `... before EOF.`, `Unexpected EOF ...`); a test produces each one, so a
+  sqlparser upgrade that rewords one fails it.
+- **The end of the input** ends an open statement: one with no `;` runs, and an open string or comment is the
+  parser's error ("Unterminated string literal"), not silently dropped.
+- **Errors** go to standard error and the session goes on. From a script, each names the input line its statement
+  starts on (`error: line 12: plan error: ...`); at a terminal it doesn't. A line that isn't UTF-8 is an error and
+  skipped. The exit status is 0 if every statement and command succeeded and 1 otherwise, so a script's failures are
+  visible to a shell; a `-t` table that can't be loaded exits 1 before reading anything.
+- **The terminal.** Prompts (`quarry>`, `   ...>`) and a one-line banner appear only when standard input is a
+  terminal (`IsTerminal`), so piped output is exactly the results. There is no line editing or history beyond what
+  the terminal's own line discipline gives (`rlwrap quarry repl ...` adds both), and Ctrl-C ends the process rather
+  than cancelling a query.
+- **`.timer on`** prints each statement's wall time, from parsing to the formatted table, not including writing it
+  out (`time: <milliseconds, three decimals> ms`).
 
 ## The days
 
@@ -471,7 +512,7 @@ it (README, "Results (day 4)"); each made queries differ.
   optimizer rules (constant folding, projection pushdown).
 - **Day 4:** TPC-H-style queries over generated data; differential tests against DuckDB (Python `duckdb` as the
   oracle); criterion benchmarks. Also the `OR` factoring rule (for Q19) and the boolean scatter (for Q6 and Q12).
-- **Day 5:** a REPL, the README's results, WALKTHROUGH.md, v1.0.0.
+- **Day 5:** the REPL ("The REPL" above), the README's results, WALKTHROUGH.md, v1.0.0.
 
 ## Testing
 
@@ -491,3 +532,9 @@ it (README, "Results (day 4)"); each made queries differ.
 - **Against DuckDB (day 4):** the TPC-H-style queries' answers at scale 0.01 are DuckDB 2.0.0's, compared in every
   `cargo test` (`tests/tpch.rs`), and `scripts/differential.py` runs random queries through both engines (below).
   Day 2's rules above were checked against DuckDB 2.0.0 by hand.
+- **The REPL (day 5):** `tests/split_properties.rs` splits random text full of quotes, comment markers, dollar
+  quotes, backslashes, CRLFs and semicolons and requires the statements to end exactly at the tokenizer's semicolon
+  tokens, a text that a closing suffix cures never to be called invalid, and a line-at-a-time feed to find the same
+  statements as the whole text. `repl.rs`'s unit tests run sessions over in-memory input (commands, errors and their
+  line numbers, the end of the input, prompts); `tests/cli.rs` pipes scripts into the built binary for its output
+  and exit status.
