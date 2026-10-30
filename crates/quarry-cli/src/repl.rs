@@ -3,7 +3,8 @@
 //! Lines are read one at a time. A line starting with `.` when no statement is pending is a command (`.help`
 //! lists them); everything else is SQL, collected until a `;` ends a statement, where `quarry::sql::split_statements`
 //! decides what a `;` ends. Each statement runs as `quarry query` would run it. An error is printed and the session
-//! goes on; the exit status says whether any statement or command failed.
+//! goes on, except after text the tokenizer rejects, which stops a script (where its statement ends can't be told);
+//! the exit status says whether any statement or command failed.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;

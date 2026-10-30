@@ -28,8 +28,8 @@ against DuckDB's; and a differential test of random queries against DuckDB 2.0.0
 are kept as tests (README, "Review of day 1" to "Review of day 5").
 
 **What a 1.x keeps.** The `quarry` subcommands, their flags and their exit statuses (0 success, 1 an engine error or
-a failed statement in the REPL, 2 a bad command line); the REPL's commands and its `error: line N:` messages; and the library's `quarry::query`,
-`Catalog` and `sql::bind`. The printed plan format and the table layout may change.
+a failed statement in the REPL, 2 a bad command line); the REPL's commands and its `error: line N:` messages; and the
+library's `quarry::query`, `Catalog` and `sql::bind`. The printed plan format and the table layout may change.
 
 **Limits.** One thread; no subqueries, `WITH`, set operations, window functions, `RIGHT`/`FULL` joins, intervals or
 decimal arithmetic; everything in memory (README, "Limitations").

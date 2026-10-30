@@ -770,9 +770,9 @@ property then found one more bug itself: `-(-0)` printed as `-0`, which binds ba
 - The REPL has no history or line editing beyond the terminal's own (`rlwrap quarry repl ...` adds both), and
   Ctrl-C ends it rather than cancelling a query. Text the tokenizer rejects whatever follows (an invalid escape such
   as `U&'\zz'` or `E'\x80'`) stops a script there, since where that statement ends can't be told; the statements
-  after it don't run (the REPL says so). At a terminal it is an error at once and the session goes on. Text inside an open comment or string is re-tokenized on every line, so thousands of lines
-  of it are slow to read (DESIGN.md, "The REPL"). A path containing `=` needs a `NAME=` in front (`-t
-  part=year=2024/part.csv`).
+  after it don't run (the REPL says so). At a terminal it is an error at once and the session goes on. Text inside
+  an open comment or string is re-tokenized on every line, so thousands of lines of it are slow to read (DESIGN.md,
+  "The REPL"). A path containing `=` needs a `NAME=` in front (`-t part=year=2024/part.csv`).
 
 ## License
 

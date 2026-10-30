@@ -423,7 +423,7 @@ change detection between runs.
 `crates/quarry-cli/src/repl.rs`. It reads standard input a line at a time. A line starting with `.` when no SQL is
 pending is a command (`.tables`, `.schema`, `.load`, `.drop`, `.timer`, `.quit`); everything else collects until a
 `;` ends a statement, which then runs exactly as `quarry query` runs one (`run_sql` in `main.rs` is shared). Errors
-go to stderr and the session goes on. It's the same code for a person at a terminal and for `quarry repl < script.sql`;
+go to stderr and the session goes on (a script stops only at text the tokenizer rejects, below). It's the same code for a person at a terminal and for `quarry repl < script.sql`;
 only the prompts and the line numbers in errors depend on which (`IsTerminal`).
 
 **How does it know where a statement ends?**

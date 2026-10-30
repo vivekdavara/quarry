@@ -504,7 +504,8 @@ table and their count, or `EXPLAIN`'s optimized plan).
   of a string in review.)
 - **The end of the input** ends an open statement: one with no `;` runs, and an open string or comment is the
   parser's error ("Unterminated string literal"), not silently dropped.
-- **Errors** go to standard error and the session goes on. From a script, each names the input line its statement
+- **Errors** go to standard error and the session goes on, except after text the tokenizer rejects (above), which
+  stops a script. From a script, each names the input line its statement
   starts on (`error: line 12: plan error: ...`); at a terminal it doesn't. A line that isn't UTF-8 is kept, with
   U+FFFD for its bad bytes, so the statement it is part of still ends at its `;`, but that statement doesn't run
   ("line 3 isn't valid UTF-8, so its statement doesn't run"); such a command line is skipped. A byte order mark
