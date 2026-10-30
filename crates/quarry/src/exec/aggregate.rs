@@ -339,6 +339,10 @@ impl Accumulator for FloatSum {
         self.counts.resize(num_groups, 0);
         let values = values.expect("SUM has an argument");
         let floats = values.as_primitive::<Float64Type>();
+        if floats.nulls().is_none() {
+            add_in_runs(&mut self.sums, &mut self.counts, groups, floats.values());
+            return Ok(());
+        }
         for (i, &g) in groups.iter().enumerate() {
             if floats.is_valid(i) {
                 self.sums[g] += floats.value(i);
@@ -363,6 +367,30 @@ impl Accumulator for FloatSum {
             .collect();
         Ok(Arc::new(out))
     }
+}
+
+/// Adds `values[i]` to `sums[groups[i]]` and counts it, for values with no NULLs, keeping a run of rows in one group
+/// in a register. Adding a row to the sum in memory waits for the previous row's store to the same group (TPC-H Q1's
+/// four groups come in runs, so most rows did); a run's running sum doesn't. Each group's values are still added one
+/// at a time in row order, so the sums are the same bits as one row at a time.
+fn add_in_runs(sums: &mut [f64], counts: &mut [i64], groups: &[usize], values: &[f64]) {
+    let mut rows = groups.iter().zip(values);
+    let Some((&first, &v)) = rows.next() else {
+        return;
+    };
+    let (mut group, mut sum, mut n) = (first, sums[first] + v, 1);
+    for (&g, &v) in rows {
+        if g == group {
+            sum += v;
+            n += 1;
+        } else {
+            sums[group] = sum;
+            counts[group] += n;
+            (group, sum, n) = (g, sums[g] + v, 1);
+        }
+    }
+    sums[group] = sum;
+    counts[group] += n;
 }
 
 /// MIN or MAX of any type the row format encodes: the values are compared as their row-format bytes, which order as
