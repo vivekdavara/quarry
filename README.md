@@ -324,6 +324,41 @@ the batch must give the same as the whole. The GROUP BY property does the same f
 two of four columns; one to four aggregates, each maybe DISTINCT) against a grouping in plain Rust. Twelve mutations
 of the engine (six in the evaluator, six in aggregation) each fail one of them. CI runs both at 100,000 cases.
 
+## Results (day 5)
+
+**Q1's float sums.** `sample` on TPC-H Q1 (25 runs at scale 1 in one `quarry repl` session, `.timer on`) put 29.9%
+of the samples (1,112 of 3,722) at the top of the stack in `FloatSum::update`: Q1 has four `SUM`s and three `AVG`s of
+`DOUBLE`s over 5.9 million rows, and each row's `sums[g] += v` waited for the previous row's store whenever the
+previous row was in the same group, which is most of the time: in file order, Q1's 5,920,021 rows are 2,132,083 runs
+of one group, 2.8 rows on average (counted by DuckDB with `lag()` over `file_row_number`). For a column with no NULLs,
+`add_in_runs` (`exec/aggregate.rs`) keeps a run's sum in a register and stores it when the group changes. Each
+group's values are still added one at a time in row order, so every sum is the same bits as before
+(`float_sums_add_in_row_order`, and the 25 Q1 answers are identical); `FloatSum::update` fell to 16.4% (609 of 3,714).
+
+```bash
+cargo run --release -p quarry --example tpch_times -- data/tpch-1 7
+```
+
+`tpch_times` at the commit before (`a90eafd`) and the change (`de5c2a2`), alternated twice from 10:49 on 2026-10-30,
+on battery (Low Power Mode off), medians of 7 after a warm-up; a review agent was idle during the first pair and
+running tests during the second, which slowed both binaries:
+
+| Query | Before | After | Before | After |
+|---|---|---|---|---|
+| Q1 | 338.4 ms | **278.7 ms** | 352.7 ms | **288.7 ms** |
+| Q3 | 225.7 ms | 226.7 ms | 253.0 ms | 255.3 ms |
+| Q5 | 378.4 ms | 379.4 ms | 416.0 ms | 396.2 ms |
+| Q6 | 145.9 ms | 168.1 ms | 152.2 ms | 153.3 ms |
+| Q10 | 279.5 ms | 292.6 ms | 327.8 ms | 308.5 ms |
+| Q12 | 268.8 ms | 284.2 ms | 281.7 ms | 284.3 ms |
+| Q14 | 156.3 ms | 163.9 ms | 167.7 ms | 176.9 ms |
+| Q19 | 341.6 ms | 359.4 ms | 364.2 ms | 364.2 ms |
+
+Q1 is 17.6% and 18.1% faster; Q1's one-thread DuckDB time on the same files was 194.9 ms (day 4), so Quarry went
+from 1.7x to 1.4x it. The other queries moved within what two runs of the same binary differ by here (Q6's two
+"after" runs: 168.1 and 153.3 ms). Q6, for one, sums 114,119 rows (the rows its WHERE keeps, counted with `quarry
+query`), 0.3% of the 41 million values Q1's seven sums add.
+
 ## Results (day 4)
 
 **TPC-H at scale 1** (6,004,003 lines; the seven tables 238 MB of zstd Parquet, `lineitem` in 46 row groups),
