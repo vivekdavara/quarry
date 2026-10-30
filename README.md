@@ -481,6 +481,35 @@ What moved, and why:
   status, `count(DISTINCT customer)`) are still 3-22x DuckDB's one-thread times. Not profiled further yet; one
   hypothesis for day 4 is that Quarry decodes every string out of Parquet's dictionary encoding before comparing.
 
+## Review of day 5
+
+Review agents, one at a time, each in its own worktree, briefed on correctness: inputs where the REPL does the wrong
+thing, and tests that would pass a broken one.
+
+**Round 1** (one agent at `4e3fc75`, the splitter and the REPL, 19 minutes). The splitter's central claim held: no
+`;` the tokenizer reads as a statement end was missed or misread, in an exhaustive search over short texts as well
+as the property. Five defects, all fixed (`f430384`, `17a497a`), the failing cases kept in
+`crates/quarry-cli/tests/repl_review.rs`:
+- **An invalid escape in an `E''` string swallowed the rest of the session.** sqlparser reports `E'\x80'` (and
+  `E'\0'`, `E'\uzzzz'`) as "Unterminated encoded string literal", the same words as for `E'abc`, so the splitter
+  took it for an open string: every later line, `.quit` included, joined it and nothing ran until the end of the
+  input. Open and invalid text are now told apart by whether a closing suffix makes the text tokenize, with no
+  message read.
+- **A line that wasn't UTF-8 inside a statement was dropped, and the statement ran without it**: with its WHERE line
+  gone, a `count(*)` counted every row. Such a statement now doesn't run.
+- **After rejected text, the next line started a new statement**, so text inside the rejected statement's open string
+  ran as SQL (`SELECT 42 AS boom`). An invalid statement now lasts until a line ending in `;`.
+- **Wrong line numbers** for a statement that doesn't tokenize and starts after a comment closing on its line.
+- **Quadratic and cubic input costs**: a 20,000-line statement took over 60 s in a debug build and a 1,600-line block
+  comment of `x;` lines 33.5 s; now 0.03 s and 0.76 s ("What it costs" in DESIGN.md has what remains).
+
+Its mutation run of `split.rs` (19 mutants) left only equivalent survivors; of `repl.rs` it left 11 real gaps
+(an indented command, the line-number arithmetic past the first pending line, `.quit` after an error, `.schema`'s
+forms, `.help`, `.exit`), and its tests for them are in `repl_review.rs`. Judgement calls it raised, left as they
+are: a path containing `=` needs a `NAME=` in front (`.load part=year=2024/part.csv`, as with `-t`); `.quit;` and
+`.QUIT` are refused, as sqlite's shell refuses them; `quarry repl < x.sql | head` reports the broken pipe and exits
+1; and a parser message's "Line: 1" counts from the statement's start while the REPL's "line 9" counts the input.
+
 ## Review of day 4
 
 Review agents, one at a time, each in its own worktree with release-only builds (the disk had 8-11 GB free) and
@@ -703,8 +732,10 @@ property then found one more bug itself: `-(-0)` printed as `-0`, which binds ba
 - Integer literals must fit in 64 bits, and expressions nest at most 128 levels (a chain of 128 `OR`s).
 - The REPL has no history or line editing beyond the terminal's own (`rlwrap quarry repl ...` adds both), and
   Ctrl-C ends it rather than cancelling a query. Text the tokenizer rejects whatever follows (an invalid escape such
-  as `U&'\zz'`) runs at once as one statement, taking the rest of its line with it. A `;` inside an open string
-  costs a tokenization of the statement so far, so thousands of them in one string are slow to read.
+  as `U&'\zz'`) fails as one statement ending at the first line that ends in `;`, so a valid statement after it on
+  that line doesn't run. Text inside an open comment or string is re-tokenized on every line, so thousands of lines
+  of it are slow to read (DESIGN.md, "The REPL"). A path containing `=` needs a `NAME=` in front (`-t
+  part=year=2024/part.csv`).
 
 ## License
 

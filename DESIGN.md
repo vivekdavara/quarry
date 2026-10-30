@@ -480,20 +480,30 @@ table and their count, or `EXPLAIN`'s optimized plan).
   unterminated (an error), and one inside a `--` comment makes the last token the comment. So the REPL's split and
   the parser's semicolons can't disagree, whatever sqlparser's GenericDialect accepts (`E'\''`, `U&'...'`,
   `$tag$...$tag$`, nested `/* */`, backquoted names). Each found statement is parsed on its own; empty ones (`;;`,
-  or only comments) are skipped. Splitting costs one tokenization of each candidate stretch, so `n` semicolons
-  inside one open string cost `O(n * length)`; statements that end normally cost `O(length)` in all.
-- **What follows the last `;`** is blank (whitespace and comments: forgotten), incomplete (no `;` yet, or an open
-  string, name or comment: the REPL waits for the next line, prompting `   ...>`), or invalid: text the tokenizer
-  rejects whatever follows it, such as an invalid escape in `U&'\zz'`. An invalid stretch runs at once, so the
-  parser reports it, and takes the rest of its line with it (statements after it on that line don't run; there is
-  no way to know where the bad statement ends). Which tokenizer errors mean "more text could fix this" is decided by
-  their messages (`Unterminated ...`, `... before EOF.`, `Unexpected EOF ...`); a test produces each one, so a
-  sqlparser upgrade that rewords one fails it.
+  or only comments) are skipped.
+- **What it costs.** The REPL adds each line to what is pending and splits again, but tokenizes only the new line's
+  semicolons (`split_statements_after`: a prefix's tokens don't change when text is added after it), and after a
+  statement that tokenizes and has no `;` yet, a line without `;` isn't split at all. A statement of many lines
+  then costs `O(length)`. What stays quadratic is text inside an open comment or string: each of its lines
+  re-tokenizes everything pending (6,400 lines of `x;` inside one `/* */` take 12.1 s in a debug build, 1,600 take
+  0.76 s), and `n` semicolons inside one string on one line cost `O(n * length)`.
+- **What follows the last `;`** is blank (whitespace and comments: forgotten), unended (it tokenizes but has no
+  `;` yet), open (a string, name or comment the next line may close), or invalid: text the tokenizer rejects
+  whatever follows it, such as the invalid escapes in `U&'\zz'` and `E'\x80'`. The REPL waits on unended and open
+  text, prompting `   ...>`. Open and invalid can't be told apart by the tokenizer's messages (sqlparser 0.63 says
+  "Unterminated encoded string literal" for both `E'abc` and `E'\x80'`), so text that doesn't tokenize is open
+  exactly when a closing suffix makes it tokenize: a quote, `''` (after a trailing backslash in `E'...'`), the end
+  of a `q'[...]'` string, `$$`, a `*/` for each `/*` it holds, or a `$tag$` it holds; only one thing can be open at
+  the end, since the tokenizer stops there. There is no knowing where an invalid statement ends, so it runs, and
+  fails with the parser's message, at the end of the first line ending in `;` (its own or a later one), and nothing
+  inside it runs: on `SELECT U&'\zz'; SELECT 2;` the second `SELECT` is part of the failed statement.
 - **The end of the input** ends an open statement: one with no `;` runs, and an open string or comment is the
   parser's error ("Unterminated string literal"), not silently dropped.
 - **Errors** go to standard error and the session goes on. From a script, each names the input line its statement
-  starts on (`error: line 12: plan error: ...`); at a terminal it doesn't. A line that isn't UTF-8 is an error and
-  skipped. The exit status is 0 if every statement and command succeeded and 1 otherwise, so a script's failures are
+  starts on (`error: line 12: plan error: ...`); at a terminal it doesn't. A line that isn't UTF-8 is kept, with
+  U+FFFD for its bad bytes, so the statement it is part of still ends at its `;`, but that statement doesn't run
+  ("line 3 isn't valid UTF-8, so its statement doesn't run"); such a command line is skipped. A byte order mark
+  before the first line is dropped. The exit status is 0 if every statement and command succeeded and 1 otherwise, so a script's failures are
   visible to a shell; a `-t` table that can't be loaded exits 1 before reading anything.
 - **The terminal.** Prompts (`quarry>`, `   ...>`) and a one-line banner appear only when standard input is a
   terminal (`IsTerminal`), so piped output is exactly the results. There is no line editing or history beyond what
@@ -534,7 +544,7 @@ table and their count, or `EXPLAIN`'s optimized plan).
   Day 2's rules above were checked against DuckDB 2.0.0 by hand.
 - **The REPL (day 5):** `tests/split_properties.rs` splits random text full of quotes, comment markers, dollar
   quotes, backslashes, CRLFs and semicolons and requires the statements to end exactly at the tokenizer's semicolon
-  tokens, a text that a closing suffix cures never to be called invalid, and a line-at-a-time feed to find the same
-  statements as the whole text. `repl.rs`'s unit tests run sessions over in-memory input (commands, errors and their
+  tokens, the rest to be open exactly when a closing suffix (its own list, and the text's dollar tags found by pairs
+  of `$`) cures it, and a line-at-a-time feed, as the REPL does it, to find the same statements as the whole text. `repl.rs`'s unit tests run sessions over in-memory input (commands, errors and their
   line numbers, the end of the input, prompts); `tests/cli.rs` pipes scripts into the built binary for its output
   and exit status.
