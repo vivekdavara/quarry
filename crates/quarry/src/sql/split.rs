@@ -154,22 +154,45 @@ fn is_blank(token: &Token) -> bool {
 }
 
 /// Suffixes that end what a text left open: a string (`''` after a trailing backslash in `E'...'`), a quoted name,
-/// a quote-delimited `q'[...]'` string, a `$$` string.
-const CLOSERS: &[&str] = &["'", "\"", "`", "''", "$$", "]'", "}'", ")'", ">'"];
+/// a `$$` string.
+const CLOSERS: &[&str] = &["'", "\"", "`", "''", "$$"];
 
 /// Whether some suffix makes `text`, which doesn't tokenize, tokenize: one of `CLOSERS`, one `*/` to as many as it
-/// has `/*`, or a `$tag$` it contains. Only one thing can be open at the end (the tokenizer stops at it), so one
-/// suffix is enough.
+/// has `/*`, a `$tag$` it contains, or the end of a quote-delimited string it opens. Only one thing can be open at
+/// the end (the tokenizer stops at it), so one suffix is enough.
 fn can_close(text: &str) -> bool {
     let comments = (1..=text.matches("/*").count()).map(|n| "*/".repeat(n));
     let closers = CLOSERS
         .iter()
         .map(|c| c.to_string())
         .chain(comments)
-        .chain(dollar_tags(text));
+        .chain(dollar_tags(text))
+        .chain(quote_delimited_ends(text));
     closers
         .into_iter()
         .any(|c| tokenize(&format!("{text}{c}")).is_ok())
+}
+
+/// The ends of the quote-delimited strings `text` may open (`q'[...]'`, `Q'#...#'`): the delimiter after each `q'`,
+/// its bracket's mirror for `[`, `{`, `(` and `<`, then a quote.
+fn quote_delimited_ends(text: &str) -> Vec<String> {
+    let mut ends = Vec::new();
+    for (i, _) in text.match_indices(['q', 'Q']) {
+        let mut chars = text[i + 1..].chars();
+        if chars.next() == Some('\'')
+            && let Some(delimiter) = chars.next()
+        {
+            let close = match delimiter {
+                '[' => ']',
+                '{' => '}',
+                '(' => ')',
+                '<' => '>',
+                c => c,
+            };
+            ends.push(format!("{close}'"));
+        }
+    }
+    ends
 }
 
 /// The `$tag$` openers of dollar-quoted strings in `text` (a tag is letters, digits and `_`).
@@ -243,6 +266,9 @@ mod tests {
             "SELECT $t$a $u$ b;",
             "SELECT U&'a;",
             "SELECT q'[a;",
+            "SELECT Q'{a;",
+            "SELECT q'#a;",
+            "SELECT q'aba;",
         ] {
             let split = split_statements(text);
             assert!(split.statements.is_empty(), "{text}");

@@ -13,11 +13,11 @@ use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer};
 const PIECES: &[&str] = &[
     ";", ";", ";", "'", "'", "\"", "`", "-", "--", "/", "/*", "*/", "*", "\\", "$", "$$", "$t$",
     "E'", "U&'", "q'[", "]'", "\n", "\r\n", " ", "a", "1", "é", "😀", "SELECT 1", "x", "_", "#",
-    "@", "&", "\\x80", "\\0", "U&'\\zz",
+    "@", "&", "\\x80", "\\0", "U&'\\zz", "q'#",
 ];
 
 /// Suffixes that close what an unterminated text left open.
-const CLOSERS: &[&str] = &["'", "\"", "`", "*/", "$$", "$t$", "]'"];
+const CLOSERS: &[&str] = &["'", "\"", "`", "*/", "$$", "$t$", "]'", "#'"];
 
 fn text() -> impl Strategy<Value = String> {
     proptest::collection::vec(proptest::sample::select(PIECES), 0..24).prop_map(|p| p.concat())
