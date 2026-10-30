@@ -4,12 +4,13 @@ A SQL query engine over Parquet and CSV files, written in Rust on Apache Arrow (
 resolves every name and type against the files' schemas, builds a logical plan, and executes it with vectorized
 operators over Arrow record batches.
 
-**Status: day 4 of 5.** The readers, the catalog, the logical plan, the binder (SQL to a typed plan), the executor
-(filter, projection, aggregate with GROUP BY and DISTINCT, sort and top-k, limit, hash and nested-loop joins, and
-vectorized expressions) and the optimizer (constant folding, `OR` factoring, predicate pushdown through joins and
-into Parquet row groups, projection pushdown) are done and tested; `quarry query` runs a query over files. Day 4 added
-a TPC-H-style data generator, eight TPC-H queries checked against DuckDB's answers, a differential test of random
-queries against DuckDB (in CI), criterion benchmarks and the timings below. Day 5 adds a REPL and the release.
+**Status: v1.0.0.** Built in five days: the readers, the catalog, the logical plan and the binder (SQL to a typed
+plan) on day 1; the executor (filter, projection, aggregate with GROUP BY and DISTINCT, sort, limit, vectorized
+expressions) on day 2; hash and nested-loop joins, the top-k, the optimizer (constant folding, predicate pushdown
+through joins and into Parquet row groups, projection pushdown) on day 3; a TPC-H-style data generator, eight TPC-H
+queries checked against DuckDB's answers, `OR` factoring, a differential test of random queries against DuckDB (in
+CI), criterion benchmarks and timings on day 4; and `quarry repl`, an interactive shell, on day 5. `quarry query`
+runs one query over files; `quarry repl` runs many.
 
 ## Why
 
@@ -623,7 +624,7 @@ property then found one more bug itself: `-(-0)` printed as `-0`, which binds ba
   conditions run through the same evaluator as the query, so pruning can only be too cautious, never differently
   typed or ordered than the filter; random data checks it can't drop a row.
 
-## Limitations (day 4)
+## Limitations
 
 - Eight of TPC-H's 22 queries run; the rest need subqueries, `EXTRACT`, `INTERVAL` or views (and `partsupp`, which
   the generator doesn't write). The data is TPC-H-style, not `dbgen`'s: `DOUBLE` money, dense keys, simpler text, so
@@ -665,6 +666,10 @@ property then found one more bug itself: `-(-0)` printed as `-0`, which binds ba
 - CSV schemas are inferred from the first 1,000 rows by default; a later value of another type fails the scan that
   reaches it (`CsvOptions { infer_rows: None, .. }` reads the whole file to infer).
 - Integer literals must fit in 64 bits, and expressions nest at most 128 levels (a chain of 128 `OR`s).
+- The REPL has no history or line editing beyond the terminal's own (`rlwrap quarry repl ...` adds both), and
+  Ctrl-C ends it rather than cancelling a query. Text the tokenizer rejects whatever follows (an invalid escape such
+  as `U&'\zz'`) runs at once as one statement, taking the rest of its line with it. A `;` inside an open string
+  costs a tokenization of the statement so far, so thousands of them in one string are slow to read.
 
 ## License
 
