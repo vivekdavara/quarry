@@ -5,12 +5,14 @@
 //! decides what a `;` ends. Each statement runs as `quarry query` would run it. An error is printed and the session
 //! goes on; the exit status says whether any statement or command failed.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use quarry::sql::{Rest, first_token_offset, split_statements};
+use quarry::sql::{Rest, first_token_offset, split_statements_after};
 use quarry::{Catalog, QuarryError, Result};
 
 const HELP: &str = "\
@@ -179,9 +181,7 @@ pub fn run(
         interactive,
         count: 0,
     };
-    // The SQL read but not yet run, and the input line it starts on.
-    let mut pending = String::new();
-    let mut pending_line = 1;
+    let mut pending = Pending::default();
     let mut line_no = 0;
     let mut bytes = Vec::new();
     loop {
@@ -202,11 +202,19 @@ pub fn run(
             break;
         }
         line_no += 1;
-        let Ok(line) = std::str::from_utf8(&bytes) else {
-            errors.report(err, line_no, &"the line isn't valid UTF-8; skipped")?;
-            continue;
-        };
+        // A line that isn't UTF-8 is kept (with U+FFFD for its bad bytes), so the statement it's in still ends
+        // where it should, but that statement isn't run.
+        let decoded = String::from_utf8_lossy(&bytes);
+        let utf8 = matches!(decoded, Cow::Borrowed(_));
+        let mut line: &str = &decoded;
+        if line_no == 1 {
+            line = line.strip_prefix('\u{feff}').unwrap_or(line);
+        }
         if pending.is_empty() && line.trim_start().starts_with('.') {
+            if !utf8 {
+                errors.report(err, line_no, &"the line isn't valid UTF-8; skipped")?;
+                continue;
+            }
             match session.command(line.trim()) {
                 Ok((text, next)) => {
                     out.write_all(text.as_bytes())?;
@@ -218,52 +226,149 @@ pub fn run(
             }
             continue;
         }
-        if pending.is_empty() {
-            pending_line = line_no;
-        }
-        pending.push_str(line);
-        let split = split_statements(&pending);
-        for range in split.statements {
-            let line = pending_line + pending[..range.start].matches('\n').count();
-            match session.statement(&pending[range]) {
-                Ok(text) => out.write_all(text.as_bytes())?,
-                Err(e) => errors.report(err, line, &e)?,
+        // The semicolons pending before this line have been tokenized and end nothing.
+        let checked = pending.text.len();
+        pending.push(line, line_no, utf8);
+        if pending.invalid {
+            if ends_with_semicolon(line) {
+                run_rest(session, &pending, out, err, &mut errors)?;
+                pending = Pending::default();
             }
+            continue;
+        }
+        if pending.unended && !line.contains(';') {
+            continue;
+        }
+        let split = split_statements_after(&pending.text, checked);
+        for range in split.statements {
+            run_statement(session, &pending, range, out, err, &mut errors)?;
         }
         match split.rest {
-            Rest::Blank => pending.clear(),
+            Rest::Blank => pending = Pending::default(),
             Rest::Unended | Rest::Open => {
-                pending_line += pending[..split.rest_start].matches('\n').count();
-                pending.drain(..split.rest_start);
+                pending.drain(split.rest_start);
+                pending.unended = split.rest == Rest::Unended;
             }
             Rest::Invalid => {
-                let rest = &pending[split.rest_start..];
-                let line = pending_line
-                    + pending[..split.rest_start].matches('\n').count()
-                    + rest[..first_token_offset(rest).unwrap_or(0)]
-                        .matches('\n')
-                        .count();
-                if let Err(e) = session.statement(rest) {
-                    errors.report(err, line, &e)?;
+                pending.drain(split.rest_start);
+                if ends_with_semicolon(line) {
+                    run_rest(session, &pending, out, err, &mut errors)?;
+                    pending = Pending::default();
+                } else {
+                    pending.invalid = true;
                 }
-                pending.clear();
             }
         }
     }
     // The end of the input ends a statement still open: one with no `;` yet runs, and an open string or comment
-    // is the parser's error. (`pending` only ever holds an incomplete statement here.)
+    // is the parser's error.
     if !pending.is_empty() {
-        let first = first_token_offset(&pending).unwrap_or(0);
-        let line = pending_line + pending[..first].matches('\n').count();
-        match session.statement(&pending) {
-            Ok(text) => out.write_all(text.as_bytes())?,
-            Err(e) => errors.report(err, line, &e)?,
-        }
+        run_rest(session, &pending, out, err, &mut errors)?;
     }
     if interactive {
         writeln!(out)?;
     }
     Ok(errors.count == 0)
+}
+
+/// Where an invalid statement ends: no one can tell from its tokens, so at the end of the first line (its own or a
+/// later one) whose last character is `;`, as a statement typed or written in a script ends.
+fn ends_with_semicolon(line: &str) -> bool {
+    line.trim_end().ends_with(';')
+}
+
+/// The SQL read but not yet run.
+#[derive(Debug, Default)]
+struct Pending {
+    text: String,
+    /// The input line `text` starts on.
+    line: usize,
+    /// Byte ranges of `text` from input lines that weren't UTF-8, with their line numbers.
+    bad: Vec<(Range<usize>, usize)>,
+    /// The last split left a statement that tokenizes and has no `;` yet: a line without one can't end it.
+    unended: bool,
+    /// The last split left text the tokenizer rejects: it runs (and fails) at the end of a line ending in `;`.
+    invalid: bool,
+}
+
+impl Pending {
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    fn push(&mut self, line: &str, line_no: usize, utf8: bool) {
+        if self.text.is_empty() {
+            self.line = line_no;
+        }
+        let start = self.text.len();
+        self.text.push_str(line);
+        if !utf8 {
+            self.bad.push((start..self.text.len(), line_no));
+        }
+    }
+
+    /// The input line that byte `offset` of `text` is on.
+    fn line_of(&self, offset: usize) -> usize {
+        self.line + self.text[..offset].matches('\n').count()
+    }
+
+    /// Drops `text[..upto]`, which has run.
+    fn drain(&mut self, upto: usize) {
+        self.line = self.line_of(upto);
+        self.text.drain(..upto);
+        self.bad.retain(|(r, _)| r.end > upto);
+        for (r, _) in &mut self.bad {
+            *r = r.start.saturating_sub(upto)..r.end - upto;
+        }
+    }
+
+    /// The first line among `range`'s that wasn't UTF-8.
+    fn bad_line(&self, range: &Range<usize>) -> Option<usize> {
+        self.bad
+            .iter()
+            .find(|(r, _)| r.start < range.end && range.start < r.end)
+            .map(|&(_, line)| line)
+    }
+}
+
+/// Runs the statement at `range` of the pending text (its `;` just after it, if it has one).
+fn run_statement(
+    session: &mut Session,
+    pending: &Pending,
+    range: Range<usize>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    errors: &mut Errors,
+) -> io::Result<()> {
+    let line = pending.line_of(range.start);
+    let through = range.start..(range.end + 1).min(pending.text.len());
+    if let Some(bad) = pending.bad_line(&through) {
+        let e = format!("line {bad} isn't valid UTF-8, so its statement doesn't run");
+        return errors.report(err, line, &e);
+    }
+    match session.statement(&pending.text[range]) {
+        Ok(text) => out.write_all(text.as_bytes()),
+        Err(e) => errors.report(err, line, &e),
+    }
+}
+
+/// Runs everything pending as one statement: one the end of the input ended, or an invalid one.
+fn run_rest(
+    session: &mut Session,
+    pending: &Pending,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    errors: &mut Errors,
+) -> io::Result<()> {
+    let first = first_token_offset(&pending.text).unwrap_or(0);
+    run_statement(
+        session,
+        pending,
+        first..pending.text.len(),
+        out,
+        err,
+        errors,
+    )
 }
 
 /// Prints errors, counting them.
@@ -478,6 +583,38 @@ mod tests {
         assert!(out.ends_with("quarry> quarry> \n"), "{out}");
         assert_eq!(err.lines().count(), 1);
         assert!(err.starts_with("error: plan error: "), "{err}");
+    }
+
+    #[test]
+    fn a_statement_with_a_line_that_is_not_utf8_does_not_run() {
+        let mut session = Session::new(8192);
+        session.load(ORDERS).unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let input: &[u8] = b"SELECT count(*) AS n\nFROM orders\nWHERE status = 'caf\xe9'\n;\nSELECT 1 AS a\n\xff;\nSELECT 2 AS b;\n";
+        let ok = run(&mut session, input, &mut out, &mut err, false).unwrap();
+        let (out, err) = (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        );
+        assert!(!ok);
+        // Neither statement touching a bad line runs (not even with the bad bytes replaced), and both end where
+        // their `;` is: the one after them runs.
+        assert!(!out.contains("| n ") && !out.contains("| a "), "{out}");
+        assert!(out.contains("| b |"), "{out}");
+        assert_eq!(
+            err,
+            "error: line 1: line 3 isn't valid UTF-8, so its statement doesn't run\n\
+             error: line 5: line 6 isn't valid UTF-8, so its statement doesn't run\n"
+        );
+    }
+
+    #[test]
+    fn a_byte_order_mark_before_the_first_line_is_ignored() {
+        let (ok, out, err) = session("\u{feff}.tables\n\u{feff}SELECT 1 AS one;\n", false);
+        // Only the first line's: a second one is text the tokenizer doesn't know.
+        assert!(!ok, "{err}");
+        assert!(out.starts_with("customers  "), "{out}");
+        assert!(err.starts_with("error: line 2: "), "{err}");
     }
 
     #[test]
