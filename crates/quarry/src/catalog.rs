@@ -61,6 +61,14 @@ impl Catalog {
             .map(|(_, t)| t.clone())
     }
 
+    /// Removes the table with this name, in any case, returning its name as registered; `None` if there is none.
+    /// Plans already bound keep their own reference to the table.
+    pub fn deregister(&mut self, name: &str) -> Option<String> {
+        self.tables
+            .remove(&name.to_lowercase())
+            .map(|(registered, _)| registered)
+    }
+
     /// The registered names, as registered, in alphabetical order.
     pub fn table_names(&self) -> Vec<String> {
         self.tables.values().map(|(name, _)| name.clone()).collect()

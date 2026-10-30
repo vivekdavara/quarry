@@ -390,6 +390,14 @@ fn catalog_names_ignore_case_and_must_be_unique() {
             .is_err()
     );
     assert_eq!(catalog.table_names(), vec!["LineItem".to_string()]);
+    // Removing a table frees its name, in any case.
+    assert_eq!(catalog.deregister("LINEITEM"), Some("LineItem".to_string()));
+    assert_eq!(catalog.deregister("lineitem"), None);
+    assert!(catalog.table("lineitem").is_none());
+    assert!(catalog.table_names().is_empty());
+    catalog
+        .register("lineitem", Arc::new(MemTable::from_batch(sample())))
+        .unwrap();
 }
 
 #[test]
