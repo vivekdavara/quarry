@@ -2,6 +2,7 @@
 
 mod binder;
 mod expr;
+mod split;
 
 use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
@@ -13,6 +14,7 @@ use crate::plan::LogicalPlan;
 
 pub use binder::Binder;
 pub use expr::MAX_EXPR_DEPTH;
+pub use split::{Rest, Split, first_token_offset, split_statements};
 
 /// A bound statement.
 #[derive(Debug, Clone)]
