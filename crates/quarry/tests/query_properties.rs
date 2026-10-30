@@ -486,3 +486,75 @@ proptest! {
         }
     }
 }
+
+/// Floats whose sums depend on the order they're added in: 1e16 + 1.0 is 1e16, but 1.0 + 1.0 + 1e16 is 1e16 + 2.
+const ORDER_SENSITIVE: &[f64] = &[1e16, -1e16, 1.0, 0.1, 3.3, -2.5e-3, 7e15, f64::NAN, -0.0];
+
+/// Rows of (group, value) in runs: a run of 1-6 rows shares a group, as rows sorted or clustered by a key do (each
+/// run's group is random, so runs of the same group can follow each other).
+fn runs() -> impl Strategy<Value = Vec<(i64, Option<f64>)>> {
+    let run = (
+        0i64..4,
+        proptest::collection::vec(
+            prop_oneof![1 => Just(None), 6 => proptest::sample::select(ORDER_SENSITIVE).prop_map(Some)],
+            1..7,
+        ),
+    );
+    proptest::collection::vec(run, 0..12).prop_map(|runs| {
+        runs.into_iter()
+            .flat_map(|(g, values)| values.into_iter().map(move |v| (g, v)))
+            .collect()
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(
+        std::env::var("PROPTEST_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(1000)
+    ))]
+
+    /// SUM and AVG of floats add each group's values in row order, so a result is the same bits at every batch size
+    /// (DESIGN.md, "Execution"). The values are order-sensitive here, unlike in `group_by_agrees_with_the_reference`.
+    #[test]
+    fn float_sums_add_in_row_order(rows in runs(), nulls in any::<bool>(), batch_size in 1usize..10) {
+        // Without `nulls`, NULLs become 0.25 and the column has no null buffer at all (the engine's other path).
+        let rows: Vec<(i64, Option<f64>)> =
+            rows.into_iter().map(|(g, v)| (g, if nulls { v } else { Some(v.unwrap_or(0.25)) })).collect();
+        let values: Float64Array = rows.iter().map(|r| r.1).collect();
+        prop_assert_eq!(values.nulls().is_some(), nulls && rows.iter().any(|r| r.1.is_none()));
+        let schema = Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("f", DataType::Float64, true),
+        ]);
+        let table = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(rows.iter().map(|r| r.0).collect::<Int64Array>()), Arc::new(values)],
+        )
+        .unwrap();
+        let mut catalog = Catalog::new();
+        catalog.register("t", Arc::new(MemTable::from_batch(table))).unwrap();
+        let plan = sql::plan(&catalog, "SELECT k, sum(f), avg(f), count(f) FROM t GROUP BY k ORDER BY k").unwrap();
+        let result = collect_with_batch_size(&quarry::optimizer::optimize(&plan).unwrap(), batch_size).unwrap();
+        let mut got = Vec::new();
+        for b in &result.batches {
+            let (k, s, a, c) = (b.column(0).as_primitive::<Int64Type>(), b.column(1).as_primitive::<Float64Type>(),
+                b.column(2).as_primitive::<Float64Type>(), b.column(3).as_primitive::<Int64Type>());
+            for i in 0..b.num_rows() {
+                let bits = |x: &arrow::array::Float64Array| x.is_valid(i).then(|| x.value(i).to_bits());
+                got.push((k.value(i), bits(s), bits(a), c.value(i)));
+            }
+        }
+        // The reference: each group's values folded left to right, starting from 0.0.
+        let mut want = Vec::new();
+        for g in 0..4 {
+            let members: Vec<f64> = rows.iter().filter(|r| r.0 == g).filter_map(|r| r.1).collect();
+            if !rows.iter().any(|r| r.0 == g) {
+                continue;
+            }
+            let sum = members.iter().fold(0.0, |s, v| s + v);
+            let n = members.len();
+            let (s, a) = if n == 0 { (None, None) } else { (Some(sum.to_bits()), Some((sum / n as f64).to_bits())) };
+            want.push((g, s, a, n as i64));
+        }
+        prop_assert_eq!(got, want, "rows {:?} at batch size {}", rows, batch_size);
+    }
+}
