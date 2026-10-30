@@ -22,7 +22,7 @@ pushdown); row-group pruning by the footer's statistics. Errors, never panics, o
 own tokenizer sees a `;`; a script stops at text the tokenizer rejects). `tpch-gen` writes TPC-H-style tables
 at any scale factor; eight TPC-H queries come with DuckDB's answers.
 
-**Testing.** 219 tests, among them property tests of the binder, the evaluator, GROUP BY, ORDER BY, joins, pruning,
+**Testing.** 222 tests, among them property tests of the binder, the evaluator, GROUP BY, ORDER BY, joins, pruning,
 whole optimized queries and the REPL's statement splitter, each against an independent reference; the TPC-H answers
 against DuckDB's; and a differential test of random queries against DuckDB 2.0.0 in CI. Each day's review findings
 are kept as tests (README, "Review of day 1" to "Review of day 5").
