@@ -448,3 +448,73 @@ fn parquet_schema_head_and_plan() {
         "Projection: people.name\n  Filter: CAST(people.id AS Int64) % 2 = 1\n    Scan: people\n"
     );
 }
+
+fn quarry_with_input(args: &[&str], input: &str) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_quarry"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the binary runs");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn repl_runs_a_script_from_standard_input() {
+    let dir = TempDir::new().unwrap();
+    let path = sample(dir.path());
+    let script = "-- a script\nSELECT customer, count(*) AS n\n  FROM orders\n GROUP BY customer\n ORDER BY customer;\n\
+                  .tables\nEXPLAIN SELECT id FROM orders WHERE total > 5;\n";
+    let out = quarry_with_input(&["repl", "-t", &path], script);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "");
+    assert_eq!(
+        stdout(&out),
+        format!(
+            "+----------+---+\n| customer | n |\n+----------+---+\n| ada      | 2 |\n| bo       | 1 |\n\
+             +----------+---+\n2 rows\n\
+             orders  {path}\n\
+             Projection: orders.id\n  Filter: orders.total > 5.0\n    Scan: orders projection=[id, total]\n"
+        )
+    );
+    // No prompts and no banner when standard input isn't a terminal.
+    assert!(!stdout(&out).contains("quarry>"));
+}
+
+#[test]
+fn repl_exit_status_says_whether_anything_failed() {
+    let dir = TempDir::new().unwrap();
+    let path = sample(dir.path());
+    let out = quarry_with_input(
+        &["repl", "-t", &path],
+        "SELECT nope FROM orders;\nSELECT count(*) AS n FROM orders;\n",
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stdout(&out).contains("| 3 |"), "{}", stdout(&out));
+    assert!(
+        stderr(&out).starts_with("error: line 1: plan error: column nope not found"),
+        "{}",
+        stderr(&out)
+    );
+    // A table that can't be loaded stops it before any input is read.
+    let out = quarry_with_input(&["repl", "-t", "missing.csv"], "SELECT 1;\n");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
+    assert!(stderr(&out).starts_with("error: "), "{}", stderr(&out));
+    // --batch-size applies to the session's queries: an error under a LIMIT that depends on it (DESIGN.md,
+    // "Execution"): row 3 divides by zero, and a batch of 2 rows stops before it.
+    let sql = "SELECT 10 % (id - 3) AS r FROM orders WHERE 10 % (id - 3) >= 0 LIMIT 1;\n";
+    let small = quarry_with_input(&["repl", "--batch-size", "2", "-t", &path], sql);
+    let large = quarry_with_input(&["repl", "-t", &path], sql);
+    assert_eq!(small.status.code(), Some(0), "{}", stderr(&small));
+    assert_eq!(large.status.code(), Some(1), "{}", stdout(&large));
+}

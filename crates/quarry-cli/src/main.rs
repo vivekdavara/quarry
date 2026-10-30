@@ -1,8 +1,11 @@
 //! `quarry`: the command-line front end.
 //!
 //! Exit status: 0 on success, 1 when the engine reports an error (printed to stderr as `error: ...`), 2 for a
-//! malformed command line.
+//! malformed command line. `quarry repl` exits 1 if any statement or command in the session failed.
 
+mod repl;
+
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -62,10 +65,24 @@ enum Command {
         /// The query (after `--` if it starts with `-`, as a SQL comment does).
         sql: String,
     },
+    /// Read SQL statements (ending in `;`) and commands (`.help` lists them) from the terminal, or from a script on
+    /// standard input, and run each against the given tables.
+    Repl {
+        /// A table: `name=path`, or just `path` to name it after the file (`.load` adds more).
+        #[arg(short, long = "table", value_name = "NAME=PATH")]
+        tables: Vec<String>,
+        /// The most rows a batch holds, from the scans up.
+        #[arg(long, value_name = "ROWS", default_value_t = DEFAULT_BATCH_SIZE as u32,
+              value_parser = clap::value_parser!(u32).range(1..))]
+        batch_size: u32,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Command::Repl { tables, batch_size } = cli.command {
+        return repl_main(&tables, batch_size as usize);
+    }
     match run(cli.command) {
         Ok(output) => {
             print!("{output}");
@@ -97,20 +114,79 @@ fn run(command: Command) -> Result<String> {
             (BoundStatement::Explain(_), Some(_)) => Err(QuarryError::Plan(
                 "--output takes a query's rows; EXPLAIN prints a plan".to_string(),
             )),
-            (BoundStatement::Explain(plan), None) => Ok(exec::explain(&optimize(&plan)?)),
-            (BoundStatement::Query(plan), output) => {
+            (BoundStatement::Query(plan), Some(path)) => {
                 let result = exec::collect_with_batch_size(&optimize(&plan)?, batch_size as usize)?;
-                let rows = result.num_rows();
-                let noun = if rows == 1 { "row" } else { "rows" };
-                match output {
-                    Some(path) => {
-                        write_parquet(&path, &result)?;
-                        Ok(format!("{rows} {noun} written to {}\n", path.display()))
-                    }
-                    None => Ok(format!("{}\n{rows} {noun}\n", result.to_table()?)),
-                }
+                write_parquet(&path, &result)?;
+                Ok(format!(
+                    "{} written to {}\n",
+                    rows(result.num_rows()),
+                    path.display()
+                ))
             }
+            (statement, None) => run_bound(statement, batch_size as usize),
         },
+        Command::Repl { .. } => unreachable!("main runs the REPL"),
+    }
+}
+
+/// `quarry repl`: the session's tables from `--table`, then lines from standard input.
+fn repl_main(tables: &[String], batch_size: usize) -> ExitCode {
+    let mut session = repl::Session::new(batch_size);
+    for spec in tables {
+        if let Err(e) = session.load(spec) {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    }
+    let interactive = std::io::stdin().is_terminal();
+    if interactive {
+        println!(
+            "quarry {}: SQL over Parquet and CSV. End each statement with ';'; .help lists the commands.",
+            quarry::VERSION
+        );
+    }
+    let (stdin, mut stdout, mut stderr) = (std::io::stdin(), std::io::stdout(), std::io::stderr());
+    match repl::run(
+        &mut session,
+        stdin.lock(),
+        &mut stdout,
+        &mut stderr,
+        interactive,
+    ) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::from(1),
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Runs one SQL statement against the catalog as `quarry query` does: a query's rows as a table and their count,
+/// or `EXPLAIN`'s optimized plan.
+fn run_sql(catalog: &Catalog, sql: &str, batch_size: usize) -> Result<String> {
+    run_bound(sql::bind(catalog, sql)?, batch_size)
+}
+
+fn run_bound(statement: BoundStatement, batch_size: usize) -> Result<String> {
+    match statement {
+        BoundStatement::Explain(plan) => Ok(exec::explain(&optimize(&plan)?)),
+        BoundStatement::Query(plan) => {
+            let result = exec::collect_with_batch_size(&optimize(&plan)?, batch_size)?;
+            Ok(format!(
+                "{}\n{}\n",
+                result.to_table()?,
+                rows(result.num_rows())
+            ))
+        }
+    }
+}
+
+fn rows(n: usize) -> String {
+    if n == 1 {
+        "1 row".to_string()
+    } else {
+        format!("{n} rows")
     }
 }
 
@@ -167,7 +243,11 @@ fn open(file: &Path) -> Result<Arc<dyn TableProvider>> {
 }
 
 fn schema(file: &Path) -> Result<String> {
-    let table = open(file)?;
+    Ok(describe(open(file)?.as_ref()))
+}
+
+/// A table's columns and types, one a line, and for Parquet its rows and row groups.
+fn describe(table: &dyn TableProvider) -> String {
     let mut out = String::new();
     for field in table.schema().fields() {
         let null = if field.is_nullable() { "" } else { " not null" };
@@ -185,7 +265,7 @@ fn schema(file: &Path) -> Result<String> {
             groups.join(", ")
         ));
     }
-    Ok(out)
+    out
 }
 
 fn head(file: &Path, rows: usize) -> Result<String> {
