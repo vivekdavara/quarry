@@ -530,6 +530,8 @@ mod tests {
             (".schema nope", "no table named nope"),
             (".tables x", "usage: .tables"),
             (".load orders=/no/such/file.csv", "/no/such/file.csv"),
+            // The REPL's own words, not the command line's `--table`.
+            (".load =x.csv", "table error: =x.csv: expected NAME=PATH"),
         ] {
             let (ok, _, err) = session(&format!("{line}\nSELECT 1 AS one;\n"), false);
             assert!(!ok, "{line}");

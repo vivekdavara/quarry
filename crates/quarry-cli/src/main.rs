@@ -204,9 +204,7 @@ fn catalog(tables: &[String]) -> Result<Catalog> {
 fn parse_table(spec: &str) -> Result<(String, PathBuf)> {
     if let Some((name, path)) = spec.split_once('=') {
         if name.is_empty() || path.is_empty() {
-            return Err(QuarryError::Table(format!(
-                "--table {spec}: expected NAME=PATH"
-            )));
+            return Err(QuarryError::Table(format!("{spec}: expected NAME=PATH")));
         }
         return Ok((name.to_string(), PathBuf::from(path)));
     }
@@ -218,7 +216,7 @@ fn parse_table(spec: &str) -> Result<(String, PathBuf)> {
     match stem {
         Some(stem) => Ok((stem.to_string(), path.clone())),
         None => Err(QuarryError::Table(format!(
-            "--table {spec}: can't name a table after this path"
+            "{spec}: can't name a table after this path"
         ))),
     }
 }
