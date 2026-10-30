@@ -45,7 +45,16 @@ INSTRUCTIONS = ["DELIVER IN PERSON", "COLLECT COD", "NONE", "TAKE BACK RETURN"]
 SEGMENTS = ["AUTOMOBILE", "BUILDING", "FURNITURE", "HOUSEHOLD", "MACHINERY"]
 PRIORITIES = ["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"]
 WORDS = ["special", "requests", "final", "pinto", "ironic", "foxes", "blithely"]
-NATION_NAMES = ["ALGERIA", "BRAZIL", "CHINA", "FRANCE", "GERMANY", "JAPAN", "PERU", "UNITED STATES"]
+NATION_NAMES = [
+    "ALGERIA",
+    "BRAZIL",
+    "CHINA",
+    "FRANCE",
+    "GERMANY",
+    "JAPAN",
+    "PERU",
+    "UNITED STATES",
+]
 
 # Each column: (table, kind, constants for comparisons). Kinds: key and int (BIGINT), float (DOUBLE), cat (VARCHAR
 # with few values), text (VARCHAR, free), date (DATE).
@@ -82,15 +91,37 @@ INTS = {
 # Each key column's largest value; the scaled ones are read from the data (`Engines.__init__`), so constants cover
 # the keys at any scale.
 KEYS = {
-    "l_orderkey": "orders", "o_orderkey": "orders", "l_partkey": "part", "p_partkey": "part",
-    "l_suppkey": "supplier", "s_suppkey": "supplier", "o_custkey": "customer", "c_custkey": "customer",
-    "c_nationkey": 24, "s_nationkey": 24, "n_nationkey": 24, "r_regionkey": 4,
+    "l_orderkey": "orders",
+    "o_orderkey": "orders",
+    "l_partkey": "part",
+    "p_partkey": "part",
+    "l_suppkey": "supplier",
+    "s_suppkey": "supplier",
+    "o_custkey": "customer",
+    "c_custkey": "customer",
+    "c_nationkey": 24,
+    "s_nationkey": 24,
+    "n_nationkey": 24,
+    "r_regionkey": 4,
 }
-TEXTS = ["l_comment", "o_comment", "c_comment", "p_name", "p_type", "c_address", "o_clerk"]
+TEXTS = [
+    "l_comment",
+    "o_comment",
+    "c_comment",
+    "p_name",
+    "p_type",
+    "c_address",
+    "o_clerk",
+]
 DATES = ["l_shipdate", "l_commitdate", "l_receiptdate", "o_orderdate"]
 
 TABLE_COLUMNS = {
-    "lineitem": "l_", "orders": "o_", "customer": "c_", "part": "p_", "supplier": "s_", "nation": "n_",
+    "lineitem": "l_",
+    "orders": "o_",
+    "customer": "c_",
+    "part": "p_",
+    "supplier": "s_",
+    "nation": "n_",
     "region": "r_",
 }
 
@@ -144,7 +175,9 @@ class Generator:
         self.r = random.Random(seed)
 
     def date(self) -> str:
-        day = datetime.date(1992, 1, 1) + datetime.timedelta(days=self.r.randrange(0, 2557))
+        day = datetime.date(1992, 1, 1) + datetime.timedelta(
+            days=self.r.randrange(0, 2557)
+        )
         return f"DATE '{day.isoformat()}'"
 
     def constant(self, column: str) -> str:
@@ -172,8 +205,16 @@ class Generator:
         if k == "text":
             word = r.choice(WORDS)
             blank = word[0] + "_" + word[2:]
-            pattern = r.choice([f"%{word}%", f"{word}%", f"%{word}", f"%{word}%{r.choice(WORDS)}%", f"%{blank}%",
-                                f"{blank[:3]}%"])
+            pattern = r.choice(
+                [
+                    f"%{word}%",
+                    f"{word}%",
+                    f"%{word}",
+                    f"%{word}%{r.choice(WORDS)}%",
+                    f"%{blank}%",
+                    f"{blank[:3]}%",
+                ]
+            )
             if r.random() < 0.2:
                 return f"{c} {r.choice(['', 'NOT '])}ILIKE '{pattern.upper()}'"
             return f"{c} {r.choice(['', 'NOT '])}LIKE '{pattern}'"
@@ -181,12 +222,14 @@ class Generator:
             values = CATEGORIES[c]
             choice = r.random()
             if choice < 0.3:
-                picked = [repr(v) for v in r.sample(values, min(len(values), r.randint(1, 3)))]
+                picked = [
+                    repr(v) for v in r.sample(values, min(len(values), r.randint(1, 3)))
+                ]
                 if r.random() < 0.2:
                     picked.insert(r.randrange(len(picked) + 1), "NULL")
                 return f"{c} {r.choice(['', 'NOT '])}IN ({', '.join(picked)})"
             if choice < 0.45:
-                prefix = r.choice(values)[:r.randint(1, 3)]
+                prefix = r.choice(values)[: r.randint(1, 3)]
                 if r.random() < 0.3:
                     return f"{c} ILIKE '{prefix.lower()}%'"
                 return f"{c} LIKE '{prefix}%'"
@@ -290,10 +333,23 @@ class Generator:
         ints = [x for x in columns if kind(x) in ("int", "key")]
         if k == "float" and r.random() < 0.6:
             other = r.choice(floats)
-            return r.choice([f"{c} * (1 - {other})", f"{c} + {other}", f"{c} - {other} * 2.5", f"-{c}"])
+            return r.choice(
+                [
+                    f"{c} * (1 - {other})",
+                    f"{c} + {other}",
+                    f"{c} - {other} * 2.5",
+                    f"-{c}",
+                ]
+            )
         if k in ("int", "key") and r.random() < 0.5:
-            return r.choice([f"{c} + {r.randint(1, 9)}", f"{c} * {r.choice(ints)}", f"{c} % {r.randint(2, 9)}",
-                             f"{c} / {r.randint(1, 9)}"])
+            return r.choice(
+                [
+                    f"{c} + {r.randint(1, 9)}",
+                    f"{c} * {r.choice(ints)}",
+                    f"{c} % {r.randint(2, 9)}",
+                    f"{c} / {r.randint(1, 9)}",
+                ]
+            )
         if k == "date" and r.random() < 0.5:
             others = [d for d in DATES if d in columns and d != c]
             if others:
@@ -366,13 +422,17 @@ class Generator:
                 sql += f" GROUP BY {', '.join(keys)}"
                 if r.random() < 0.3:
                     sql += f" HAVING {self.having(columns)}"
-                sql += " ORDER BY " + ", ".join(f"{i + 1} {r.choice(['ASC', 'DESC'])}" for i in range(len(keys)))
+                sql += " ORDER BY " + ", ".join(
+                    f"{i + 1} {r.choice(['ASC', 'DESC'])}" for i in range(len(keys))
+                )
                 if groupable is many or r.random() < 0.1:
                     sql += f" LIMIT {r.randint(0, 60)}"
             return sql
         items = [self.expression(columns, nullable) for _ in range(r.randint(1, 4))]
         select = ", ".join(f"{e} AS c{i}" for i, e in enumerate(items))
-        order = ", ".join(f"{i + 1} {r.choice(['ASC', 'DESC'])}" for i in range(len(items)))
+        order = ", ".join(
+            f"{i + 1} {r.choice(['ASC', 'DESC'])}" for i in range(len(items))
+        )
         distinct = "DISTINCT " if r.random() < 0.1 else ""
         sql = f"SELECT {distinct}{select} FROM {from_}{where_sql} ORDER BY {order} LIMIT {r.randint(0, 60)}"
         if r.random() < 0.3:
@@ -422,25 +482,45 @@ class Engines:
         self.duck.execute("SET threads = 1")
         for t in TABLES:
             path = str(data / f"{t}.parquet").replace("'", "''")
-            self.duck.execute(f"CREATE VIEW {t} AS SELECT * FROM read_parquet('{path}')")
+            self.duck.execute(
+                f"CREATE VIEW {t} AS SELECT * FROM read_parquet('{path}')"
+            )
         for column, table in list(KEYS.items()):
             if isinstance(table, str):
-                (KEYS[column],) = self.duck.execute(f"SELECT count(*) FROM {table}").fetchone()
+                (KEYS[column],) = self.duck.execute(
+                    f"SELECT count(*) FROM {table}"
+                ).fetchone()
 
     def run_quarry(self, sql: str, batch_size: int, timeout: float):
         """(result, error, timed out)."""
         try:
             done = subprocess.run(
-                [self.quarry, "query", *self.table_args, "--batch-size", str(batch_size), "--output", str(self.out),
-                 "--", sql],
-                capture_output=True, text=True, timeout=timeout, check=False,
+                [
+                    self.quarry,
+                    "query",
+                    *self.table_args,
+                    "--batch-size",
+                    str(batch_size),
+                    "--output",
+                    str(self.out),
+                    "--",
+                    sql,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
             )
         except subprocess.TimeoutExpired:
             return None, f"timed out after {timeout} s", True
         if done.returncode != 0:
             return None, done.stderr.strip(), False
         path = str(self.out).replace("'", "''")
-        return result(duckdb.execute(f"SELECT * FROM read_parquet('{path}')")), None, False
+        return (
+            result(duckdb.execute(f"SELECT * FROM read_parquet('{path}')")),
+            None,
+            False,
+        )
 
     def run_duckdb(self, sql: str):
         try:
@@ -456,9 +536,14 @@ def main() -> int:
     parser.add_argument("--random", type=int, default=300)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--failures", type=pathlib.Path)
-    parser.add_argument("--timeout", type=float, default=120.0, help="seconds a Quarry run may take")
-    parser.add_argument("--slow-ok", action="store_true",
-                        help="pass a run whose only problem is queries that timed out at a small batch size")
+    parser.add_argument(
+        "--timeout", type=float, default=120.0, help="seconds a Quarry run may take"
+    )
+    parser.add_argument(
+        "--slow-ok",
+        action="store_true",
+        help="pass a run whose only problem is queries that timed out at a small batch size",
+    )
     args = parser.parse_args()
     if not args.timeout > 0:
         parser.error("--timeout must be above 0")
@@ -473,13 +558,21 @@ def main() -> int:
         gen = Generator(args.seed)  # after Engines, which reads the key ranges
         queries += [(f"random {i + 1}", gen.query()) for i in range(args.random)]
         sizes = random.Random(args.seed + 1_000_003)
-        batch_sizes = sizes.choices([1, 3, 7, 64, 1000, DEFAULT_BATCH], weights=[5, 10, 15, 15, 15, 40], k=len(queries))
+        batch_sizes = sizes.choices(
+            [1, 3, 7, 64, 1000, DEFAULT_BATCH],
+            weights=[5, 10, 15, 15, 15, 40],
+            k=len(queries),
+        )
         agree = both_failed = rows = retried = 0
         failures = []
         for (name, sql), batch_size in zip(queries, batch_sizes):
-            got, quarry_error, timed_out = engines.run_quarry(sql, batch_size, args.timeout)
+            got, quarry_error, timed_out = engines.run_quarry(
+                sql, batch_size, args.timeout
+            )
             if timed_out and batch_size != DEFAULT_BATCH:
-                print(f"slow: {name} passed {args.timeout} s at batch size {batch_size}; running it at {DEFAULT_BATCH}")
+                print(
+                    f"slow: {name} passed {args.timeout} s at batch size {batch_size}; running it at {DEFAULT_BATCH}"
+                )
                 retried += 1
                 batch_size = DEFAULT_BATCH
                 got, quarry_error, _ = engines.run_quarry(sql, batch_size, args.timeout)
@@ -488,7 +581,11 @@ def main() -> int:
                 both_failed += 1
                 continue
             if quarry_error or duckdb_error:
-                problem = f"Quarry: {quarry_error}" if quarry_error else f"DuckDB: {duckdb_error}"
+                problem = (
+                    f"Quarry: {quarry_error}"
+                    if quarry_error
+                    else f"DuckDB: {duckdb_error}"
+                )
             else:
                 problem = differs(got, want)
             if problem:
@@ -498,15 +595,21 @@ def main() -> int:
             else:
                 agree += 1
                 rows += len(got[1])
-        print(f"{len(queries)} queries (seed {args.seed}): {agree} agree ({rows} rows), {both_failed} failed in "
-              f"both, {len(failures)} differ, {retried} re-run at {DEFAULT_BATCH} rows after a timeout")
+        print(
+            f"{len(queries)} queries (seed {args.seed}): {agree} agree ({rows} rows), {both_failed} failed in "
+            f"both, {len(failures)} differ, {retried} re-run at {DEFAULT_BATCH} rows after a timeout"
+        )
         if failures and args.failures:
             args.failures.mkdir(parents=True, exist_ok=True)
             for name, sql, problem in failures:
-                (args.failures / f"{name.replace(' ', '_')}.sql").write_text(f"-- {problem}\n{sql}\n")
+                (args.failures / f"{name.replace(' ', '_')}.sql").write_text(
+                    f"-- {problem}\n{sql}\n"
+                )
         if retried and not args.slow_ok:
-            print(f"{retried} queries timed out at a small batch size (a hang there looks the same); "
-                  "--slow-ok accepts that")
+            print(
+                f"{retried} queries timed out at a small batch size (a hang there looks the same); "
+                "--slow-ok accepts that"
+            )
             return 1
         return 1 if failures else 0
 

@@ -45,6 +45,12 @@ jobs:
         if: runner.os == 'Linux'
         with:
           python-version: "3.11"
+      - name: Lint and format check of the Python scripts (ruff 0.16.10)
+        if: runner.os == 'Linux'
+        run: |
+          pip install ruff==0.16.10
+          ruff check scripts
+          ruff format --check scripts
       - name: Differential test against DuckDB 2.0.0 (the TPC-H queries and 1,000 random ones, at scale 0.01)
         if: runner.os == 'Linux'
         run: |

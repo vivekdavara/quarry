@@ -32,7 +32,11 @@ def main() -> None:
         con.execute(f"CREATE VIEW {table} AS SELECT * FROM read_parquet('{path}')")
     print(f"DuckDB {duckdb.__version__}, median of {runs} runs after one warm-up run")
     print()
-    print("| Query | Result rows | " + " | ".join(f"{t} thread{'s' if t > 1 else ''}" for t in threads) + " |")
+    print(
+        "| Query | Result rows | "
+        + " | ".join(f"{t} thread{'s' if t > 1 else ''}" for t in threads)
+        + " |"
+    )
     print("|---|---|" + "---|" * len(threads))
     for query in QUERIES:
         sql = query.read_text()

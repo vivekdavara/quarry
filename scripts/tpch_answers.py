@@ -15,7 +15,12 @@ import sys
 import duckdb
 
 TABLES = ["region", "nation", "supplier", "customer", "part", "orders", "lineitem"]
-QUERIES = pathlib.Path(__file__).resolve().parent.parent / "crates" / "quarry-tpch" / "queries"
+QUERIES = (
+    pathlib.Path(__file__).resolve().parent.parent
+    / "crates"
+    / "quarry-tpch"
+    / "queries"
+)
 
 
 def connect(data: pathlib.Path) -> duckdb.DuckDBPyConnection:
@@ -29,7 +34,9 @@ def connect(data: pathlib.Path) -> duckdb.DuckDBPyConnection:
 
 def text(value) -> str:
     if value is None:
-        raise ValueError("a NULL in an answer; the CSV format here has no way to write one")
+        raise ValueError(
+            "a NULL in an answer; the CSV format here has no way to write one"
+        )
     if isinstance(value, float):
         return repr(value)
     return str(value)
