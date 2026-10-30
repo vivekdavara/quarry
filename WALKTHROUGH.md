@@ -2,7 +2,8 @@
 
 Questions an interviewer is likely to ask about Quarry, with short answers grounded in the code. Day 1 covers the
 readers, the logical plan and the binder; day 2 execution; day 3 joins, the optimizer, row-group pruning and the top-k;
-later days add sections.
+day 4 TPC-H, the differential test against DuckDB and the benchmarks; day 5 the REPL. Each day's "What went wrong"
+section is near the end.
 
 ## The big picture
 
@@ -416,6 +417,64 @@ cache after the first run), and planning alone (parse, bind, optimize: 42-176 µ
 scale 1 with a warm-up run and a median, printed as the README's table; criterion adds confidence intervals and
 change detection between runs.
 
+## The REPL (day 5)
+
+**What does `quarry repl` do?**
+`crates/quarry-cli/src/repl.rs`. It reads standard input a line at a time. A line starting with `.` when no SQL is
+pending is a command (`.tables`, `.schema`, `.load`, `.drop`, `.timer`, `.quit`); everything else collects until a
+`;` ends a statement, which then runs exactly as `quarry query` runs one (`run_sql` in `main.rs` is shared). Errors
+go to stderr and the session goes on. It's the same code for a person at a terminal and for `quarry repl < script.sql`;
+only the prompts and the line numbers in errors depend on which (`IsTerminal`).
+
+**How does it know where a statement ends?**
+That's the one interesting problem: a `;` ends a statement only outside strings, quoted names and comments, and
+those can span lines. sqlite's shell has its own little lexer for it (`sqlite3_complete`). I didn't want a second
+lexer that could disagree with the parser's, so `sql::split_statements` (`crates/quarry/src/sql/split.rs`) asks the
+parser's tokenizer: the `;` at byte `q` ends the statement starting at `s` exactly when `text[s..=q]` tokenizes and
+its last token is that semicolon. The tokenizer reads left to right and a `;` is a token of its own, so the tokens
+before it don't depend on what comes after; a `;` inside a string or block comment leaves the prefix unterminated,
+and one inside a `--` comment ends in a comment token. So every quirk of sqlparser's GenericDialect (`E'\''`
+escapes, `U&'...'`, `$tag$...$tag$` dollar quotes, nested `/* */`, backquoted names) is handled the way the parser
+handles it, for free.
+
+**Isn't tokenizing every prefix slow?**
+Each candidate `;` costs one tokenization of the text since the last statement's end, so ordinary input is linear:
+each statement is tokenized about once. The bad case is many `;` inside one open string: `n` of them cost `O(n *
+length)`. For a REPL fed by a person or a script that's fine; DESIGN.md says so.
+
+**What if the text after the last `;` doesn't tokenize?**
+Two cases. An unterminated string, name or comment could be finished by the next line, so the REPL waits (`...>`).
+But some text is wrong whatever follows (an invalid escape such as `U&'\zz'`); waiting would hang the session, so it
+runs at once and the parser reports it. Telling them apart uses the tokenizer's error messages (`Unterminated ...`,
+`... before EOF.`, `Unexpected EOF ...`), which is brittle across sqlparser versions, so
+`each_unterminated_error_is_recognized` produces every one of them and fails if a message changes. At the end of the
+input, an open statement runs anyway: one without a `;` succeeds, an open string is the parser's error, so nothing a
+script contains is silently dropped.
+
+**How did you test the splitter?**
+Differentially, against the tokenizer itself (`tests/split_properties.rs`): random text built from quotes, comment
+markers, dollar quotes, backslashes, CRLFs, emoji and semicolons. Where the whole text tokenizes, the split must end
+statements exactly at its semicolon tokens; where it doesn't, a rest that some closing suffix (a quote, `*/`, `$$`
+repeated) makes tokenize must be "incomplete", never "invalid"; and feeding the text a line at a time, as the REPL
+does, must find the same statements as splitting it whole. Five mutants of the splitter, each fails it; one (treating
+every unterminated error as invalid) passed until I added the closing-suffix check.
+
+**Why are commands recognized only when nothing is pending?**
+Because a line starting with `.` can be SQL: `SELECT o` then `.customer FROM orders o;` is a qualified name split
+over two lines, and a `.quit` inside an open `/* ... */` is part of the comment. With the rule "a command only when no
+statement is open", neither is misread (`a_dot_inside_a_statement_is_sql`).
+
+**Why line numbers only for scripts, and why exit 1?**
+At a terminal you can see which statement failed; in a 200-line script you can't, so each error says the line its
+statement starts on (`error: line 9: ...`). The exit status is 1 if anything failed, so `quarry repl < etl.sql &&
+next-step` behaves like a shell would expect. It goes on after an error rather than stopping, as sqlite's and
+DuckDB's shells do by default.
+
+**Why no history or arrow keys?**
+That needs a line-editing library (rustyline, linenoise) and a terminal to test it in. The terminal's own line
+discipline already gives backspace; `rlwrap quarry repl` adds history and editing without any code here. Ctrl-C
+ends the process rather than cancelling a query, since queries don't check for cancellation.
+
 ## What went wrong on day 4
 
 - **My first `OR` factoring rule was unsafe, and I had argued it was safe.** I checked that the factored conjuncts
@@ -540,8 +599,12 @@ Subqueries, `WITH`, set operations, window functions, `RIGHT`/`FULL` joins, inte
 than `CAST`. Each is a `QuarryError::Unsupported` naming what it was, never a panic or a wrong plan
 (`unsupported_sql_is_named`).
 
-**What comes next?**
-(Written on day 1; days 3 and 4 did this.) Day 3 adds a physical plan between the logical plan and the operators: the hash join (joins bind today but don't run),
-a top-k sort for `ORDER BY ... LIMIT` (today's sort sorts everything), predicate pushdown into Parquet row groups
-(the footer is already read once per table; day 3 reads its per-column min and max) and optimizer rules (constant
-folding must keep a failing constant lazy, see above). Day 4 compares every result with DuckDB's on TPC-H-style data.
+**What would you do next?**
+In order of what the measurements say. Quarry runs one thread, and DuckDB's eight threads are 2.7-4.6x its one on
+TPC-H, so the biggest step is parallel scans and aggregation (morsels of row groups, per-thread hash tables merged at
+the end). Then a real physical plan with costs: which side of a join to build (always the right input today) and
+join order. Then the lazy `AND`/`OR`: they `take` the undecided rows into a new batch and scatter results back;
+selection vectors would avoid the copies. Then the SQL that keeps 14 of TPC-H's 22 queries out: subqueries,
+`EXTRACT`, `INTERVAL`, decimals. Spilling to disk for sorts, joins and aggregates comes after, since every query here
+fits in memory. (On day 1 this answer listed days 3 and 4's plan: the hash join, the top-k, pruning, the optimizer
+rules and the comparison with DuckDB; all of those were built.)
