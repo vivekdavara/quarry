@@ -443,7 +443,7 @@ re-tokenized from the statement's start, so a 1,600-line comment of `x;` lines t
 statement over a minute (debug build). Two facts fixed most of it. A prefix's tokens don't change when text is added
 after it, so only the new line's semicolons need testing (`split_statements_after`). And after a statement that
 tokenizes with no `;` yet, a line without `;` can't change anything, so it isn't split at all. Those cases are now
-0.76 s and 0.03 s. Text inside an open comment or string is still re-tokenized each line (quadratic), which
+0.40 s and 0.03 s. Text inside an open comment or string is still re-tokenized each line (quadratic), which
 DESIGN.md says.
 
 **What if the text after the last `;` doesn't tokenize?**
@@ -453,9 +453,12 @@ My first version told them apart by the tokenizer's error messages, with a test 
 the review's worst finding: sqlparser says "Unterminated encoded string literal" both for `E'abc` and for
 `E'\x80'`, so an invalid escape swallowed every later line, `.quit` included. Now `can_close` decides it by trying
 closing suffixes (a quote, `''`, `$$`, a `*/` per `/*`, a `$tag$` in the text): open if one makes the text tokenize,
-invalid if none does. An invalid statement can't tell you where it ends either, so it lasts until a line ending in
-`;` and then fails with the parser's message; nothing inside it runs. At the end of the input an open statement
-runs anyway, so nothing a script holds is silently dropped.
+invalid if none does. And where does an invalid statement end? Its tokens can't say: a `;` after it may be inside
+its own string or a comment. I guessed twice (the end of its line, then the first line ending in `;`) and the
+reviews broke both, each time running the inside of a string as SQL. So it doesn't guess any more: the error is
+reported at once, a script stops there and says the rest isn't run (exit 1), and at a terminal the session goes on
+with a clean slate. At the end of the input an open statement runs anyway, so nothing a script holds is silently
+dropped.
 
 **How did you test the splitter?**
 Differentially, against the tokenizer itself (`tests/split_properties.rs`): random text built from quotes, comment
@@ -511,6 +514,12 @@ exactly in any order.
 - **A mutant survived my own new test of the review's finding.** The review's case for bad UTF-8 asserted that the
   statement didn't count every row; a version that ran the statement with the bad bytes replaced passed it, since
   the count was 0 instead. The test that kills it asserts the statement doesn't run.
+- **My fix for rejected text was another guess, and round 2 broke it the same way.** Round 1 showed that ending a
+  rejected statement at the end of its line ran the inside of its string; I moved the end to the first line ending
+  in `;`, which fails on a string whose line ends in `;`, and on comments. Both times I was answering "where does
+  this statement end?", which has no answer once the tokenizer gives up. The fix that holds is to stop asking: a
+  script stops and says so. Lesson: when a fix is a heuristic for something the input can't decide, look for the
+  design that doesn't need the answer.
 - **Claims went into a commit message before they were measured.** `de5c2a2` says Q1's groups "come in long runs";
   measured afterwards with DuckDB, they average 2.8 rows. The README says what was measured; the commit message
   stays. Twice I wrote a test's expected output from memory (an EXPLAIN line, the error text for an unknown column)

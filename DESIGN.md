@@ -485,18 +485,23 @@ table and their count, or `EXPLAIN`'s optimized plan).
   semicolons (`split_statements_after`: a prefix's tokens don't change when text is added after it), and after a
   statement that tokenizes and has no `;` yet, a line without `;` isn't split at all. A statement of many lines
   then costs `O(length)`. What stays quadratic is text inside an open comment or string: each of its lines
-  re-tokenizes everything pending (6,400 lines of `x;` inside one `/* */` take 12.1 s in a debug build, 1,600 take
-  0.76 s), and `n` semicolons inside one string on one line cost `O(n * length)`.
+  re-tokenizes everything pending (6,400 lines of `x;` inside one `/* */` take 6.4 s in a debug build, 1,600 take
+  0.40 s), and so does a statement with a `;` on every line inside comments or strings; `n` semicolons inside one
+  string on one line cost `O(n * length)`.
 - **What follows the last `;`** is blank (whitespace and comments: forgotten), unended (it tokenizes but has no
   `;` yet), open (a string, name or comment the next line may close), or invalid: text the tokenizer rejects
   whatever follows it, such as the invalid escapes in `U&'\zz'` and `E'\x80'`. The REPL waits on unended and open
   text, prompting `   ...>`. Open and invalid can't be told apart by the tokenizer's messages (sqlparser 0.63 says
   "Unterminated encoded string literal" for both `E'abc` and `E'\x80'`), so text that doesn't tokenize is open
-  exactly when a closing suffix makes it tokenize: a quote, `''` (after a trailing backslash in `E'...'`), the end
-  of a `q'[...]'` string, `$$`, a `*/` for each `/*` it holds, or a `$tag$` it holds; only one thing can be open at
-  the end, since the tokenizer stops there. There is no knowing where an invalid statement ends, so it runs, and
-  fails with the parser's message, at the end of the first line ending in `;` (its own or a later one), and nothing
-  inside it runs: on `SELECT U&'\zz'; SELECT 2;` the second `SELECT` is part of the failed statement.
+  exactly when a closing suffix makes it tokenize: a quote, `''` (after a trailing backslash in `E'...'`), `'''` or
+  `"""` (raw triple-quoted strings), the end of a quote-delimited string (`q'[...]'`, `q'#...#'`), `$$`, a `$tag$`
+  it holds, or ` */` once for each `/*` it holds (spare ones tokenize as `*` and `/`; the space keeps a trailing `/`
+  from opening a comment); only one thing can be open at the end, since the tokenizer stops there. There is no
+  knowing where an invalid statement ends: a `;` after it may be inside its string or a comment. So it is reported
+  at once (the parser's message), and a script stops there, with "stopping: where that statement ends can't be
+  told, so the rest of the input isn't run" and status 1; at a terminal the pending text is dropped and the session
+  goes on. (Two guesses at its end, the end of its line and then the first line ending in `;`, each ran the inside
+  of a string in review.)
 - **The end of the input** ends an open statement: one with no `;` runs, and an open string or comment is the
   parser's error ("Unterminated string literal"), not silently dropped.
 - **Errors** go to standard error and the session goes on. From a script, each names the input line its statement

@@ -359,6 +359,30 @@ from 1.7x to 1.4x it. The other queries moved within what two runs of the same b
 "after" runs: 168.1 and 153.3 ms). Q6, for one, sums 114,119 rows (the rows its WHERE keeps, counted with `quarry
 query`), 0.3% of the 41 million values Q1's seven sums add.
 
+**At v1.0.0** (`88b69a7`, the engine unchanged since `de5c2a2`), on AC power with nothing else running, 11:38-11:39
+on 2026-10-30, Quarry then DuckDB 2.0.0 on the same files (medians of 7 and 5 after a warm-up; no sleep in `pmset -g
+log`):
+
+```bash
+cargo run --release -p quarry --example tpch_times -- data/tpch-1 7
+python scripts/tpch_duckdb_times.py data/tpch-1 5 1 8
+```
+
+| Query | Quarry | DuckDB, 1 thread | DuckDB, 8 threads | Quarry / DuckDB 1 thread |
+|---|---|---|---|---|
+| Q1 | 277.1 ms | 190.1 ms | 43.6 ms | 1.46x |
+| Q3 | 225.3 ms | 132.2 ms | 35.1 ms | 1.70x |
+| Q5 | 374.3 ms | 137.6 ms | 36.0 ms | 2.72x |
+| Q6 | 145.6 ms | 81.7 ms | 20.6 ms | 1.78x |
+| Q10 | 277.1 ms | 158.6 ms | 59.9 ms | 1.75x |
+| Q12 | 268.2 ms | 85.3 ms | 23.2 ms | 3.14x |
+| Q14 | 155.5 ms | 134.4 ms | 34.2 ms | 1.16x |
+| Q19 | 340.3 ms | 170.6 ms | 52.8 ms | 1.99x |
+
+The differential test at this code: seeds 1 and 3 at scale 0.01 (2,016 queries) agree, and seed 2 at scale 0.1 at
+`92a62b0` (308 queries, the same engine) agrees, one of them compared at 8,192 rows a batch after timing out at a
+small one (the slow fan-out `--slow-ok` is for).
+
 ## Results (day 4)
 
 **TPC-H at scale 1** (6,004,003 lines; the seven tables 238 MB of zstd Parquet, `lineitem` in 46 row groups),
@@ -509,6 +533,19 @@ forms, `.help`, `.exit`), and its tests for them are in `repl_review.rs`. Judgem
 are: a path containing `=` needs a `NAME=` in front (`.load part=year=2024/part.csv`, as with `-t`); `.quit;` and
 `.QUIT` are refused, as sqlite's shell refuses them; `quarry repl < x.sql | head` reports the broken pipe and exits
 1; and a parser message's "Line: 1" counts from the statement's start while the REPL's "line 9" counts the input.
+
+**Round 2** (one agent on round 1's two fix commits, 18 minutes), asked what each fix broke. **My fix for rejected
+text was still a guess, and still ran the inside of strings**: "the statement lasts until a line ending in `;`"
+fired on a `;` ending a line inside the rejected statement's own open string, or at the end of a `--` comment, and
+the next line (`SELECT 42 AS boom;`) ran; a comment after the `;` hid it instead, and the next statement was
+swallowed with no error. Two guesses at where an unparseable statement ends had now both failed, so the REPL stops
+guessing: a script stops at it and says so (`88b69a7`). Also: raw triple-quoted strings (`R'''...'''`) and
+quote-delimited strings with a delimiter other than a bracket were called invalid (`a491dde`, found meanwhile by
+re-running round 1's exhaustive search, and `c1e63cb`); open text with many dollar tags was cubic (tags weren't
+deduplicated) and so was nesting comments deep (one candidate per depth); `skip_blank` knew four whitespace bytes
+where the tokenizer takes any `char::is_whitespace`. Of its mutants, the non-equivalent survivors (bad-line ranges
+across a drain, the skip rule after a closed comment) got tests. The failing cases are in `repl_review.rs` and
+`crates/quarry/tests/split_review.rs`. No third round: the session's time was up.
 
 ## Review of day 4
 
@@ -732,8 +769,8 @@ property then found one more bug itself: `-(-0)` printed as `-0`, which binds ba
 - Integer literals must fit in 64 bits, and expressions nest at most 128 levels (a chain of 128 `OR`s).
 - The REPL has no history or line editing beyond the terminal's own (`rlwrap quarry repl ...` adds both), and
   Ctrl-C ends it rather than cancelling a query. Text the tokenizer rejects whatever follows (an invalid escape such
-  as `U&'\zz'`) fails as one statement ending at the first line that ends in `;`, so a valid statement after it on
-  that line doesn't run. Text inside an open comment or string is re-tokenized on every line, so thousands of lines
+  as `U&'\zz'` or `E'\x80'`) stops a script there, since where that statement ends can't be told; the statements
+  after it don't run (the REPL says so). At a terminal it is an error at once and the session goes on. Text inside an open comment or string is re-tokenized on every line, so thousands of lines
   of it are slow to read (DESIGN.md, "The REPL"). A path containing `=` needs a `NAME=` in front (`-t
   part=year=2024/part.csv`).
 
