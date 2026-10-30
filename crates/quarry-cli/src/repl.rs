@@ -232,7 +232,7 @@ pub fn run(
         }
         match split.rest {
             Rest::Blank => pending.clear(),
-            Rest::Incomplete => {
+            Rest::Unended | Rest::Open => {
                 pending_line += pending[..split.rest_start].matches('\n').count();
                 pending.drain(..split.rest_start);
             }

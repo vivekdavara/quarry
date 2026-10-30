@@ -14,7 +14,7 @@ use crate::plan::LogicalPlan;
 
 pub use binder::Binder;
 pub use expr::MAX_EXPR_DEPTH;
-pub use split::{Rest, Split, first_token_offset, split_statements};
+pub use split::{Rest, Split, first_token_offset, split_statements, split_statements_after};
 
 /// A bound statement.
 #[derive(Debug, Clone)]

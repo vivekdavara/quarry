@@ -6,6 +6,11 @@
 //! tokenizes and its last token is that semicolon. (The tokenizer reads left to right and a `;` is a token of its
 //! own, so the tokens up to it don't depend on what follows; a `;` inside a string or comment leaves the prefix
 //! unterminated, and one inside a `--` comment ends a comment token instead.)
+//!
+//! Text after the last statement that doesn't tokenize is either open (a string, name or comment the next line may
+//! close) or invalid (wrong whatever follows). The tokenizer's messages don't tell them apart (sqlparser 0.63 says
+//! "Unterminated encoded string literal" both for `E'abc` and for `E'\x80'`), so the text is open exactly when one
+//! of the closing suffixes in `CLOSERS` (or a `*/` per `/*`, or a dollar tag it contains) makes it tokenize.
 
 use std::ops::Range;
 
@@ -17,10 +22,12 @@ use sqlparser::tokenizer::{Location, Token, Tokenizer, TokenizerError};
 pub enum Rest {
     /// Nothing but whitespace and comments.
     Blank,
-    /// The start of a statement: no `;` yet, or one inside a string, quoted name or comment still open.
-    Incomplete,
+    /// The start of a statement that tokenizes but has no `;` yet. A line without a `;` added to it can't end it.
+    Unended,
+    /// The start of a statement inside a string, quoted name or comment still open.
+    Open,
     /// Text the tokenizer rejects whatever follows (an invalid escape, say): a statement that is already wrong,
-    /// running to the end of the text. Running it reports the tokenizer's error.
+    /// with no knowing where it ends. Running it reports the tokenizer's error.
     Invalid,
 }
 
@@ -38,10 +45,17 @@ pub struct Split {
 
 /// Cuts `text` into the statements its semicolons end and what is left after them.
 pub fn split_statements(text: &str) -> Split {
+    split_statements_after(text, 0)
+}
+
+/// As `split_statements`, for text whose semicolons before byte `checked` are known not to end a statement (a split
+/// of `text[..checked]` found none). The REPL adds a line to what it has pending and splits again: only the new
+/// line's semicolons need tokenizing, since a prefix's tokens don't change when text is added after it.
+pub fn split_statements_after(text: &str, checked: usize) -> Split {
     let mut statements = Vec::new();
     let mut start = 0;
     for (q, _) in text.match_indices(';') {
-        if q < start {
+        if q < checked {
             continue;
         }
         if let Ok(tokens) = tokenize(&text[start..=q])
@@ -55,8 +69,8 @@ pub fn split_statements(text: &str) -> Split {
     }
     let rest = match tokenize(&text[start..]) {
         Ok(tokens) if tokens.iter().all(is_blank) => Rest::Blank,
-        Ok(_) => Rest::Incomplete,
-        Err(e) if is_unterminated(&e) => Rest::Incomplete,
+        Ok(_) => Rest::Unended,
+        Err(_) if can_close(&text[start..]) => Rest::Open,
         Err(_) => Rest::Invalid,
     };
     Split {
@@ -66,15 +80,53 @@ pub fn split_statements(text: &str) -> Split {
     }
 }
 
-/// The byte offset of the first token in `text` that isn't whitespace or a comment, if there is one.
-///
-/// Used on text that ends just before a semicolon token, so it holds whole tokens and tokenizes.
+/// The byte offset of the first token in `text` that isn't whitespace or a comment, if there is one. For text that
+/// doesn't tokenize (an open string, say), where whitespace and comments end, by `skip_blank`.
 pub fn first_token_offset(text: &str) -> Option<usize> {
-    let tokens = Tokenizer::new(&GenericDialect {}, text)
-        .tokenize_with_location()
-        .ok()?;
-    let first = tokens.iter().find(|t| !is_blank(&t.token))?;
-    Some(byte_offset(text, first.span.start))
+    match Tokenizer::new(&GenericDialect {}, text).tokenize_with_location() {
+        Ok(tokens) => {
+            let first = tokens.iter().find(|t| !is_blank(&t.token))?;
+            Some(byte_offset(text, first.span.start))
+        }
+        Err(_) => Some(skip_blank(text)),
+    }
+}
+
+/// The offset after the whitespace (space, tab, CR, LF), `--` comments and nested `/* */` comments `text` starts
+/// with; at an open `/*`, its offset.
+fn skip_blank(text: &str) -> usize {
+    let b = text.as_bytes();
+    let mut i = 0;
+    loop {
+        if i < b.len() && matches!(b[i], b' ' | b'\t' | b'\r' | b'\n') {
+            i += 1;
+        } else if b[i..].starts_with(b"--") {
+            i = b[i..]
+                .iter()
+                .position(|&c| c == b'\n')
+                .map_or(b.len(), |n| i + n + 1);
+        } else if b[i..].starts_with(b"/*") {
+            let (mut depth, mut j) = (0, i);
+            while j < b.len() {
+                if b[j..].starts_with(b"/*") {
+                    (depth, j) = (depth + 1, j + 2);
+                } else if b[j..].starts_with(b"*/") {
+                    (depth, j) = (depth - 1, j + 2);
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    j += 1;
+                }
+            }
+            if depth > 0 {
+                return i;
+            }
+            i = j;
+        } else {
+            return i;
+        }
+    }
 }
 
 /// The byte offset of a tokenizer location: a 1-based line, and a 1-based column counted in characters.
@@ -101,13 +153,38 @@ fn is_blank(token: &Token) -> bool {
     matches!(token, Token::Whitespace(_))
 }
 
-/// The tokenizer's errors that more text could cure: each says the text ended inside a string, a quoted name, a
-/// dollar-quoted string or a comment. `tests::each_unterminated_error_is_recognized` produces every one, so a
-/// sqlparser upgrade that rewords one fails there.
-fn is_unterminated(e: &TokenizerError) -> bool {
-    e.message.starts_with("Unterminated")
-        || e.message.ends_with("before EOF.")
-        || e.message.starts_with("Unexpected EOF")
+/// Suffixes that end what a text left open: a string (`''` after a trailing backslash in `E'...'`), a quoted name,
+/// a quote-delimited `q'[...]'` string, a `$$` string.
+const CLOSERS: &[&str] = &["'", "\"", "`", "''", "$$", "]'", "}'", ")'", ">'"];
+
+/// Whether some suffix makes `text`, which doesn't tokenize, tokenize: one of `CLOSERS`, one `*/` to as many as it
+/// has `/*`, or a `$tag$` it contains. Only one thing can be open at the end (the tokenizer stops at it), so one
+/// suffix is enough.
+fn can_close(text: &str) -> bool {
+    let comments = (1..=text.matches("/*").count()).map(|n| "*/".repeat(n));
+    let closers = CLOSERS
+        .iter()
+        .map(|c| c.to_string())
+        .chain(comments)
+        .chain(dollar_tags(text));
+    closers
+        .into_iter()
+        .any(|c| tokenize(&format!("{text}{c}")).is_ok())
+}
+
+/// The `$tag$` openers of dollar-quoted strings in `text` (a tag is letters, digits and `_`).
+fn dollar_tags(text: &str) -> Vec<String> {
+    let mut tags = Vec::new();
+    for (i, _) in text.match_indices('$') {
+        let tag: String = text[i + 1..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !tag.is_empty() && text[i + 1 + tag.len()..].starts_with('$') {
+            tags.push(format!("${tag}$"));
+        }
+    }
+    tags
 }
 
 #[cfg(test)]
@@ -128,7 +205,7 @@ mod tests {
         let split = split_statements(text);
         assert_eq!(statements(text), ["SELECT 1", "SELECT 2"]);
         assert_eq!(&text[split.rest_start..], "\nSELECT 3");
-        assert_eq!(split.rest, Rest::Incomplete);
+        assert_eq!(split.rest, Rest::Unended);
     }
 
     #[test]
@@ -152,22 +229,27 @@ mod tests {
     }
 
     #[test]
-    fn open_strings_and_comments_are_incomplete() {
+    fn open_strings_and_comments_are_open() {
         for text in [
             "SELECT 'a;",
             "SELECT E'\\';",
+            "SELECT E'a\\",
             "SELECT \"a;",
             "SELECT `a;",
             "SELECT /* a; /* b */ still open;",
+            "SELECT /* /* /* three deep;",
             "SELECT $$a;",
             "SELECT $t$a;",
-            "SELECT 1",
+            "SELECT $t$a $u$ b;",
+            "SELECT U&'a;",
+            "SELECT q'[a;",
         ] {
             let split = split_statements(text);
             assert!(split.statements.is_empty(), "{text}");
-            assert_eq!(split.rest, Rest::Incomplete, "{text}");
+            assert_eq!(split.rest, Rest::Open, "{text}");
             assert_eq!(split.rest_start, 0, "{text}");
         }
+        assert_eq!(split_statements("SELECT 1").rest, Rest::Unended);
     }
 
     #[test]
@@ -176,7 +258,7 @@ mod tests {
         assert_eq!(statements(text), ["SELECT 1"]);
         let split = split_statements(text);
         assert_eq!(&text[split.rest_start..], " SELECT 'a;");
-        assert_eq!(split.rest, Rest::Incomplete);
+        assert_eq!(split.rest, Rest::Open);
     }
 
     #[test]
@@ -197,29 +279,45 @@ mod tests {
 
     #[test]
     fn text_the_tokenizer_rejects_is_invalid() {
-        // An invalid escape in a Unicode string: no text that follows could fix it.
-        let split = split_statements("SELECT U&'\\zz'; SELECT 2;");
-        assert!(split.statements.is_empty());
-        assert_eq!(split.rest, Rest::Invalid);
+        // Invalid escapes: no text that follows could fix them. sqlparser calls the E'' ones "Unterminated encoded
+        // string literal" (the review found the REPL waiting for more input after them, `.quit` included).
+        for text in [
+            "SELECT U&'\\zz'; SELECT 2;",
+            "SELECT E'\\x80';",
+            "SELECT E'\\0';",
+            "SELECT E'\\200';",
+            "SELECT E'\\uzzzz';",
+            "SELECT E'\\U&';",
+        ] {
+            let split = split_statements(text);
+            assert!(split.statements.is_empty(), "{text}");
+            assert_eq!(split.rest, Rest::Invalid, "{text}");
+        }
     }
 
     #[test]
-    fn each_unterminated_error_is_recognized() {
-        for (text, message) in [
-            ("'a", "Unterminated string literal"),
-            ("E'a", "Unterminated encoded string literal"),
-            ("\"a", "Expected close delimiter '\"' before EOF."),
-            ("`a", "Expected close delimiter '`' before EOF."),
-            ("$$a", "Unterminated dollar-quoted string"),
-            ("$t$a", "Unterminated dollar-quoted, expected $"),
-            ("/* a", "Unexpected EOF while in a multi-line comment"),
-            ("U&'a", "Unterminated unicode encoded string literal"),
-        ] {
-            let e = tokenize(text).expect_err(text);
-            assert!(e.message.starts_with(message), "{text}: {}", e.message);
-            assert!(is_unterminated(&e), "{text}: {}", e.message);
-        }
-        let e = tokenize("U&'\\zz'").unwrap_err();
-        assert!(!is_unterminated(&e), "{}", e.message);
+    fn semicolons_before_checked_are_not_tokenized_again() {
+        // A split that starts after the first `;` doesn't see it end a statement: the caller vouched it doesn't.
+        let text = "SELECT 1; SELECT 2;";
+        assert_eq!(
+            split_statements_after(text, 9).statements,
+            vec![Range { start: 0, end: 18 }]
+        );
+        assert_eq!(split_statements_after(text, 0).statements, [0..8, 10..18]);
+    }
+
+    #[test]
+    fn the_first_token_of_text_that_does_not_tokenize() {
+        assert_eq!(
+            first_token_offset(" /* a\n */ -- b\n  SELECT 'open"),
+            Some(17)
+        );
+        assert_eq!(
+            first_token_offset("\n/* /* nested */ still */ SELECT U&'\\zz'"),
+            Some(26)
+        );
+        // An open comment is where the text starts.
+        assert_eq!(first_token_offset("  /* open"), Some(2));
+        assert_eq!(first_token_offset("  -- c\n"), None);
     }
 }
